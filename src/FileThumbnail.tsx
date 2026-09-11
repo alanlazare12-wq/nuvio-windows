@@ -75,7 +75,7 @@ function preload(key: string, id: string, isVisible: () => boolean): Promise<Pre
       try { preview = await renderThumbnail(id); } catch { /* Keep the file type icon on failure. */ }
       if (epoch === generation) {
         cache.set(key, preview);
-        if (cache.size > 48) cache.delete(cache.keys().next().value!);
+        if (cache.size > 256) cache.delete(cache.keys().next().value!);
         pending.delete(key);
         resolve(preview);
       } else { resolve(null); }
@@ -86,30 +86,69 @@ function preload(key: string, id: string, isVisible: () => boolean): Promise<Pre
   return result;
 }
 
+const thumbnailListeners = new Map<Element, (intersecting: boolean) => void>();
+let sharedObserver: IntersectionObserver | null = null;
+
+function observeThumbnail(el: Element, cb: (intersecting: boolean) => void) {
+  if (!sharedObserver) {
+    sharedObserver = new IntersectionObserver(
+      (entries) => {
+        for (const entry of entries) {
+          const listener = thumbnailListeners.get(entry.target);
+          if (listener) listener(entry.isIntersecting);
+        }
+      },
+      { rootMargin: "250px" }
+    );
+  }
+  thumbnailListeners.set(el, cb);
+  sharedObserver.observe(el);
+  return () => {
+    thumbnailListeners.delete(el);
+    sharedObserver?.unobserve(el);
+  };
+}
+
 export function FileThumbnail({ file, children }: { file: CloudFile; children: ReactNode }) {
   const container = useRef<HTMLDivElement>(null);
-  const [preview, setPreview] = useState<Preview>(null);
   const [epoch, setEpoch] = useState(generation);
   const key = `${epoch}:${file.id}:${file.updatedAt}:${file.sizeBytes}`;
+  const [preview, setPreview] = useState<Preview>(() => cache.get(key) ?? null);
+
   useEffect(() => {
     const reset = () => { setPreview(null); setEpoch(generation); };
     window.addEventListener("nuvio:thumbnails-cleared", reset);
     return () => window.removeEventListener("nuvio:thumbnails-cleared", reset);
   }, []);
+
   useEffect(() => {
-    setPreview(null);
-    if (file.trashed || !container.current) return;
+    const cached = cache.get(key);
+    if (cached !== undefined) {
+      setPreview(cached);
+      return;
+    }
+    if (file.trashed || !container.current) {
+      setPreview(null);
+      return;
+    }
     let alive = true;
     let near = false;
-    const observer = new IntersectionObserver(entries => {
-      near = entries.some(entry => entry.isIntersecting);
-      if (near) void preload(key, file.id, () => alive && near).then(value => { if (alive) setPreview(value); });
-    }, { rootMargin: "180px" });
-    observer.observe(container.current);
-    return () => { alive = false; observer.disconnect(); };
+    const unobserve = observeThumbnail(container.current, (intersecting) => {
+      near = intersecting;
+      if (near) {
+        void preload(key, file.id, () => alive && near).then((value) => {
+          if (alive) setPreview(value);
+        });
+      }
+    });
+    return () => {
+      alive = false;
+      unobserve();
+    };
   }, [key, file.id, file.trashed]);
+
   return <div ref={container} className={`file-thumbnail ${preview ? "is-ready" : ""}`}>
-    {preview?.image ? <img src={preview.image} alt={`Miniatura de ${file.name}`} draggable={false} />
+    {preview?.image ? <img src={preview.image} alt={`Miniatura de ${file.name}`} draggable={false} loading="lazy" />
       : preview?.text ? <pre aria-label={`Miniatura de ${file.name}`}>{preview.text}</pre> : children}
   </div>;
 }

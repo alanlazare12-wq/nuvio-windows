@@ -310,26 +310,28 @@ impl CatalogRepository {
         )?;
             tx.execute(
             "INSERT INTO file_locations(file_id,folder_id) VALUES (?1,CASE WHEN EXISTS(SELECT 1 FROM folders WHERE id=?2 AND trashed=0) THEN ?2 ELSE NULL END)
-             ON CONFLICT(file_id) DO UPDATE SET folder_id=excluded.folder_id",
+             ON CONFLICT(file_id) DO UPDATE SET folder_id=COALESCE(excluded.folder_id, file_locations.folder_id)",
             params![id, doc.folder_id],
         )?;
             tx.execute(
                 "INSERT OR REPLACE INTO remote_documents VALUES (?1,?2)",
                 params![id, serde_json::to_string(doc)?],
             )?;
-            tx.execute(
-            "UPDATE transfers SET status='completed',progress=100,speed_label='Guardado en Telegram' WHERE id=?1 AND direction='upload'",
-            [&doc.transfer],
-        )?;
-            tx.execute(
-                "UPDATE transfer_metadata SET remote_message_id=?1,error=NULL WHERE transfer_id=?2",
-                params![doc.message_id.to_string(), doc.transfer],
+            if !doc.transfer.is_empty() {
+                tx.execute(
+                "UPDATE transfers SET status='completed',progress=100,speed_label='Guardado en Telegram' WHERE id=?1 AND direction='upload'",
+                [&doc.transfer],
             )?;
-            tx.execute(
-            "UPDATE transfer_runtime SET phase='completed',processed_bytes=total_bytes,speed_bps=0,eta_seconds=0,updated_at=unixepoch(),completed_at=unixepoch() WHERE transfer_id=?1",
-            [&doc.transfer],
-        )?;
-            tx.execute("DELETE FROM transfer_pending WHERE id=?1", [&doc.transfer])?;
+                tx.execute(
+                    "UPDATE transfer_metadata SET remote_message_id=?1,error=NULL WHERE transfer_id=?2",
+                    params![doc.message_id.to_string(), doc.transfer],
+                )?;
+                tx.execute(
+                "UPDATE transfer_runtime SET phase='completed',processed_bytes=total_bytes,speed_bps=0,eta_seconds=0,updated_at=unixepoch(),completed_at=unixepoch() WHERE transfer_id=?1",
+                [&doc.transfer],
+            )?;
+                tx.execute("DELETE FROM transfer_pending WHERE id=?1", [&doc.transfer])?;
+            }
         }
         tx.commit()?;
         Ok(())
@@ -854,10 +856,82 @@ impl TelegramService {
             "percent": null,
             "phase": "scanning"
         }));
-        let mut cursor = 0;
-        let mut documents = Vec::new();
         let mut latest_folder_events = std::collections::HashMap::<String, FolderEvent>::new();
         let mut latest_moves = std::collections::HashMap::<i64, Option<String>>::new();
+
+        // 1. CARGAR CARPETAS Y MOVIMIENTOS PRIMERO
+        let _ = crate::mobile::update_sync_notification(&serde_json::json!({
+            "active": true,
+            "scanned": 0,
+            "total": total,
+            "percent": 5,
+            "phase": "folders"
+        }));
+
+        let mut from_msg = 0;
+        while let Ok(e::FoundChatMessages::FoundChatMessages(page)) = call(f::search_chat_messages(
+            chat,
+            None,
+            "#NuvioFolder1".to_string(),
+            None,
+            from_msg,
+            0,
+            100,
+            None,
+            self.client_id,
+        )).await {
+            let mut last_id = from_msg;
+            let mut found = false;
+            for msg in page.messages {
+                if msg.id == from_msg { continue; }
+                found = true;
+                last_id = msg.id;
+                if let Some(event) = folder_event(&msg) {
+                    latest_folder_events.entry(event.id.clone()).or_insert(event);
+                }
+            }
+            if !found || last_id == from_msg { break; }
+            from_msg = last_id;
+        }
+
+        from_msg = 0;
+        while let Ok(e::FoundChatMessages::FoundChatMessages(page)) = call(f::search_chat_messages(
+            chat,
+            None,
+            "#NuvioMove1".to_string(),
+            None,
+            from_msg,
+            0,
+            100,
+            None,
+            self.client_id,
+        )).await {
+            let mut last_id = from_msg;
+            let mut found = false;
+            for msg in page.messages {
+                if msg.id == from_msg { continue; }
+                found = true;
+                last_id = msg.id;
+                if let Some(event) = file_move_event(&msg) {
+                    for id in event.message_ids {
+                        latest_moves.entry(id).or_insert_with(|| event.folder_id.clone());
+                    }
+                }
+            }
+            if !found || last_id == from_msg { break; }
+            from_msg = last_id;
+        }
+
+        if !latest_folder_events.is_empty() {
+            let _ = repo.apply_folder_snapshot(latest_folder_events.values().cloned().collect());
+        }
+
+        let mut cursor = 0;
+        let mut documents = Vec::new();
+        let mut pending_documents = Vec::new();
+        let mut last_flush = Instant::now();
+
+        // 2. SINCRONIZAR ARCHIVOS E IMÁGENES EN SUS CARPETAS CORRESPONDIENTES
         loop {
             let e::Messages::Messages(page) = call(f::get_chat_history(
                 chat,
@@ -870,7 +944,6 @@ impl TelegramService {
             .await?;
             let mut last = cursor;
             let mut found = false;
-            let mut page_documents = Vec::new();
             let mut has_new_folders = false;
             for msg in page.messages.into_iter().flatten() {
                 if msg.id == cursor {
@@ -897,20 +970,21 @@ impl TelegramService {
                             .or_insert_with(|| event.folder_id.clone());
                     }
                 } else if let Some(doc) = document(&msg) {
-                    page_documents.push(doc.clone());
+                    let mut doc_to_save = doc.clone();
+                    if let Some(moved) = latest_moves.get(&doc.message_id) {
+                        doc_to_save.folder_id = moved.clone();
+                    }
+                    pending_documents.push(doc_to_save);
                     documents.push(doc);
                 }
             }
             if has_new_folders {
                 let _ = repo.apply_folder_snapshot(latest_folder_events.values().cloned().collect());
             }
-            if !page_documents.is_empty() {
-                for doc in &mut page_documents {
-                    if let Some(moved) = latest_moves.get(&doc.message_id) {
-                        doc.folder_id = moved.clone();
-                    }
-                }
-                let _ = repo.record_remote_batch(&page_documents);
+            if pending_documents.len() >= 150 || (last_flush.elapsed() >= Duration::from_millis(1200) && !pending_documents.is_empty()) {
+                let _ = repo.record_remote_batch(&pending_documents);
+                pending_documents.clear();
+                last_flush = Instant::now();
             }
             progress.scanned(scanned, total);
             let percent = total.filter(|n| *n > 0).map(|n| ((scanned as f64 / n as f64 * 90.0) as u8).min(89));
@@ -919,13 +993,18 @@ impl TelegramService {
                 "scanned": scanned,
                 "total": total,
                 "percent": percent,
-                "phase": "scanning"
+                "phase": "files"
             }));
             if !found || last == cursor {
                 break;
             }
             cursor = last;
             tokio::time::sleep(Duration::from_millis(60)).await;
+        }
+
+        if !pending_documents.is_empty() {
+            let _ = repo.record_remote_batch(&pending_documents);
+            pending_documents.clear();
         }
 
         progress.applying(0, documents.len());

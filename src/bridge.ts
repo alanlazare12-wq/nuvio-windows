@@ -18,8 +18,20 @@ export function loadDashboard(): Promise<DashboardData> {
   return invoke<DashboardData>("get_dashboard");
 }
 
+let cachedPlatform: string | null = null;
+export async function getPlatform(): Promise<string> {
+  if (!cachedPlatform) {
+    try {
+      cachedPlatform = await invoke<string>("platform_name");
+    } catch {
+      cachedPlatform = "unknown";
+    }
+  }
+  return cachedPlatform;
+}
+
 export async function listenMobileBack(handler: () => void): Promise<() => void> {
-  if (await invoke<string>("platform_name") !== "android") return () => {};
+  if ((await getPlatform()) !== "android") return () => {};
   const listener = await onBackButtonPress(handler);
   return () => { void listener.unregister(); };
 }
@@ -50,7 +62,7 @@ export type UploadNotificationData = {
 
 export async function updateSyncNotification(data: SyncNotificationData): Promise<void> {
   try {
-    if (await invoke<string>("platform_name") !== "android") return;
+    if ((await getPlatform()) !== "android") return;
     await invoke("update_mobile_sync_notification", { data });
   } catch {
     // Notificaciones móviles opcionales
@@ -59,7 +71,7 @@ export async function updateSyncNotification(data: SyncNotificationData): Promis
 
 export async function updateUploadNotification(data: UploadNotificationData): Promise<void> {
   try {
-    if (await invoke<string>("platform_name") !== "android") return;
+    if ((await getPlatform()) !== "android") return;
     await invoke("update_mobile_upload_notification", { data });
   } catch {
     // Notificaciones móviles opcionales
@@ -68,7 +80,7 @@ export async function updateUploadNotification(data: UploadNotificationData): Pr
 
 export async function clearMobileNotification(id: number): Promise<void> {
   try {
-    if (await invoke<string>("platform_name") !== "android") return;
+    if ((await getPlatform()) !== "android") return;
     await invoke("clear_mobile_notification", { id });
   } catch {
     // Notificaciones móviles opcionales
@@ -145,7 +157,7 @@ export function emptyTrash(): Promise<number> {
 }
 
 export async function selectDownloadDirectory(): Promise<string | null> {
-  if (await invoke<string>("platform_name") === "android") {
+  if ((await getPlatform()) === "android") {
     return invoke<string | null>("pick_download_directory");
   }
   const selected = await open({
@@ -199,7 +211,7 @@ export async function downloadFile(file: CloudFile): Promise<boolean> {
 }
 
 export async function selectFilesForUpload(): Promise<string[]> {
-  if ((await invoke<string>("platform_name")) === "android") {
+  if ((await getPlatform()) === "android") {
     return invoke<string[]>("pick_upload_files");
   }
   const selected = await open({
@@ -213,7 +225,7 @@ export async function selectFilesForUpload(): Promise<string[]> {
 }
 
 export async function selectFolderForUpload(): Promise<DirectoryUploadPlan | null> {
-  if ((await invoke<string>("platform_name")) === "android") {
+  if ((await getPlatform()) === "android") {
     return invoke<DirectoryUploadPlan | null>("pick_upload_directory");
   }
   const selected = await open({

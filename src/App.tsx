@@ -49,7 +49,7 @@ import {
   X,
   Zap,
 } from "lucide-react";
-import { useEffect, useMemo, useRef, useState } from "react";
+import { memo, useEffect, useMemo, useRef, useState } from "react";
 import { convertFileSrc } from "@tauri-apps/api/core";
 import { getCurrentWebview } from "@tauri-apps/api/webview";
 import { isPermissionGranted, requestPermission, sendNotification } from "@tauri-apps/plugin-notification";
@@ -449,15 +449,20 @@ function App() {
     let timer = 0;
     const poll = async () => {
       if (disposed) return;
+      if (touchDragRef.current?.active) {
+        timer = window.setTimeout(poll, 800);
+        return;
+      }
       const next = await refreshDashboard();
       const active = next?.syncProgress?.active || (next?.queueSummary.pending ?? 0) > 0;
-      if (!disposed) timer = window.setTimeout(poll, document.hidden ? 10000 : active ? 600 : 2500);
+      if (!disposed) timer = window.setTimeout(poll, document.hidden ? 10000 : active ? 1200 : 3000);
     };
     void poll();
     return () => { disposed = true; dashboardRequestRef.current++; mediaRequestRef.current++; window.clearTimeout(timer); };
   }, []);
 
   const previousSyncActiveRef = useRef(false);
+  const previousSyncKeyRef = useRef<string>("");
   useEffect(() => {
     if (!dashboard) return;
     const sync = dashboard.syncProgress;
@@ -465,16 +470,21 @@ function App() {
     const wasActive = previousSyncActiveRef.current;
     if (active) {
       previousSyncActiveRef.current = true;
-      void updateSyncNotification({
-        active: true,
-        percent: sync?.percent,
-        scanned: sync?.scanned ?? 0,
-        total: sync?.total,
-        phase: sync?.phase,
-        error: sync?.error,
-      });
+      const key = `${sync?.percent}:${sync?.scanned}:${sync?.phase}`;
+      if (key !== previousSyncKeyRef.current) {
+        previousSyncKeyRef.current = key;
+        void updateSyncNotification({
+          active: true,
+          percent: sync?.percent,
+          scanned: sync?.scanned ?? 0,
+          total: sync?.total,
+          phase: sync?.phase,
+          error: sync?.error,
+        });
+      }
     } else if (wasActive) {
       previousSyncActiveRef.current = false;
+      previousSyncKeyRef.current = "";
       void updateSyncNotification({
         active: false,
         percent: 100,
@@ -484,9 +494,10 @@ function App() {
         error: sync?.error,
       });
     }
-  }, [dashboard?.syncProgress?.active, dashboard?.syncProgress?.percent, dashboard?.syncProgress?.scanned, dashboard?.syncProgress?.error]);
+  }, [dashboard?.syncProgress?.active, dashboard?.syncProgress?.percent, dashboard?.syncProgress?.scanned, dashboard?.syncProgress?.phase, dashboard?.syncProgress?.error]);
 
   const previousUploadActiveRef = useRef(false);
+  const previousUploadKeyRef = useRef<string>("");
   useEffect(() => {
     if (!dashboard) return;
     const q = dashboard.queueSummary;
@@ -499,20 +510,26 @@ function App() {
     if (hasActive) {
       previousUploadActiveRef.current = true;
       const currentFileName = activeUploads[0]?.fileName ?? null;
-      void updateUploadNotification({
-        active: true,
-        total: q.total,
-        completed: q.completed,
-        pending: q.pending,
-        failed: q.failed,
-        percent: q.totalBytes > 0 ? Math.round((q.processedBytes / q.totalBytes) * 100) : null,
-        processedBytes: q.processedBytes,
-        totalBytes: q.totalBytes,
-        speedBps: q.speedBps,
-        currentFileName,
-      });
+      const pct = q.totalBytes > 0 ? Math.round((q.processedBytes / q.totalBytes) * 100) : null;
+      const key = `${pct}:${q.completed}:${q.pending}:${currentFileName}:${Math.round(q.speedBps / 50000)}`;
+      if (key !== previousUploadKeyRef.current) {
+        previousUploadKeyRef.current = key;
+        void updateUploadNotification({
+          active: true,
+          total: q.total,
+          completed: q.completed,
+          pending: q.pending,
+          failed: q.failed,
+          percent: pct,
+          processedBytes: q.processedBytes,
+          totalBytes: q.totalBytes,
+          speedBps: q.speedBps,
+          currentFileName,
+        });
+      }
     } else if (wasActive) {
       previousUploadActiveRef.current = false;
+      previousUploadKeyRef.current = "";
       void updateUploadNotification({
         active: false,
         total: q.total,
@@ -658,15 +675,42 @@ function App() {
       const normalized = `${item.name} ${item.extension} ${item.folder} ${item.tags.join(" ")}`.toLowerCase();
       return normalized.includes(needle);
     });
-    output = [...output].sort((a, b) => {
-      if (sort === "name") return a.name.localeCompare(b.name, "es", { numeric: true, sensitivity: "base" });
-      if (sort === "size") return b.sizeBytes - a.sizeBytes;
-      const aTime = new Date(a.updatedAt).getTime() || 0;
-      const bTime = new Date(b.updatedAt).getTime() || 0;
-      return sort === "oldest" ? aTime - bTime : bTime - aTime;
-    });
+    if (sort === "name") {
+      output.sort((a, b) => a.name.localeCompare(b.name, "es", { numeric: true, sensitivity: "base" }));
+    } else if (sort === "size") {
+      output.sort((a, b) => b.sizeBytes - a.sizeBytes);
+    } else if (sort === "oldest") {
+      output.sort((a, b) => (Date.parse(a.updatedAt) || 0) - (Date.parse(b.updatedAt) || 0));
+    }
+    // Nota: para sort === "recent", dashboard.files ya viene ordenado por updated_at DESC desde SQLite
     return section === "home" ? output.slice(0, 12) : output;
   }, [dashboard, currentFolderId, fileFilter, query, section, selectedTag, sort]);
+
+  const [visibleCount, setVisibleCount] = useState(80);
+  const loadMoreSentinelRef = useRef<HTMLDivElement>(null);
+
+  useEffect(() => {
+    setVisibleCount(80);
+  }, [section, currentFolderId, fileFilter, query, sort, selectedTag]);
+
+  useEffect(() => {
+    const el = loadMoreSentinelRef.current;
+    if (!el) return;
+    const observer = new IntersectionObserver(
+      (entries) => {
+        if (entries.some((e) => e.isIntersecting)) {
+          setVisibleCount((prev) => Math.min(prev + 80, files.length));
+        }
+      },
+      { rootMargin: "400px" }
+    );
+    observer.observe(el);
+    return () => observer.disconnect();
+  }, [files.length, visibleCount]);
+
+  const visibleFiles = useMemo(() => {
+    return files.slice(0, visibleCount);
+  }, [files, visibleCount]);
 
   useEffect(() => {
     if (currentFolderId && dashboard && !dashboard.folders.some((folder) => folder.id === currentFolderId && !folder.trashed)) {
@@ -1792,9 +1836,27 @@ function App() {
                 )}
               </div>
             ) : files.length === 0 ? null : view === "grid" ? (
-              <div className="file-grid">{files.map((file) => <FileCard key={file.id} file={file} selected={selectedFiles.has(file.id)} isDragging={draggingFileIds.includes(file.id)} onSelect={() => toggleSelection(file.id)} onFavorite={() => void action(() => setFavorite(file.id, !file.favorite))} onDownload={() => void handleBulkDownload([file.id])} onPreview={() => void handleMedia(file)} onMove={() => setMoveDialog({ kind: "files", ids: [file.id] })} onTrash={() => void action(() => setTrashed(file.id, !file.trashed))} onDelete={() => void handlePermanentDelete([file.id])} onDragStart={(event) => desktopDragStart(event, file)} onDragEnd={clearFileDrag} onPointerDown={(event) => touchDragStart(event, file)} onPointerMove={touchDragMove} onPointerUp={touchDragEnd} onPointerCancel={() => { if (touchDragRef.current) clearFileDrag(); }} />)}</div>
+              <>
+                <div className="file-grid">{visibleFiles.map((file) => <FileCard key={file.id} file={file} selected={selectedFiles.has(file.id)} isDragging={draggingFileIds.includes(file.id)} onSelect={() => toggleSelection(file.id)} onFavorite={() => void action(() => setFavorite(file.id, !file.favorite))} onDownload={() => void handleBulkDownload([file.id])} onPreview={() => void handleMedia(file)} onMove={() => setMoveDialog({ kind: "files", ids: [file.id] })} onTrash={() => void action(() => setTrashed(file.id, !file.trashed))} onDelete={() => void handlePermanentDelete([file.id])} onDragStart={(event) => desktopDragStart(event, file)} onDragEnd={clearFileDrag} onPointerDown={(event) => touchDragStart(event, file)} onPointerMove={touchDragMove} onPointerUp={touchDragEnd} onPointerCancel={() => { if (touchDragRef.current) clearFileDrag(); }} />)}</div>
+                {visibleCount < files.length && (
+                  <div ref={loadMoreSentinelRef} className="load-more-sentinel" style={{ padding: "16px 0", textAlign: "center" }}>
+                    <button className="secondary-button" type="button" onClick={() => setVisibleCount((prev) => Math.min(prev + 80, files.length))}>
+                      Cargar más ({visibleFiles.length} de {files.length})
+                    </button>
+                  </div>
+                )}
+              </>
             ) : (
-              <div className="file-list"><div className="file-list-head"><span>Nombre</span><span>Ubicación</span><span>Tamaño</span><span>Modificado</span><span /></div>{files.map((file) => <FileRow key={file.id} file={file} selected={selectedFiles.has(file.id)} isDragging={draggingFileIds.includes(file.id)} onSelect={() => toggleSelection(file.id)} onFavorite={() => void action(() => setFavorite(file.id, !file.favorite))} onDownload={() => void handleBulkDownload([file.id])} onPreview={() => void handleMedia(file)} onMove={() => setMoveDialog({ kind: "files", ids: [file.id] })} onTrash={() => void action(() => setTrashed(file.id, !file.trashed))} onDelete={() => void handlePermanentDelete([file.id])} onDragStart={(event) => desktopDragStart(event, file)} onDragEnd={clearFileDrag} onPointerDown={(event) => touchDragStart(event, file)} onPointerMove={touchDragMove} onPointerUp={touchDragEnd} onPointerCancel={() => { if (touchDragRef.current) clearFileDrag(); }} />)}</div>
+              <>
+                <div className="file-list"><div className="file-list-head"><span>Nombre</span><span>Ubicación</span><span>Tamaño</span><span>Modificado</span><span /></div>{visibleFiles.map((file) => <FileRow key={file.id} file={file} selected={selectedFiles.has(file.id)} isDragging={draggingFileIds.includes(file.id)} onSelect={() => toggleSelection(file.id)} onFavorite={() => void action(() => setFavorite(file.id, !file.favorite))} onDownload={() => void handleBulkDownload([file.id])} onPreview={() => void handleMedia(file)} onMove={() => setMoveDialog({ kind: "files", ids: [file.id] })} onTrash={() => void action(() => setTrashed(file.id, !file.trashed))} onDelete={() => void handlePermanentDelete([file.id])} onDragStart={(event) => desktopDragStart(event, file)} onDragEnd={clearFileDrag} onPointerDown={(event) => touchDragStart(event, file)} onPointerMove={touchDragMove} onPointerUp={touchDragEnd} onPointerCancel={() => { if (touchDragRef.current) clearFileDrag(); }} />)}</div>
+                {visibleCount < files.length && (
+                  <div ref={loadMoreSentinelRef} className="load-more-sentinel" style={{ padding: "16px 0", textAlign: "center" }}>
+                    <button className="secondary-button" type="button" onClick={() => setVisibleCount((prev) => Math.min(prev + 80, files.length))}>
+                      Cargar más ({visibleFiles.length} de {files.length})
+                    </button>
+                  </div>
+                )}
+              </>
             )}
           </section>}
         </div>
@@ -2417,7 +2479,7 @@ type FileActions = {
   onPointerCancel: () => void;
 };
 
-function FileCard({ file, selected, isDragging, onSelect, onFavorite, onDownload, onPreview, onMove, onTrash, onDelete, onDragStart, onDragEnd, onPointerDown, onPointerMove, onPointerUp, onPointerCancel }: FileActions) {
+const FileCard = memo(function FileCard({ file, selected, isDragging, onSelect, onFavorite, onDownload, onPreview, onMove, onTrash, onDelete, onDragStart, onDragEnd, onPointerDown, onPointerMove, onPointerUp, onPointerCancel }: FileActions) {
   const Icon = kindIcon(file.kind);
   return <article className={`file-card ${selected ? "selected" : ""} ${isDragging ? "is-touch-dragging" : ""}`} draggable={false} tabIndex={0} aria-label={fileName(file)} onClick={(event) => { if (!(event.target as Element).closest("button,input,label,select,a")) onSelect(); }} onKeyDown={(event) => { if (event.target === event.currentTarget && event.key === " ") { event.preventDefault(); onSelect(); } }} onDragStart={onDragStart} onDragEnd={onDragEnd} onPointerDown={onPointerDown} onPointerMove={onPointerMove} onPointerUp={onPointerUp} onPointerCancel={onPointerCancel}>
     <div className={`file-preview kind-${file.kind}`}>
@@ -2440,9 +2502,9 @@ function FileCard({ file, selected, isDragging, onSelect, onFavorite, onDownload
       <div className="file-meta"><span>{formatBytes(file.sizeBytes)}</span><span className="meta-dot" /><span>{relativeDate(file.updatedAt)}</span></div>
     </div>
   </article>;
-}
+});
 
-function FileRow({ file, selected, isDragging, onSelect, onFavorite, onDownload, onPreview, onMove, onTrash, onDelete, onDragStart, onDragEnd, onPointerDown, onPointerMove, onPointerUp, onPointerCancel }: FileActions) {
+const FileRow = memo(function FileRow({ file, selected, isDragging, onSelect, onFavorite, onDownload, onPreview, onMove, onTrash, onDelete, onDragStart, onDragEnd, onPointerDown, onPointerMove, onPointerUp, onPointerCancel }: FileActions) {
   const Icon = kindIcon(file.kind);
   return <article className={`file-row ${selected ? "selected" : ""} ${isDragging ? "is-touch-dragging" : ""}`} draggable={false} tabIndex={0} aria-label={fileName(file)} onClick={(event) => { if (!(event.target as Element).closest("button,input,label,select,a")) onSelect(); }} onKeyDown={(event) => { if (event.target === event.currentTarget && event.key === " ") { event.preventDefault(); onSelect(); } }} onDragStart={onDragStart} onDragEnd={onDragEnd} onPointerDown={onPointerDown} onPointerMove={onPointerMove} onPointerUp={onPointerUp} onPointerCancel={onPointerCancel}>
     <div className="file-row-name">
@@ -2460,6 +2522,6 @@ function FileRow({ file, selected, isDragging, onSelect, onFavorite, onDownload,
       {file.trashed && <button className="ghost-icon danger" onClick={onDelete} title="Eliminar definitivamente"><Trash2 size={16} /></button>}
     </div>
   </article>;
-}
+});
 
 export default App;

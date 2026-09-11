@@ -202,7 +202,11 @@ impl CatalogRepository {
 
         let rows = statement.query_map([], |row| {
             let tags_json: String = row.get(10)?;
-            let tags = serde_json::from_str::<Vec<String>>(&tags_json).unwrap_or_default();
+            let tags = if tags_json.is_empty() || tags_json == "[]" {
+                Vec::new()
+            } else {
+                serde_json::from_str::<Vec<String>>(&tags_json).unwrap_or_default()
+            };
             Ok(CloudFile {
                 id: row.get(0)?,
                 name: row.get(1)?,
