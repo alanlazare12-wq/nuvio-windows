@@ -140,8 +140,11 @@ impl CatalogRepository {
                 key TEXT PRIMARY KEY NOT NULL,
                 value TEXT NOT NULL
             );
-            INSERT OR IGNORE INTO app_settings VALUES ('preparation_concurrency','2');
-            INSERT OR IGNORE INTO app_settings VALUES ('upload_concurrency','1');
+            INSERT OR IGNORE INTO app_settings VALUES ('preparation_concurrency','4');
+            INSERT OR IGNORE INTO app_settings VALUES ('upload_concurrency','8');
+            UPDATE app_settings SET value='8' WHERE key='upload_concurrency' AND value='4'
+            AND NOT EXISTS (SELECT 1 FROM app_meta WHERE key='upload_concurrency_v2');
+            INSERT OR IGNORE INTO app_meta VALUES ('upload_concurrency_v2','1');
             INSERT OR IGNORE INTO app_settings VALUES ('download_concurrency','2');
             INSERT OR IGNORE INTO app_settings VALUES ('cache_limit_bytes','2147483648');
             INSERT OR IGNORE INTO app_settings VALUES ('remember_session','0');
@@ -459,14 +462,17 @@ impl CatalogRepository {
     }
 
     pub fn queue_summary(&self, cache_bytes: i64) -> Result<QueueSummary, RepositoryError> {
-        let jobs: Vec<_> = self
-            .list_transfers()?
+        let all_jobs = self.list_transfers()?;
+        let completed = all_jobs
+            .iter()
+            .filter(|job| matches!(job.status.as_str(), "completed" | "duplicate"))
+            .count();
+        let jobs: Vec<_> = all_jobs
             .into_iter()
             .filter(|job| !matches!(job.status.as_str(), "completed" | "duplicate" | "cancelled"))
             .collect();
         let settings = self.settings()?;
         let total = jobs.len();
-        let completed = 0;
         let failed = jobs.iter().filter(|j| j.status == "failed").count();
         let active = jobs
             .iter()
@@ -545,15 +551,15 @@ impl CatalogRepository {
         let prep = get("preparation_concurrency")?
             .and_then(|v| v.parse().ok())
             .unwrap_or(defaults.preparation_concurrency)
-            .clamp(1, 4);
+            .clamp(1, 8);
         let upload = get("upload_concurrency")?
             .and_then(|v| v.parse().ok())
             .unwrap_or(defaults.upload_concurrency)
-            .clamp(1, 2);
+            .clamp(1, 16);
         let download = get("download_concurrency")?
             .and_then(|v| v.parse().ok())
             .unwrap_or(defaults.download_concurrency)
-            .clamp(1, 4);
+            .clamp(1, 8);
         let cache = get("cache_limit_bytes")?
             .and_then(|v| v.parse().ok())
             .unwrap_or(defaults.cache_limit_bytes)
@@ -1178,6 +1184,7 @@ mod tests {
         let summary = repo.queue_summary(0).unwrap();
         assert_eq!(summary.total, 1);
         assert_eq!(summary.pending, 1);
+        assert_eq!(summary.completed, 1);
         assert_eq!(repo.unfinished_count().unwrap(), 1);
         assert_eq!(repo.list_transfers().unwrap().len(), 2);
 
@@ -1270,5 +1277,36 @@ mod tests {
         let file = repo.list_files().unwrap().remove(0);
         assert!(file.folder_id.is_none());
         assert_eq!(file.folder, "Mi unidad");
+    }
+    #[test]
+    fn upload_concurrency_migrates_once_and_preserves_user_choices() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("db");
+        let repo = CatalogRepository::open(&path).unwrap();
+        assert_eq!(repo.settings().unwrap().upload_concurrency, 8);
+        repo.set_setting("upload_concurrency", "4").unwrap();
+        repo.connection
+            .lock()
+            .unwrap()
+            .execute("DELETE FROM app_meta WHERE key='upload_concurrency_v2'", [])
+            .unwrap();
+        drop(repo);
+        let repo = CatalogRepository::open(&path).unwrap();
+        assert_eq!(repo.settings().unwrap().upload_concurrency, 8);
+        for value in [1, 4, 8, 16] {
+            repo.set_setting("upload_concurrency", &value.to_string())
+                .unwrap();
+            assert_eq!(repo.settings().unwrap().upload_concurrency, value);
+        }
+        repo.set_setting("upload_concurrency", "4").unwrap();
+        drop(repo);
+        assert_eq!(
+            CatalogRepository::open(&path)
+                .unwrap()
+                .settings()
+                .unwrap()
+                .upload_concurrency,
+            4
+        );
     }
 }

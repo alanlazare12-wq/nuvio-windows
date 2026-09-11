@@ -1,3 +1,10 @@
+## Actualización 2026-09-11
+
+- Barra de sincronización con avance del historial, fase de aplicación del catálogo, estimación del tiempo restante y errores visibles.
+- Ocho subidas simultáneas por defecto y selector de 1 a 16 aplicable sin reiniciar.
+- Orden natural de números en nombres de archivos y carpetas; Recientes muestra todos sus resultados.
+- Corrección de la lectura de preferencias de concurrencia y pruebas de filtros combinados, arrastre y progreso en escritorio y móvil.
+
 # Historial de Nuvio
 
 ## 1.1.0 — 2026-09-10

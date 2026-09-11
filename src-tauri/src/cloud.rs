@@ -804,7 +804,36 @@ impl TelegramService {
     }
 
     pub async fn sync_catalog(&self, repo: &CatalogRepository) -> Result<usize, String> {
+        let _gate = self.catalog_sync_gate.lock().await;
+        let mut progress = crate::progress::SyncRun::new(&self.sync_progress);
+        let result = self.sync_catalog_inner(repo, &progress).await;
+        progress.finish(result.as_ref().err().cloned());
+        result
+    }
+
+    async fn sync_catalog_inner(
+        &self,
+        repo: &CatalogRepository,
+        progress: &crate::progress::SyncRun<'_>,
+    ) -> Result<usize, String> {
         let chat = self.own_chat(repo).await?;
+        let total = match tokio::time::timeout(
+            Duration::from_secs(5),
+            call(f::get_chat_message_count(
+                chat,
+                None,
+                e::SearchMessagesFilter::Empty,
+                false,
+                self.client_id,
+            )),
+        )
+        .await
+        {
+            Ok(Ok(e::Count::Count(count))) => usize::try_from(count.count).ok(),
+            _ => None,
+        };
+        let mut scanned = 0;
+        progress.scanned(scanned, total);
         let mut cursor = 0;
         let mut documents = Vec::new();
         let mut latest_folder_events = std::collections::HashMap::<String, FolderEvent>::new();
@@ -826,6 +855,7 @@ impl TelegramService {
                     continue;
                 }
                 found = true;
+                scanned += 1;
                 last = msg.id;
                 if let Some(event) = folder_event(&msg) {
                     latest_folder_events
@@ -841,6 +871,7 @@ impl TelegramService {
                     documents.push(doc);
                 }
             }
+            progress.scanned(scanned, total);
             if !found || last == cursor {
                 break;
             }
@@ -848,11 +879,13 @@ impl TelegramService {
             tokio::time::sleep(Duration::from_millis(60)).await;
         }
 
+        progress.applying(0, documents.len());
         repo.apply_folder_snapshot(latest_folder_events.into_values().collect())?;
 
         let count = documents.len();
-        for doc in documents.into_iter().rev() {
+        for (index, doc) in documents.into_iter().rev().enumerate() {
             repo.record_remote(&doc).map_err(|e| e.to_string())?;
+            progress.applying(index + 1, count);
         }
         for (message_id, folder_id) in latest_moves {
             let file_id = format!("tg-{message_id}");

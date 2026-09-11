@@ -87,8 +87,8 @@ pub struct AppSettings {
 impl Default for AppSettings {
     fn default() -> Self {
         Self {
-            preparation_concurrency: 2,
-            upload_concurrency: 1,
+            preparation_concurrency: 4,
+            upload_concurrency: 8,
             download_concurrency: 2,
             cache_limit_bytes: 2 * 1024 * 1024 * 1024,
             remember_session: false,
@@ -101,6 +101,7 @@ impl Default for AppSettings {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DashboardData {
+    pub sync_progress: crate::progress::SyncProgress,
     pub files: Vec<CloudFile>,
     pub folders: Vec<CloudFolder>,
     pub transfers: Vec<TransferJob>,
@@ -114,4 +115,5 @@ pub struct DashboardData {
     pub provider_status: String,
     pub queue_summary: QueueSummary,
     pub settings: AppSettings,
+    pub is_premium: bool,
 }

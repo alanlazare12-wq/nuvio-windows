@@ -40,6 +40,8 @@ impl Default for TelegramAuthSnapshot {
 }
 
 pub struct TelegramService {
+    pub(crate) sync_progress: Mutex<crate::progress::SyncProgress>,
+    pub(crate) catalog_sync_gate: tokio::sync::Mutex<()>,
     pub(crate) client_id: i32,
     database_directory: PathBuf,
     files_directory: PathBuf,
@@ -102,6 +104,8 @@ impl TelegramService {
             })
             .map_err(|e| e.to_string())?;
         Ok(Self {
+            sync_progress: Mutex::new(crate::progress::SyncProgress::default()),
+            catalog_sync_gate: tokio::sync::Mutex::new(()),
             client_id,
             database_directory,
             files_directory,
@@ -278,6 +282,16 @@ impl TelegramService {
         ))
         .await;
         code.zeroize();
+        result?;
+        self.refresh().await
+    }
+
+    pub async fn resend_code(&self) -> Result<TelegramAuthSnapshot, String> {
+        let result = call(tdlib_rs::functions::resend_authentication_code(
+            None,
+            self.client_id,
+        ))
+        .await;
         result?;
         self.refresh().await
     }

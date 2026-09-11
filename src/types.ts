@@ -109,7 +109,9 @@ export type AppSettings = {
   speedLimitBps?: number | null;
 };
 
+export type SyncProgress = { active: boolean; phase: string; scanned: number; total?: number | null; percent?: number | null; etaSeconds?: number | null; error?: string | null };
 export type DashboardData = {
+  syncProgress?: SyncProgress;
   files: CloudFile[];
   folders: CloudFolder[];
   transfers: TransferJob[];
@@ -123,6 +125,7 @@ export type DashboardData = {
   providerStatus: string;
   queueSummary: QueueSummary;
   settings: AppSettings;
+  isPremium?: boolean;
 };
 
 export type TelegramAuthStage =
@@ -162,6 +165,19 @@ export type PreparedUpload = {
   status: TransferStatus;
 };
 
+export type ScannedUploadFile = {
+  relativePath: string;
+  absolutePath: string;
+  size: number;
+};
+
+export type DirectoryUploadPlan = {
+  rootName: string;
+  folders: string[];
+  files: ScannedUploadFile[];
+  totalBytes: number;
+};
+
 export type BatchDownloadItem = {
   fileId: string;
   transferId?: string | null;
@@ -181,3 +197,16 @@ export type FileFilter = "all" | FileKind;
 export type SectionKey = "home" | "files" | "favorites" | "recent" | "history" | "trash";
 export type SortKey = "recent" | "oldest" | "name" | "size";
 export type TransferFilter = "all" | "pending" | "failed" | "completed";
+
+export type SkippedUploadItem = {
+  fileName: string;
+  path: string;
+  reason: string;
+  sizeBytes?: number;
+};
+
+export type DroppedPathInfo = {
+  path: string;
+  isDir: boolean;
+  name: string;
+};

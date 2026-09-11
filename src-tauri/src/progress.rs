@@ -69,3 +69,101 @@ mod tests {
         assert_eq!(SpeedEstimator::eta(100, 100, 10), Some(0));
     }
 }
+
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SyncProgress {
+    pub active: bool,
+    pub phase: String,
+    pub scanned: usize,
+    pub total: Option<usize>,
+    pub percent: Option<u8>,
+    pub eta_seconds: Option<u64>,
+    pub error: Option<String>,
+}
+
+pub struct SyncRun<'a> {
+    state: &'a std::sync::Mutex<SyncProgress>,
+    started: Instant,
+    finished: bool,
+}
+impl<'a> SyncRun<'a> {
+    pub fn new(state: &'a std::sync::Mutex<SyncProgress>) -> Self {
+        *state.lock().expect("sync progress") = SyncProgress {
+            active: true,
+            phase: "scanning".into(),
+            ..Default::default()
+        };
+        Self {
+            state,
+            started: Instant::now(),
+            finished: false,
+        }
+    }
+    pub fn scanned(&self, scanned: usize, total: Option<usize>) {
+        let mut state = self.state.lock().expect("sync progress");
+        state.scanned = scanned;
+        state.total = total;
+        state.percent = total
+            .filter(|n| *n > 0)
+            .map(|n| ((scanned as f64 / n as f64 * 90.0) as u8).min(89));
+        state.eta_seconds = total.filter(|n| *n > scanned && scanned > 0).map(|n| {
+            (self.started.elapsed().as_secs_f64() * (n - scanned) as f64 / scanned as f64).ceil()
+                as u64
+        });
+    }
+    pub fn applying(&self, processed: usize, total: usize) {
+        let mut state = self.state.lock().expect("sync progress");
+        state.phase = "applying".into();
+        state.percent = Some(90 + (processed.saturating_mul(9) / total.max(1)).min(9) as u8);
+        state.eta_seconds = None;
+    }
+    pub fn finish(&mut self, error: Option<String>) {
+        let mut state = self.state.lock().expect("sync progress");
+        state.active = false;
+        state.phase = if error.is_some() { "error" } else { "complete" }.into();
+        if error.is_none() {
+            state.percent = Some(100);
+            state.eta_seconds = Some(0);
+        }
+        state.error = error;
+        self.finished = true;
+    }
+}
+impl Drop for SyncRun<'_> {
+    fn drop(&mut self) {
+        if !self.finished {
+            self.finish(Some("Sincronización interrumpida".into()));
+        }
+    }
+}
+
+#[cfg(test)]
+mod sync_tests {
+    use super::*;
+    #[test]
+    fn progress_completes_only_after_success() {
+        let state = std::sync::Mutex::new(SyncProgress::default());
+        let mut run = SyncRun::new(&state);
+        run.scanned(200, Some(100));
+        assert_eq!(state.lock().unwrap().percent, Some(89));
+        run.applying(4, 4);
+        assert_eq!(state.lock().unwrap().percent, Some(99));
+        run.finish(None);
+        assert_eq!(state.lock().unwrap().percent, Some(100));
+        assert!(!state.lock().unwrap().active);
+    }
+    #[test]
+    fn unknown_total_and_interruption_do_not_fake_completion() {
+        let state = std::sync::Mutex::new(SyncProgress::default());
+        {
+            let run = SyncRun::new(&state);
+            run.scanned(10, None);
+            assert_eq!(state.lock().unwrap().percent, None);
+        }
+        let state = state.lock().unwrap();
+        assert!(!state.active);
+        assert_eq!(state.phase, "error");
+        assert!(state.error.is_some());
+    }
+}

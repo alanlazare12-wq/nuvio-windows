@@ -15,6 +15,8 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use serde::{Deserialize, Serialize};
+
 use cloud::BatchDownloadItem;
 use crypto::decrypt_file;
 use domain::{AppSettings, DashboardData};
@@ -80,9 +82,15 @@ fn get_dashboard(state: State<'_, Arc<AppState>>) -> Result<DashboardData, Strin
         .iter()
         .filter(|file| file.favorite && !file.trashed)
         .count();
-    let recent_count = file_count.min(4);
+    let recent_count = file_count;
 
     Ok(DashboardData {
+        sync_progress: state
+            .telegram
+            .sync_progress
+            .lock()
+            .expect("sync progress")
+            .clone(),
         files,
         folders,
         transfers,
@@ -107,6 +115,7 @@ fn get_dashboard(state: State<'_, Arc<AppState>>) -> Result<DashboardData, Strin
             }),
         queue_summary,
         settings,
+        is_premium: state.telegram.cached_snapshot().is_premium,
     })
 }
 
@@ -166,12 +175,27 @@ async fn prepare_upload(
     }
     let size = metadata.len();
     if size == 0 {
-        return Err("Telegram no permite subir archivos vacíos".into());
+        #[cfg(target_os = "android")]
+        if source.to_string_lossy().contains("upload_staging") {
+            let _ = fs::remove_file(&source);
+        }
+        return Err("Telegram no permite subir archivos vacíos (0 B)".into());
     }
     if size > limit {
+        #[cfg(target_os = "android")]
+        if source.to_string_lossy().contains("upload_staging") {
+            let _ = fs::remove_file(&source);
+        }
+        let size_gb = size as f64 / 1_000_000_000.0;
         return Err(format!(
-            "El archivo supera el límite de {} GB por archivo de esta cuenta",
-            limit / 1_000_000_000
+            "Pesa {:.2} GB. Supera el límite de {} GB por archivo de Telegram ({})",
+            size_gb,
+            limit / 1_000_000_000,
+            if state.telegram.cached_snapshot().is_premium {
+                "límite Telegram Premium"
+            } else {
+                "cuenta estándar"
+            }
         ));
     }
     let owned = state.clone();
@@ -297,6 +321,128 @@ async fn pick_download_directory() -> Result<Option<String>, String> {
     return mobile::pick_directory().await;
     #[cfg(not(target_os = "android"))]
     Ok(None)
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ScannedUploadFile {
+    pub relative_path: String,
+    pub absolute_path: String,
+    pub size: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct DirectoryUploadPlan {
+    pub root_name: String,
+    pub folders: Vec<String>,
+    pub files: Vec<ScannedUploadFile>,
+    pub total_bytes: u64,
+}
+
+pub fn build_directory_upload_plan(dir_path: &Path) -> Result<DirectoryUploadPlan, String> {
+    if !dir_path.exists() {
+        return Err("La carpeta seleccionada no existe".to_string());
+    }
+    if !dir_path.is_dir() {
+        return Err("La ruta seleccionada no es una carpeta".to_string());
+    }
+    let root_name = dir_path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "Carpeta".to_string());
+
+    let mut folders_set = std::collections::BTreeSet::new();
+    let mut files = Vec::new();
+    let mut total_bytes = 0u64;
+
+    fn walk_dir(
+        current: &Path,
+        root: &Path,
+        folders_set: &mut std::collections::BTreeSet<String>,
+        files: &mut Vec<ScannedUploadFile>,
+        total_bytes: &mut u64,
+    ) -> Result<(), String> {
+        let entries =
+            std::fs::read_dir(current).map_err(|e| format!("No se pudo leer la carpeta: {e}"))?;
+        for entry in entries {
+            let entry = entry.map_err(|e| format!("Error al leer elemento: {e}"))?;
+            let path = entry.path();
+            let file_name = entry.file_name();
+            let file_name_str = file_name.to_string_lossy();
+
+            if file_name_str.starts_with('.')
+                || file_name_str.eq_ignore_ascii_case("thumbs.db")
+                || file_name_str.eq_ignore_ascii_case("desktop.ini")
+            {
+                continue;
+            }
+
+            let rel_path = path
+                .strip_prefix(root)
+                .map_err(|e| e.to_string())?
+                .to_string_lossy()
+                .replace('\\', "/");
+
+            let metadata = entry.metadata().map_err(|e| e.to_string())?;
+            if metadata.is_dir() {
+                folders_set.insert(rel_path.clone());
+                walk_dir(&path, root, folders_set, files, total_bytes)?;
+            } else if metadata.is_file() {
+                let size = metadata.len();
+                *total_bytes += size;
+                if let Some(parent) = path.parent() {
+                    if let Ok(parent_rel) = parent.strip_prefix(root) {
+                        let normalized_parent = parent_rel.to_string_lossy().replace('\\', "/");
+                        if !normalized_parent.is_empty() {
+                            folders_set.insert(normalized_parent);
+                        }
+                    }
+                }
+                files.push(ScannedUploadFile {
+                    relative_path: rel_path,
+                    absolute_path: path.to_string_lossy().to_string(),
+                    size,
+                });
+            }
+        }
+        Ok(())
+    }
+
+    walk_dir(
+        dir_path,
+        dir_path,
+        &mut folders_set,
+        &mut files,
+        &mut total_bytes,
+    )?;
+
+    let mut folders: Vec<String> = folders_set.into_iter().collect();
+    folders.sort_by(|a, b| {
+        let depth_a = a.split('/').count();
+        let depth_b = b.split('/').count();
+        depth_a.cmp(&depth_b).then_with(|| a.cmp(b))
+    });
+
+    Ok(DirectoryUploadPlan {
+        root_name,
+        folders,
+        files,
+        total_bytes,
+    })
+}
+
+#[tauri::command]
+async fn scan_directory_for_upload(path: String) -> Result<DirectoryUploadPlan, String> {
+    let target = Path::new(&path);
+    build_directory_upload_plan(target)
+}
+
+#[tauri::command]
+async fn pick_upload_directory() -> Result<Option<DirectoryUploadPlan>, String> {
+    mobile::pick_upload_directory().await
 }
 
 #[tauri::command]
@@ -665,7 +811,11 @@ fn update_setting(
             }
         }
         "preparation_concurrency" | "upload_concurrency" | "download_concurrency" => {
-            let _: usize = value.parse().map_err(|_| "Concurrencia inválida")?;
+            let parsed: usize = value.parse().map_err(|_| "Concurrencia inválida")?;
+            let max = if key == "upload_concurrency" { 16 } else { 8 };
+            if !(1..=max).contains(&parsed) {
+                return Err(format!("La concurrencia debe estar entre 1 y {max}"));
+            }
         }
         "speed_limit_bps" => {
             if !value.is_empty() {
@@ -750,7 +900,18 @@ async fn worker(state: Arc<AppState>) {
             }
         }
 
-        if let Ok(permit) = state.upload_slots.clone().try_acquire_owned() {
+        let upload_limit = state
+            .repository
+            .settings()
+            .unwrap_or_default()
+            .upload_concurrency;
+        loop {
+            if 16 - state.upload_slots.available_permits() >= upload_limit {
+                break;
+            }
+            let Ok(permit) = state.upload_slots.clone().try_acquire_owned() else {
+                break;
+            };
             match state.repository.claim_pending("upload") {
                 Ok(Some(job)) => {
                     let owned = state.clone();
@@ -759,10 +920,14 @@ async fn worker(state: Arc<AppState>) {
                         run_job(owned, job).await;
                     });
                 }
-                Ok(None) => drop(permit),
+                Ok(None) => {
+                    drop(permit);
+                    break;
+                }
                 Err(error) => {
                     drop(permit);
                     *state.background_error.lock().expect("background") = Some(error.to_string());
+                    break;
                 }
             }
         }
@@ -791,6 +956,34 @@ async fn worker(state: Arc<AppState>) {
             }
         }
     }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DroppedPathInfo {
+    pub path: String,
+    pub is_dir: bool,
+    pub name: String,
+}
+
+#[tauri::command]
+fn inspect_dropped_paths(paths: Vec<String>) -> Vec<DroppedPathInfo> {
+    paths
+        .into_iter()
+        .map(|p| {
+            let path_buf = PathBuf::from(&p);
+            let is_dir = path_buf.is_dir();
+            let name = path_buf
+                .file_name()
+                .map(|n| n.to_string_lossy().to_string())
+                .unwrap_or_else(|| p.clone());
+            DroppedPathInfo {
+                path: p,
+                is_dir,
+                name,
+            }
+        })
+        .collect()
 }
 
 #[tauri::command]
@@ -856,6 +1049,12 @@ async fn telegram_submit_code(
     code: String,
 ) -> Result<TelegramAuthSnapshot, String> {
     state.telegram.submit_code(code).await
+}
+#[tauri::command]
+async fn telegram_resend_code(
+    state: State<'_, Arc<AppState>>,
+) -> Result<TelegramAuthSnapshot, String> {
+    state.telegram.resend_code().await
 }
 #[tauri::command]
 async fn telegram_submit_password(
@@ -953,7 +1152,7 @@ pub fn run() {
                 preparation_slots: Arc::new(tokio::sync::Semaphore::new(
                     settings.preparation_concurrency,
                 )),
-                upload_slots: Arc::new(tokio::sync::Semaphore::new(settings.upload_concurrency)),
+                upload_slots: Arc::new(tokio::sync::Semaphore::new(16)),
                 download_slots: Arc::new(tokio::sync::Semaphore::new(
                     settings.download_concurrency,
                 )),
@@ -978,6 +1177,9 @@ pub fn run() {
             get_dashboard,
             set_favorite,
             prepare_upload,
+            scan_directory_for_upload,
+            inspect_dropped_paths,
+            pick_upload_directory,
             pick_upload_files,
             decrypt_nuvio_file,
             sync_files,
@@ -1012,6 +1214,7 @@ pub fn run() {
             telegram_submit_email,
             telegram_submit_email_code,
             telegram_submit_code,
+            telegram_resend_code,
             telegram_submit_password,
             telegram_request_qr,
             telegram_register_user,
@@ -1020,4 +1223,85 @@ pub fn run() {
         ])
         .run(tauri::generate_context!())
         .expect("error while running Nuvio");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_build_directory_upload_plan_hierarchy_and_filtering() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("MiProyecto");
+        fs::create_dir_all(&root).unwrap();
+
+        // Create nested directories
+        let sub_docs = root.join("docs");
+        let sub_images = root.join("images");
+        let sub_nested = sub_images.join("2026");
+        let sub_empty = root.join("vacia");
+
+        fs::create_dir_all(&sub_docs).unwrap();
+        fs::create_dir_all(&sub_images).unwrap();
+        fs::create_dir_all(&sub_nested).unwrap();
+        fs::create_dir_all(&sub_empty).unwrap();
+
+        // Create files
+        fs::write(root.join("readme.txt"), b"hola").unwrap();
+        fs::write(sub_docs.join("manual.pdf"), b"documento").unwrap();
+        fs::write(sub_nested.join("foto.jpg"), b"imagen").unwrap();
+
+        // Create ignored files
+        fs::write(root.join(".gitignore"), b"node_modules").unwrap();
+        fs::write(sub_images.join("Thumbs.db"), b"cache").unwrap();
+        fs::write(sub_docs.join(".DS_Store"), b"apple").unwrap();
+
+        let plan = build_directory_upload_plan(&root).unwrap();
+
+        assert_eq!(plan.root_name, "MiProyecto");
+        assert_eq!(plan.files.len(), 3);
+
+        // Check relative paths of files
+        let file_rel_paths: Vec<&str> = plan
+            .files
+            .iter()
+            .map(|f| f.relative_path.as_str())
+            .collect();
+        assert!(file_rel_paths.contains(&"readme.txt"));
+        assert!(file_rel_paths.contains(&"docs/manual.pdf"));
+        assert!(file_rel_paths.contains(&"images/2026/foto.jpg"));
+        assert!(!file_rel_paths.iter().any(|p| p.contains(".gitignore")
+            || p.contains("Thumbs.db")
+            || p.contains(".DS_Store")));
+
+        // Folders must include all subdirectories in shallowest-first order
+        assert!(plan.folders.contains(&"docs".to_string()));
+        assert!(plan.folders.contains(&"images".to_string()));
+        assert!(plan.folders.contains(&"vacia".to_string()));
+        assert!(plan.folders.contains(&"images/2026".to_string()));
+
+        let idx_images = plan.folders.iter().position(|f| f == "images").unwrap();
+        let idx_nested = plan
+            .folders
+            .iter()
+            .position(|f| f == "images/2026")
+            .unwrap();
+        assert!(
+            idx_images < idx_nested,
+            "Parent folder must appear before nested subfolder"
+        );
+
+        assert_eq!(plan.total_bytes, 4 + 9 + 6);
+    }
+
+    #[test]
+    fn test_build_directory_upload_plan_errors() {
+        let temp = tempfile::tempdir().unwrap();
+        let non_existent = temp.path().join("does_not_exist");
+        assert!(build_directory_upload_plan(&non_existent).is_err());
+
+        let file_path = temp.path().join("file.txt");
+        fs::write(&file_path, b"not a dir").unwrap();
+        assert!(build_directory_upload_plan(&file_path).is_err());
+    }
 }

@@ -130,6 +130,36 @@ pub async fn stage_content_uri(uri: &str) -> Result<String, String> {
     Ok(result.path)
 }
 
+#[cfg(target_os = "android")]
+pub async fn pick_upload_directory() -> Result<Option<crate::DirectoryUploadPlan>, String> {
+    #[derive(Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    struct RawResponse {
+        cancelled: Option<bool>,
+        root_name: Option<String>,
+        folders: Option<Vec<String>>,
+        files: Option<Vec<crate::ScannedUploadFile>>,
+        total_bytes: Option<u64>,
+    }
+    let result: RawResponse = HANDLE
+        .get()
+        .ok_or("Android aún no está listo")?
+        .run_mobile_plugin_async("pickUploadDirectory", serde_json::json!({}))
+        .await
+        .map_err(|e| e.to_string())?;
+
+    if result.cancelled.unwrap_or(false) || result.root_name.is_none() {
+        return Ok(None);
+    }
+
+    Ok(Some(crate::DirectoryUploadPlan {
+        root_name: result.root_name.unwrap_or_else(|| "Carpeta".to_string()),
+        folders: result.folders.unwrap_or_default(),
+        files: result.files.unwrap_or_default(),
+        total_bytes: result.total_bytes.unwrap_or(0),
+    }))
+}
+
 #[allow(dead_code)]
 #[cfg(not(target_os = "android"))]
 pub async fn pick_upload_files() -> Result<Vec<String>, String> {
@@ -138,7 +168,12 @@ pub async fn pick_upload_files() -> Result<Vec<String>, String> {
 
 #[allow(dead_code)]
 #[cfg(not(target_os = "android"))]
+pub async fn pick_upload_directory() -> Result<Option<crate::DirectoryUploadPlan>, String> {
+    Ok(None)
+}
+
+#[allow(dead_code)]
+#[cfg(not(target_os = "android"))]
 pub async fn stage_content_uri(_uri: &str) -> Result<String, String> {
     Err("Los URI de Android sólo están soportados en Android".into())
 }
-

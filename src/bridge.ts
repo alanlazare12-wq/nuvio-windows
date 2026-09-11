@@ -6,6 +6,8 @@ import type {
   BatchDownloadItem,
   CloudFile,
   DashboardData,
+  DirectoryUploadPlan,
+  DroppedPathInfo,
   MediaReady,
   PreparedUpload,
   TelegramAuthSnapshot,
@@ -159,6 +161,23 @@ export async function selectFilesForUpload(): Promise<string[]> {
   return Array.isArray(selected) ? selected : [selected];
 }
 
+export async function selectFolderForUpload(): Promise<DirectoryUploadPlan | null> {
+  if ((await invoke<string>("platform_name")) === "android") {
+    return invoke<DirectoryUploadPlan | null>("pick_upload_directory");
+  }
+  const selected = await open({
+    multiple: false,
+    directory: true,
+    title: "Seleccionar carpeta para subir a Nuvio",
+  });
+  if (!selected || typeof selected !== "string") return null;
+  return scanDirectoryForUpload(selected);
+}
+
+export function scanDirectoryForUpload(path: string): Promise<DirectoryUploadPlan> {
+  return invoke<DirectoryUploadPlan>("scan_directory_for_upload", { path });
+}
+
 export function prepareUpload(
   path: string,
   encrypt = false,
@@ -177,32 +196,57 @@ export type PreparedUploadResult =
   | { ok: true; path: string; upload: PreparedUpload }
   | { ok: false; path: string; error: string };
 
-export async function prepareUploadBatch(
-  paths: string[],
-  concurrency = 2,
+export type UploadQueueItem = {
+  path: string;
+  folderId?: string | null;
+};
+
+export async function inspectDroppedPaths(paths: string[]): Promise<DroppedPathInfo[]> {
+  return invoke<DroppedPathInfo[]>("inspect_dropped_paths", { paths });
+}
+
+export async function prepareUploadItemsBatch(
+  items: UploadQueueItem[],
+  concurrency = 4,
   onSettled?: (result: PreparedUploadResult, completed: number, total: number) => void,
-  folderId?: string | null,
 ): Promise<PreparedUploadResult[]> {
-  const results = new Array<PreparedUploadResult>(paths.length);
+  const results = new Array<PreparedUploadResult>(items.length);
   let cursor = 0;
   let completed = 0;
-  const workerCount = Math.max(1, Math.min(concurrency, paths.length));
+  const workerCount = Math.max(1, Math.min(concurrency, items.length));
   const workers = Array.from({ length: workerCount }, async () => {
     while (true) {
       const index = cursor++;
-      if (index >= paths.length) return;
-      const path = paths[index];
+      if (index >= items.length) return;
+      const item = items[index];
       try {
-        results[index] = { ok: true, path, upload: await prepareUpload(path, false, undefined, folderId) };
+        results[index] = {
+          ok: true,
+          path: item.path,
+          upload: await prepareUpload(item.path, false, undefined, item.folderId),
+        };
       } catch (error) {
-        results[index] = { ok: false, path, error: readableError(error) };
+        results[index] = { ok: false, path: item.path, error: readableError(error) };
       }
       completed += 1;
-      onSettled?.(results[index], completed, paths.length);
+      onSettled?.(results[index], completed, items.length);
     }
   });
   await Promise.all(workers);
   return results;
+}
+
+export function prepareUploadBatch(
+  paths: string[],
+  concurrency = 4,
+  onSettled?: (result: PreparedUploadResult, completed: number, total: number) => void,
+  folderId?: string | null,
+): Promise<PreparedUploadResult[]> {
+  return prepareUploadItemsBatch(
+    paths.map((path) => ({ path, folderId })),
+    concurrency,
+    onSettled,
+  );
 }
 
 export async function decryptNuvioFile(
@@ -243,6 +287,10 @@ export function submitTelegramEmailCode(code: string): Promise<TelegramAuthSnaps
 
 export function submitTelegramCode(code: string): Promise<TelegramAuthSnapshot> {
   return invoke<TelegramAuthSnapshot>("telegram_submit_code", { code });
+}
+
+export function resendTelegramCode(): Promise<TelegramAuthSnapshot> {
+  return invoke<TelegramAuthSnapshot>("telegram_resend_code");
 }
 
 export function submitTelegramPassword(password: string): Promise<TelegramAuthSnapshot> {

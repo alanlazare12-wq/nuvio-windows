@@ -36,13 +36,14 @@ async function setup(viewport = { width: 1280, height: 820 }) {
           qa.dashboardPolls++;
           if (qa.dashboardError) throw qa.dashboardError;
           return {
-            files: structuredClone(qa.files), folders: structuredClone(qa.folders), transfers: [], transferHistory: [], totalBytes: 20000, fileCount: qa.files.length,
+            syncProgress: qa.syncProgress, files: structuredClone(qa.files), folders: structuredClone(qa.folders), transfers: [], transferHistory: [], totalBytes: 20000, fileCount: qa.files.length,
             favoriteCount: qa.files.filter(file => file.favorite && !file.trashed).length, recentCount: 12,
             telegramConnected: true, telegramAccountLabel: "Cuenta QA", providerStatus: "Conectado · entorno de pruebas",
             queueSummary: { total: 0, completed: 0, pending: 0, failed: 0, active: 0, processedBytes: 0, totalBytes: 0, speedBps: 0, cacheBytes: 0, cacheLimitBytes: 2147483648 },
             settings: { preparationConcurrency: 2, uploadConcurrency: 1, downloadConcurrency: 2, cacheLimitBytes: 2147483648, rememberSession: false, conflictPolicy: "skip" },
           };
         }
+        if (cmd === "update_setting") return {};
         if (cmd === "set_trashed") { qa.files.find(file => file.id === args.id).trashed = args.trashed; return; }
         if (cmd === "platform_name") return "windows";
         if (cmd === "create_folder") {
@@ -156,6 +157,7 @@ try {
     const name = page.locator(".file-card strong").first();
     await name.tap();
     await expect(page.locator(".file-card.selected")).toHaveCount(1);
+    await name.evaluate(element => element.scrollIntoView({ block: "center" }));
     const from = await name.boundingBox();
     const to = await page.locator(".folder-card").boundingBox();
     const a = { x: from.x + from.width / 2, y: from.y + from.height / 2 };
@@ -242,6 +244,49 @@ try {
     await page.getByRole("navigation", { name: "Principal", exact: true }).getByRole("button", { name: /Favoritos/ }).click();
     await expect(page.locator(".file-row")).toHaveCount(1);
   });
+  await test("natural-sort-filters-and-concurrency", async page => {
+    await page.getByRole("navigation", { name: "Principal", exact: true }).getByRole("button", { name: "Mis archivos", exact: true }).click();
+    await page.evaluate(() => { window.__qa.files[0].name = "Archivo 10"; window.__qa.files[1].name = "Archivo 2"; });
+    await page.getByRole("group", { name: "Tipo de archivo" }).getByRole("button", { name: "Audio", exact: true }).click();
+    await page.getByLabel("Ordenar", { exact: true }).selectOption("name");
+    await expect(page.locator(".file-card")).toHaveCount(2);
+    await expect(page.locator(".file-card").first()).toContainText("Archivo 2");
+    await page.getByLabel("Ordenar", { exact: true }).selectOption("size");
+    await expect(page.locator(".file-card").first()).toContainText("Archivo 2");
+    await page.getByLabel("Subidas simultáneas", { exact: true }).selectOption("16");
+    await expect.poll(() => page.evaluate(() => window.__qa.calls.some(c => c.cmd === "update_setting" && c.args.key === "upload_concurrency" && c.args.value === "16"))).toBe(true);
+  });
+  await test("recent-list-and-combined-filters", async page => {
+    await page.getByRole("navigation", { name: "Principal", exact: true }).getByRole("button", { name: /Recientes/ }).click();
+    await expect(page.locator(".file-card")).toHaveCount(16);
+    await page.getByLabel("Ordenar", { exact: true }).selectOption("oldest");
+    await expect(page.locator(".file-card").first()).toContainText("LEEME");
+    await page.getByLabel("Ordenar", { exact: true }).selectOption("recent");
+    await expect(page.locator(".file-card").first()).toContainText("Archivo 00");
+    await page.getByRole("navigation", { name: "Principal", exact: true }).getByRole("button", { name: /Favoritos/ }).click();
+    await expect(page.locator(".file-card")).toHaveCount(1);
+    await page.getByRole("group", { name: "Tipo de archivo" }).getByRole("button", { name: "Audio", exact: true }).click();
+    await expect(page.locator(".file-card")).toHaveCount(0);
+    await page.getByRole("button", { name: "Filtros", exact: true }).click();
+    await page.getByRole("button", { name: "Limpiar filtros", exact: true }).click();
+    await expect(page.locator(".file-card")).toHaveCount(1);
+  });
+  for (const width of [390, 1280]) {
+    await test(`sync-progress-${width}`, async page => {
+      await page.evaluate(() => { window.__qa.syncProgress = { active: true, phase: "scanning", scanned: 50, total: 100, percent: 45, etaSeconds: 12 }; });
+      const bar = page.getByRole("progressbar", { name: "Sincronización", exact: true });
+      await expect(bar).toHaveAttribute("value", "45");
+      await expect(page.getByLabel("Progreso de sincronización")).toContainText("12 s");
+      await page.evaluate(() => { window.__qa.syncProgress = { active: true, phase: "scanning", scanned: 70, percent: null }; });
+      await expect(bar).not.toHaveAttribute("value");
+      await page.evaluate(() => { window.__qa.syncProgress = { active: false, phase: "error", scanned: 70, percent: 63, error: "Sin conexión" }; });
+      await expect(page.getByLabel("Progreso de sincronización")).toContainText("Sin conexión");
+      await expect(bar).toHaveAttribute("value", "63");
+      await page.evaluate(() => { window.__qa.syncProgress = { active: false, phase: "complete", scanned: 100, percent: 100 }; });
+      await expect(bar).toHaveAttribute("value", "100");
+      assert.equal(await page.evaluate(() => document.documentElement.scrollWidth > window.innerWidth), false);
+    }, { width, height: 844 });
+  }
   await test("boot-error-detail", async page => {
     await page.addInitScript(() => { window.__qa.dashboardError = "No se pudo leer el catálogo de prueba"; });
     await page.reload();

@@ -1,13 +1,17 @@
 import {
+  AlertCircle,
+  AlertTriangle,
   Archive,
   ArrowDownToLine,
   ArrowUpFromLine,
   Check,
+  CheckCircle2,
   ChevronDown,
   ChevronLeft,
   ChevronRight,
   Clock3,
   Cloud,
+  Copy,
   Download,
   Eye,
   File,
@@ -20,6 +24,7 @@ import {
   Folder,
   FolderOpen,
   FolderPlus,
+  FolderUp,
   Grid2X2,
   HardDrive,
   Home,
@@ -46,6 +51,7 @@ import {
 } from "lucide-react";
 import { useEffect, useMemo, useRef, useState } from "react";
 import { convertFileSrc } from "@tauri-apps/api/core";
+import { getCurrentWebview } from "@tauri-apps/api/webview";
 import { isPermissionGranted, requestPermission, sendNotification } from "@tauri-apps/plugin-notification";
 import { getDocument, GlobalWorkerOptions } from "pdfjs-dist";
 import pdfWorker from "pdfjs-dist/build/pdf.worker.min.mjs?url";
@@ -63,6 +69,7 @@ import {
   exportDiagnostics,
   forgetTelegramSession,
   getTelegramAuthState,
+  inspectDroppedPaths,
   loadDashboard,
   logOutTelegram,
   moveFilesToFolder,
@@ -71,16 +78,20 @@ import {
   pauseTransfer,
   prepareMedia,
   prepareUploadBatch,
+  prepareUploadItemsBatch,
   queueDownloads,
   readableError,
   registerTelegramUser,
   requestTelegramQr,
   renameFolder,
+  resendTelegramCode,
   resumeQueue,
   resumeTransfer,
   retryTransfer,
+  scanDirectoryForUpload,
   selectDownloadDirectory,
   selectFilesForUpload,
+  selectFolderForUpload,
   setFavorite,
   setTrashed,
   setTrashedMany,
@@ -96,9 +107,11 @@ import type {
   CloudFile,
   CloudFolder,
   DashboardData,
+  DirectoryUploadPlan,
   FileFilter,
   FileKind,
   SectionKey,
+  SkippedUploadItem,
   SortKey,
   TelegramAuthSnapshot,
   TransferFilter,
@@ -286,6 +299,8 @@ function App() {
   const [syncBusy, setSyncBusy] = useState(false);
   const [loadError, setLoadError] = useState<string | null>(null);
   const [appNotice, setAppNotice] = useState<string | null>(null);
+  const [skippedFiles, setSkippedFiles] = useState<SkippedUploadItem[]>([]);
+  const [showSkippedModal, setShowSkippedModal] = useState(false);
   const [selectedFiles, setSelectedFiles] = useState<Set<string>>(() => new Set());
   const [transferFilter, setTransferFilter] = useState<TransferFilter>("all");
   const [mediaFile, setMediaFile] = useState<CloudFile | null>(null);
@@ -297,6 +312,8 @@ function App() {
   const draggingFileIdsRef = useRef<string[]>([]);
   const suppressClickUntilRef = useRef(0);
   const [dragTarget, setDragTarget] = useState<string | null>(null);
+  const [externalDragActive, setExternalDragActive] = useState(false);
+  const [externalDragTargetName, setExternalDragTargetName] = useState<string>("Mi unidad");
   const [touchDragPosition, setTouchDragPosition] = useState<{ x: number; y: number } | null>(null);
   const touchDragRef = useRef<{
     pointerId: number;
@@ -498,8 +515,54 @@ function App() {
     return dashboard.folders
       .filter((folder) => !folder.trashed && (needle ? true : (folder.parentId ?? null) === currentFolderId))
       .filter((folder) => !needle || folder.name.toLowerCase().includes(needle))
-      .sort((a, b) => a.name.localeCompare(b.name, "es"));
+      .sort((a, b) => a.name.localeCompare(b.name, "es", { numeric: true, sensitivity: "base" }));
   }, [dashboard, currentFolderId, query, section]);
+
+  useEffect(() => {
+    let unlisten: (() => void) | null = null;
+    try {
+      const webview = getCurrentWebview();
+      if (webview && typeof webview.onDragDropEvent === "function") {
+        void webview.onDragDropEvent((event) => {
+          if (event.payload.type === "enter" || event.payload.type === "over") {
+            setExternalDragActive(true);
+            const pos = event.payload.position;
+            if (pos) {
+              const dpr = window.devicePixelRatio || 1;
+              const targetKey = dropTargetKeyAt(pos.x / dpr, pos.y / dpr);
+              if (targetKey && targetKey !== "__root__") {
+                const folder = dashboard?.folders.find((f) => f.id === targetKey);
+                setExternalDragTargetName(folder ? folder.name : "esta carpeta");
+              } else if (currentFolder) {
+                setExternalDragTargetName(currentFolder.name);
+              } else {
+                setExternalDragTargetName("Mi unidad");
+              }
+            }
+          } else if (event.payload.type === "leave") {
+            setExternalDragActive(false);
+          } else if (event.payload.type === "drop") {
+            setExternalDragActive(false);
+            const paths = event.payload.paths;
+            if (paths && paths.length > 0) {
+              const pos = event.payload.position;
+              const dpr = window.devicePixelRatio || 1;
+              const targetKey = dropTargetKeyAt(pos.x / dpr, pos.y / dpr);
+              const targetFolderId = targetKey === "__root__"
+                ? null
+                : (targetKey || (section === "files" ? currentFolderId : null));
+              void handleExternalDrop(paths, targetFolderId);
+            }
+          }
+        }).then((fn) => { unlisten = fn; });
+      }
+    } catch {
+      // Plataforma no de escritorio o sin soporte nativo de drag & drop
+    }
+    return () => {
+      if (unlisten) unlisten();
+    };
+  }, [dashboard?.folders, currentFolder, currentFolderId, section]);
 
   const files = useMemo(() => {
     if (!dashboard) return [];
@@ -518,13 +581,13 @@ function App() {
       return normalized.includes(needle);
     });
     output = [...output].sort((a, b) => {
-      if (sort === "name") return a.name.localeCompare(b.name, "es");
+      if (sort === "name") return a.name.localeCompare(b.name, "es", { numeric: true, sensitivity: "base" });
       if (sort === "size") return b.sizeBytes - a.sizeBytes;
-      const aTime = new Date(a.updatedAt).getTime();
-      const bTime = new Date(b.updatedAt).getTime();
+      const aTime = new Date(a.updatedAt).getTime() || 0;
+      const bTime = new Date(b.updatedAt).getTime() || 0;
       return sort === "oldest" ? aTime - bTime : bTime - aTime;
     });
-    return section === "home" || section === "recent" ? output.slice(0, 12) : output;
+    return section === "home" ? output.slice(0, 12) : output;
   }, [dashboard, currentFolderId, fileFilter, query, section, selectedTag, sort]);
 
   useEffect(() => {
@@ -583,16 +646,225 @@ function App() {
       );
       const queued = results.filter((result) => result.ok && !result.upload.duplicate).length;
       const duplicates = results.filter((result) => result.ok && result.upload.duplicate).length;
-      const failed = results.filter((result) => !result.ok).length;
+      const failed = results.filter((result): result is { ok: false; path: string; error: string } => !result.ok);
+      if (failed.length > 0) {
+        const skippedItems: SkippedUploadItem[] = failed.map((item) => {
+          const fileName = item.path.split(/[\\/]/).pop() || item.path;
+          return {
+            fileName,
+            path: item.path,
+            reason: item.error,
+          };
+        });
+        setSkippedFiles(skippedItems);
+        setShowSkippedModal(true);
+      }
       const parts = [
         queued ? `${queued} listo${queued === 1 ? "" : "s"} para subir` : null,
         duplicates ? `${duplicates} duplicado${duplicates === 1 ? "" : "s"}` : null,
-        failed ? `${failed} error${failed === 1 ? "" : "es"}` : null,
+        failed.length ? `${failed.length} omitido${failed.length === 1 ? "" : "s"} (límite Telegram)` : null,
       ].filter(Boolean);
       setAppNotice(parts.join(" · ") || "No se añadieron archivos");
       await refreshDashboard();
     } catch (error) {
       setAppNotice(`No se pudo preparar la selección: ${readableError(error)}`);
+    } finally {
+      setUploadBusy(false);
+    }
+  };
+
+  const executeUploadFolderPlan = async (
+    plan: DirectoryUploadPlan,
+    targetFolderId: string | null,
+  ): Promise<void> => {
+    if (!plan.files.length && !plan.folders.length) {
+      setAppNotice(`La carpeta "${plan.rootName}" está vacía.`);
+      return;
+    }
+    setAppNotice(`Creando estructura de carpeta "${plan.rootName}"…`);
+
+    const knownFolders = [...(dashboard?.folders || [])];
+    const folderMap = new Map<string, string>();
+
+    const existingRoot = knownFolders.find(
+      (f) => !f.trashed && f.parentId === targetFolderId && f.name.toLowerCase() === plan.rootName.toLowerCase(),
+    );
+    let rootId: string;
+    if (existingRoot) {
+      rootId = existingRoot.id;
+    } else {
+      rootId = await createFolder(plan.rootName, targetFolderId);
+      knownFolders.push({
+        id: rootId,
+        name: plan.rootName,
+        parentId: targetFolderId,
+        trashed: false,
+        createdAt: Date.now() / 1000,
+        updatedAt: Date.now() / 1000,
+        fileCount: 0,
+        childCount: 0,
+        sizeBytes: 0,
+      });
+    }
+    folderMap.set("", rootId);
+
+    for (const relFolder of plan.folders) {
+      const segments = relFolder.split("/");
+      const folderName = segments[segments.length - 1];
+      const parentRel = segments.slice(0, -1).join("/");
+      const parentFolderId = folderMap.get(parentRel) ?? rootId;
+
+      const existingSub = knownFolders.find(
+        (f) => !f.trashed && f.parentId === parentFolderId && f.name.toLowerCase() === folderName.toLowerCase(),
+      );
+      if (existingSub) {
+        folderMap.set(relFolder, existingSub.id);
+      } else {
+        const newId = await createFolder(folderName, parentFolderId);
+        knownFolders.push({
+          id: newId,
+          name: folderName,
+          parentId: parentFolderId,
+          trashed: false,
+          createdAt: Date.now() / 1000,
+          updatedAt: Date.now() / 1000,
+          fileCount: 0,
+          childCount: 0,
+          sizeBytes: 0,
+        });
+        folderMap.set(relFolder, newId);
+      }
+    }
+
+    const itemsToPrepare = plan.files.map((file) => {
+      const parts = file.relativePath.split("/");
+      const fileFolderRel = parts.slice(0, -1).join("/");
+      const fileFolderId = folderMap.get(fileFolderRel) ?? rootId;
+      return {
+        path: file.absolutePath,
+        folderId: fileFolderId,
+      };
+    });
+
+    if (itemsToPrepare.length > 0) {
+      const concurrency = dashboard?.settings.preparationConcurrency || 4;
+      const results = await prepareUploadItemsBatch(
+        itemsToPrepare,
+        concurrency,
+        (_result, completed, total) => setAppNotice(`Preparando "${plan.rootName}" (${completed}/${total})…`),
+      );
+      const queued = results.filter((result) => result.ok && !result.upload.duplicate).length;
+      const duplicates = results.filter((result) => result.ok && result.upload.duplicate).length;
+      const failed = results.filter((result): result is { ok: false; path: string; error: string } => !result.ok);
+      if (failed.length > 0) {
+        const skippedItems: SkippedUploadItem[] = failed.map((item) => {
+          const scanned = plan.files.find((f) => f.absolutePath === item.path);
+          const fileName = scanned ? scanned.relativePath : (item.path.split(/[\\/]/).pop() || item.path);
+          return {
+            fileName,
+            path: item.path,
+            reason: item.error,
+            sizeBytes: scanned?.size,
+          };
+        });
+        setSkippedFiles((prev) => [...prev, ...skippedItems]);
+        setShowSkippedModal(true);
+      }
+      const parts = [
+        queued ? `${queued} listo${queued === 1 ? "" : "s"} para subir` : null,
+        duplicates ? `${duplicates} duplicado${duplicates === 1 ? "" : "s"}` : null,
+        failed.length ? `${failed.length} omitido${failed.length === 1 ? "" : "s"} (límite Telegram)` : null,
+      ].filter(Boolean);
+      setAppNotice(`Carpeta "${plan.rootName}": ${parts.join(" · ") || "Estructura creada"}`);
+    } else {
+      setAppNotice(`Carpeta "${plan.rootName}" creada con ${plan.folders.length} subcarpeta${plan.folders.length === 1 ? "" : "s"}`);
+    }
+  };
+
+  const handleUploadFolder = async () => {
+    if (uploadBusy) return;
+    if (!dashboard?.telegramConnected) {
+      setConnectModal(true);
+      return;
+    }
+    setUploadBusy(true);
+    setAppNotice(null);
+    try {
+      const plan = await selectFolderForUpload();
+      if (!plan) return;
+      const targetFolderId = section === "files" ? currentFolderId : null;
+      if (section !== "files") setCurrentFolderId(null);
+      setSection("files");
+      setMobileMenu(false);
+      await executeUploadFolderPlan(plan, targetFolderId);
+      await refreshDashboard();
+    } catch (error) {
+      setAppNotice(`No se pudo subir la carpeta: ${readableError(error)}`);
+    } finally {
+      setUploadBusy(false);
+    }
+  };
+
+  const handleExternalDrop = async (paths: string[], targetFolderId: string | null) => {
+    if (uploadBusy) return;
+    if (!dashboard?.telegramConnected) {
+      setAppNotice("Conecta Telegram para subir archivos a Nuvio.");
+      setConnectModal(true);
+      return;
+    }
+    setUploadBusy(true);
+    setAppNotice("Analizando elementos arrastrados…");
+    try {
+      const inspected = await inspectDroppedPaths(paths);
+      const directories = inspected.filter((item) => item.isDir);
+      const files = inspected.filter((item) => !item.isDir);
+
+      if (section !== "files") {
+        setCurrentFolderId(targetFolderId);
+        setSection("files");
+      }
+
+      for (const dir of directories) {
+        setAppNotice(`Escaneando carpeta "${dir.name}"…`);
+        const plan = await scanDirectoryForUpload(dir.path);
+        await executeUploadFolderPlan(plan, targetFolderId);
+      }
+
+      if (files.length > 0) {
+        const filePaths = files.map((f) => f.path);
+        setAppNotice(`Preparando ${files.length} archivo${files.length === 1 ? "" : "s"}…`);
+        const concurrency = dashboard?.settings.preparationConcurrency || 4;
+        const results = await prepareUploadBatch(
+          filePaths,
+          concurrency,
+          (_result, completed, total) => setAppNotice(`Preparando archivos (${completed}/${total})…`),
+          targetFolderId,
+        );
+        const queued = results.filter((result) => result.ok && !result.upload.duplicate).length;
+        const duplicates = results.filter((result) => result.ok && result.upload.duplicate).length;
+        const failed = results.filter((result): result is { ok: false; path: string; error: string } => !result.ok);
+        if (failed.length > 0) {
+          const skippedItems: SkippedUploadItem[] = failed.map((item) => ({
+            fileName: item.path.split(/[\\/]/).pop() || item.path,
+            path: item.path,
+            reason: item.error,
+          }));
+          setSkippedFiles((prev) => [...prev, ...skippedItems]);
+          setShowSkippedModal(true);
+        }
+        const parts = [
+          queued ? `${queued} listo${queued === 1 ? "" : "s"} para subir` : null,
+          duplicates ? `${duplicates} duplicado${duplicates === 1 ? "" : "s"}` : null,
+          failed.length ? `${failed.length} omitido${failed.length === 1 ? "" : "s"} (límite Telegram)` : null,
+        ].filter(Boolean);
+        if (directories.length === 0) {
+          setAppNotice(`Archivos: ${parts.join(" · ") || "Listo"}`);
+        }
+      }
+
+      await refreshDashboard();
+    } catch (error) {
+      setAppNotice(`Error al procesar arrastre: ${readableError(error)}`);
     } finally {
       setUploadBusy(false);
     }
@@ -857,7 +1129,7 @@ function App() {
   };
 
   const touchDragStart = (event: React.PointerEvent<HTMLElement>, file: CloudFile) => {
-    if (event.pointerType === "mouse" || file.trashed) return;
+    if (file.trashed) return;
     const interactive = (event.target as Element).closest("button,input,label,select,a");
     if (interactive || !event.isPrimary) return;
     clearFileDrag();
@@ -875,7 +1147,9 @@ function App() {
       element: event.currentTarget,
     };
     touchDragRef.current = state;
-    if (!selectedFiles.has(file.id)) {
+    if (event.pointerType === "mouse") {
+      state.timer = null;
+    } else if (!selectedFiles.has(file.id)) {
       state.timer = window.setTimeout(() => {
         const current = touchDragRef.current;
         if (!current || current.pointerId !== event.pointerId || current.active) return;
@@ -1063,6 +1337,9 @@ function App() {
         <button className="upload-primary" onClick={() => void handleUpload()} disabled={uploadBusy}>
           <Plus size={18} /><span>{uploadBusy ? "Preparando…" : "Subir archivos"}</span>
         </button>
+        <button className="upload-folder-sidebar" onClick={() => void handleUploadFolder()} disabled={uploadBusy}>
+          <FolderUp size={17} /><span>Subir carpeta</span>
+        </button>
         <nav className="main-nav" aria-label="Principal">
           {navItems.map((item) => {
             const Icon = item.icon;
@@ -1126,10 +1403,18 @@ function App() {
             <div><div className="eyebrow">Tu espacio</div><h1>{activeSection}</h1><p>Archivos organizados, transferencias transparentes y control local.</p></div>
             <div className="heading-actions">
               {section === "files" && <button className="secondary-button folder-create-button" disabled={!dashboard.telegramConnected} onClick={() => setFolderEditor({ mode: "create" })}><FolderPlus size={17} /> Nueva carpeta</button>}
+              <button className="secondary-button folder-upload-button" disabled={uploadBusy || !dashboard.telegramConnected} onClick={() => void handleUploadFolder()}><FolderUp size={17} /> Subir carpeta</button>
               <button className={`secondary-button sync-action-button ${syncBusy ? "is-syncing" : ""}`} disabled={syncBusy || !dashboard.telegramConnected} onClick={() => void handleSync()} title={syncBusy ? "Sincronizando con Telegram…" : "Sincronizar con Telegram"} aria-label={syncBusy ? "Sincronizando…" : "Sincronizar"}><RefreshCw size={17} className={syncBusy ? "spin-icon" : ""} /><span className="sync-button-label">{syncBusy ? "Sincronizando…" : "Sincronizar"}</span></button>
               <button className="primary-button" onClick={() => void handleUpload()} disabled={uploadBusy}><Upload size={17} /> {uploadBusy ? "Preparando…" : "Subir"}</button>
             </div>
           </section>
+
+          {(dashboard.syncProgress?.phase || syncBusy) && <section className="sync-progress-panel" aria-label="Progreso de sincronización">
+            <div><strong>{dashboard.syncProgress?.active ? (dashboard.syncProgress.phase === "applying" ? "Actualizando catálogo…" : "Sincronizando…") : syncBusy ? "Iniciando sincronización…" : dashboard.syncProgress?.error ? "Sincronización interrumpida" : "Sincronización completada"}</strong>
+              <span>{dashboard.syncProgress?.active ? (dashboard.syncProgress.percent == null ? "Calculando…" : `${dashboard.syncProgress.percent}% aprox.`) : syncBusy ? "Calculando…" : dashboard.syncProgress?.error ? "Pendiente de reintentar" : "100%"}</span></div>
+            <progress aria-label="Sincronización" max={100} value={syncBusy && !dashboard.syncProgress?.active ? undefined : dashboard.syncProgress?.percent ?? undefined} />
+            <small>{dashboard.syncProgress?.error || (dashboard.syncProgress?.active ? `${dashboard.syncProgress.scanned} mensajes revisados${dashboard.syncProgress.etaSeconds != null ? ` · Quedan aproximadamente ${dashboard.syncProgress.etaSeconds < 60 ? `${dashboard.syncProgress.etaSeconds} s` : `${Math.ceil(dashboard.syncProgress.etaSeconds / 60)} min`}` : ""}` : syncBusy ? "Consultando Telegram…" : "Catálogo actualizado")}</small>
+          </section>}
 
           {section === "files" && <nav className="folder-breadcrumbs" aria-label="Ruta de carpetas">
             <button
@@ -1150,7 +1435,53 @@ function App() {
             >{folder.name}</button></span>)}
           </nav>}
 
-          {appNotice && <div className="app-notice" role="status"><span>{appNotice}</span><button className="ghost-icon" onClick={() => setAppNotice(null)} aria-label="Cerrar aviso"><X size={15} /></button></div>}
+          {skippedFiles.length > 0 && (
+            <div className="skipped-files-banner" role="alert">
+              <div className="skipped-banner-left">
+                <AlertTriangle size={18} />
+                <span>
+                  <strong>{skippedFiles.length} archivo{skippedFiles.length === 1 ? "" : "s"} omitido{skippedFiles.length === 1 ? "" : "s"}</strong> por límite de Telegram ({dashboard.isPremium ? "4 GB" : "2 GB"}). El resto continúa procesándose.
+                </span>
+              </div>
+              <div className="skipped-banner-actions">
+                <button
+                  type="button"
+                  className="skipped-banner-btn"
+                  onClick={() => setShowSkippedModal(true)}
+                >
+                  Ver omitidos
+                </button>
+                <button
+                  type="button"
+                  className="ghost-icon"
+                  onClick={() => setSkippedFiles([])}
+                  title="Descartar aviso"
+                  aria-label="Descartar aviso"
+                >
+                  <X size={15} />
+                </button>
+              </div>
+            </div>
+          )}
+
+          {appNotice && (
+            <div className="app-notice" role="status">
+              <span>{appNotice}</span>
+              {skippedFiles.length > 0 && (
+                <button
+                  type="button"
+                  className="app-notice-action"
+                  onClick={() => setShowSkippedModal(true)}
+                >
+                  <AlertTriangle size={13} />
+                  Ver omitidos ({skippedFiles.length})
+                </button>
+              )}
+              <button className="ghost-icon" onClick={() => setAppNotice(null)} aria-label="Cerrar aviso">
+                <X size={15} />
+              </button>
+            </div>
+          )}
           {loadError && <div className="modal-error" role="alert">{loadError}</div>}
 
           {section === "home" && <section className="hero-grid">
@@ -1174,10 +1505,45 @@ function App() {
               </div>
             </div>
             <div className="queue-overview">
-              <div><strong>{queue.total}</strong><span>en cola</span></div>
-              <div><strong>{queue.failed}</strong><span>con error</span></div>
-              <div><strong>{formatSpeed(queue.speedBps)}</strong><span>velocidad actual</span></div>
-              <div><strong>{formatEta(queue.etaSeconds, queue.active > 0)}</strong><span>tiempo restante</span></div>
+              <div className="stat-card completed">
+                <div className="stat-card-header">
+                  <CheckCircle2 size={16} className="stat-icon-success" />
+                  <span>Completados</span>
+                </div>
+                <strong>{queue.completed}</strong>
+                <small>archivos finalizados</small>
+              </div>
+              <div className={`stat-card ${queue.failed + queue.pending + skippedFiles.length > 0 ? "uncompleted" : ""}`}>
+                <div className="stat-card-header">
+                  <AlertCircle size={16} className="stat-icon-warning" />
+                  <span>No completados</span>
+                </div>
+                <strong>{queue.failed + queue.pending + skippedFiles.length}</strong>
+                <small>
+                  {queue.failed > 0 && `${queue.failed} error`}
+                  {queue.failed > 0 && queue.pending > 0 && " · "}
+                  {queue.pending > 0 && `${queue.pending} en espera`}
+                  {(queue.failed > 0 || queue.pending > 0) && skippedFiles.length > 0 && " · "}
+                  {skippedFiles.length > 0 && `${skippedFiles.length} omitidos`}
+                  {queue.failed === 0 && queue.pending === 0 && skippedFiles.length === 0 && "cola al día"}
+                </small>
+              </div>
+              <div className="stat-card">
+                <div className="stat-card-header">
+                  <Zap size={16} />
+                  <span>Velocidad</span>
+                </div>
+                <strong>{formatSpeed(queue.speedBps)}</strong>
+                <small>{queue.active > 0 ? `${queue.active} en simultáneo` : "inactivo"}</small>
+              </div>
+              <div className="stat-card">
+                <div className="stat-card-header">
+                  <Clock3 size={16} />
+                  <span>Tiempo restante</span>
+                </div>
+                <strong>{formatEta(queue.etaSeconds, queue.active > 0)}</strong>
+                <small>{formatBytes(queue.processedBytes)} de {formatBytes(queue.totalBytes)}</small>
+              </div>
             </div>
             <div className="queue-global-progress"><div><span>{formatBytes(queue.processedBytes)} / {formatBytes(queue.totalBytes)}</span><strong>{queueProgress}%</strong></div><progress max={100} value={queueProgress} /></div>
             <div className="transfer-filter-row">
@@ -1218,6 +1584,11 @@ function App() {
                 </>}
                 <button className="secondary-button" onClick={() => setSelectedFiles(new Set())}>Limpiar</button>
               </>}
+              {section !== "trash" && <label className="conflict-control">Subidas simultáneas
+                <select aria-label="Subidas simultáneas" value={dashboard.settings.uploadConcurrency} onChange={(event) => void action(() => updateSetting("upload_concurrency", event.target.value))}>
+                  {[1, 2, 4, 6, 8, 12, 16].map(value => <option key={value} value={value}>{value}</option>)}
+                </select>
+              </label>}
               {section !== "trash" && <label className="conflict-control">Si ya existe
                 <select value={dashboard.settings.conflictPolicy} onChange={(event) => void action(() => updateSetting("conflict_policy", event.target.value))}>
                   <option value="skip">Omitir</option><option value="rename">Crear nombre alternativo</option>
@@ -1313,6 +1684,79 @@ function App() {
         </div>
       </main>
 
+      {/* Barra de estado / píldora de transferencias para Windows y Android */}
+      {(queue.total > 0 || queue.active > 0 || queue.completed > 0 || queue.failed > 0 || skippedFiles.length > 0) && (
+        <div
+          className="transfer-status-bar"
+          role="status"
+          aria-label="Contador de transferencias completadas y no completadas"
+          onClick={() => setSection(queue.total > 0 ? "home" : "history")}
+        >
+          <div className="transfer-status-pills">
+            <span className="transfer-pill completed" title="Archivos completados con éxito">
+              <CheckCircle2 size={15} />
+              <strong>{queue.completed}</strong>
+              <span className="pill-text">completados</span>
+            </span>
+            <span
+              className={`transfer-pill ${queue.failed + queue.pending + skippedFiles.length > 0 ? "uncompleted" : "idle"}`}
+              title="Transferencias no completadas (en cola, con error u omitidas)"
+            >
+              {queue.failed + queue.pending + skippedFiles.length > 0 ? (
+                <AlertCircle size={15} />
+              ) : (
+                <CheckCircle2 size={15} />
+              )}
+              <strong>{queue.failed + queue.pending + skippedFiles.length}</strong>
+              <span className="pill-text">no completados</span>
+              {(queue.failed > 0 || queue.pending > 0 || skippedFiles.length > 0) && (
+                <span className="pill-detail">
+                  ({[
+                    queue.failed > 0 ? `${queue.failed} error` : null,
+                    queue.pending > 0 ? `${queue.pending} en espera` : null,
+                    skippedFiles.length > 0 ? `${skippedFiles.length} omitidos` : null,
+                  ].filter(Boolean).join(", ")})
+                </span>
+              )}
+            </span>
+          </div>
+          {queue.active > 0 && (
+            <div className="transfer-live-rate">
+              <span className="transfer-pulse" />
+              <span>{formatSpeed(queue.speedBps)}</span>
+            </div>
+          )}
+          <button
+            type="button"
+            className="transfer-bar-action"
+            onClick={(e) => {
+              e.stopPropagation();
+              setSection(queue.total > 0 ? "home" : "history");
+            }}
+          >
+            {queue.total > 0 ? "Ver cola" : "Historial"} →
+          </button>
+        </div>
+      )}
+
+      {/* Indicador visual de arrastre de carpetas o archivos desde el sistema operativo */}
+      {externalDragActive && (
+        <div className="external-drag-scrim" role="region" aria-label="Soltar archivos en Nuvio">
+          <div className="external-drag-card">
+            <div className="external-drag-icon-pulse">
+              <FolderUp size={36} />
+            </div>
+            <h3>Suelta aquí para subir a Nuvio</h3>
+            <p>
+              Destino: <strong>{externalDragTargetName}</strong>
+            </p>
+            <div className="external-drag-badge">
+              <span>Subida recursiva de carpetas · {dashboard.settings.uploadConcurrency} en simultáneo</span>
+            </div>
+          </div>
+        </div>
+      )}
+
       <nav className="mobile-bottom-nav" aria-label="Navegación móvil">{navItems.slice(0, 4).map((item) => { const Icon = item.icon; return <button key={item.key} className={section === item.key ? "active" : ""} onClick={() => { if (item.key === "files") setCurrentFolderId(null); setSection(item.key); }}><Icon size={19} /><span>{item.label === "Mis archivos" ? "Archivos" : item.label}</span></button>; })}<button onClick={() => setMobileMenu(true)}><Menu size={20} /><span>Más</span></button></nav>
 
       {touchDragPosition && draggingFileIds.length > 0 && (
@@ -1364,6 +1808,14 @@ function App() {
       </Dialog>}
 
       {connectModal && <TelegramConnectModal rememberDefault={dashboard.settings.rememberSession} onClose={() => setConnectModal(false)} onChanged={async (snapshot) => { await refreshDashboard(); if (snapshot.connected) setAppNotice(`Telegram conectado${snapshot.accountLabel ? ` · ${snapshot.accountLabel}` : ""}`); }} />}
+
+      {showSkippedModal && skippedFiles.length > 0 && (
+        <SkippedUploadsModal
+          items={skippedFiles}
+          isPremium={Boolean(dashboard.isPremium)}
+          onClose={() => setShowSkippedModal(false)}
+        />
+      )}
     </div>
   );
 }
@@ -1447,7 +1899,7 @@ function MoveToFolderDialog({ folders, movingFolderId, itemLabel, onClose, onMov
   const [target, setTarget] = useState("__root__");
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
-  const choices = folders.filter((folder) => !folder.trashed && folder.id !== movingFolderId).sort((a, b) => folderPathLabel(a, folders).localeCompare(folderPathLabel(b, folders), "es"));
+  const choices = folders.filter((folder) => !folder.trashed && folder.id !== movingFolderId).sort((a, b) => folderPathLabel(a, folders).localeCompare(folderPathLabel(b, folders), "es", { numeric: true, sensitivity: "base" }));
   const submit = async (event: React.FormEvent) => {
     event.preventDefault(); setBusy(true); setError(null);
     try { await onMove(target === "__root__" ? null : target); } catch (value) { setError(readableError(value)); } finally { setBusy(false); }
@@ -1543,6 +1995,9 @@ function TelegramConnectModal({ rememberDefault, onClose, onChanged }: { remembe
   const [apiId, setApiId] = useState("");
   const [apiHash, setApiHash] = useState("");
   const [phone, setPhone] = useState("");
+  const [editingPhone, setEditingPhone] = useState(false);
+  const [resendCooldown, setResendCooldown] = useState(0);
+  const [resendNotice, setResendNotice] = useState<string | null>(null);
   const [email, setEmail] = useState("");
   const [code, setCode] = useState("");
   const [password, setPassword] = useState("");
@@ -1558,6 +2013,12 @@ function TelegramConnectModal({ rememberDefault, onClose, onChanged }: { remembe
     const timer = window.setInterval(() => void refresh(), 1400);
     return () => window.clearInterval(timer);
   }, [snapshot?.stage]);
+
+  useEffect(() => {
+    if (resendCooldown <= 0) return;
+    const timer = window.setInterval(() => setResendCooldown((prev) => Math.max(0, prev - 1)), 1000);
+    return () => window.clearInterval(timer);
+  }, [resendCooldown]);
 
   const run = async (operation: () => Promise<TelegramAuthSnapshot>, clear?: () => void) => {
     if (busy) return;
@@ -1575,8 +2036,8 @@ function TelegramConnectModal({ rememberDefault, onClose, onChanged }: { remembe
         if (!/^[a-fA-F0-9]{32}$/.test(apiHash.trim())) return setError("API Hash no parece válido");
         void run(() => configureTelegram(id, apiHash.trim(), rememberSession), () => setApiHash("")); break;
       }
-      case "phone": void run(() => submitTelegramPhone(phone), () => setPhone("")); break;
-      case "email": void run(() => submitTelegramEmail(email), () => setEmail("")); break;
+      case "phone": void run(() => submitTelegramPhone(phone.trim())); break;
+      case "email": void run(() => submitTelegramEmail(email.trim())); break;
       case "emailCode": void run(() => submitTelegramEmailCode(code), () => setCode("")); break;
       case "code": void run(() => submitTelegramCode(code), () => setCode("")); break;
       case "password": void run(() => submitTelegramPassword(password), () => setPassword("")); break;
@@ -1596,14 +2057,109 @@ function TelegramConnectModal({ rememberDefault, onClose, onChanged }: { remembe
       <div className="account-actions"><button className="secondary-button" disabled={busy} onClick={() => void run(logOutTelegram)}>Cerrar sesión</button><button className="secondary-button danger-button" disabled={busy} onClick={() => void run(forgetTelegramSession)}>Olvidar sesión</button></div>
     </div> : stage === "closed" ? <div className="auth-closed"><strong>Sesión cerrada</strong><p>{snapshot.message}</p></div> : <form className="credential-placeholder" onSubmit={submit}>
       {stage === "needsCredentials" && <><label htmlFor="telegram-api-id">API ID</label><input id="telegram-api-id" inputMode="numeric" value={apiId} onChange={(event) => setApiId(event.target.value)} autoComplete="off" /><label htmlFor="telegram-api-hash">API Hash</label><input id="telegram-api-hash" type="password" value={apiHash} onChange={(event) => setApiHash(event.target.value)} autoComplete="off" /><label className="remember-session-control"><input type="checkbox" checked={rememberSession} onChange={(event) => setRememberSession(event.target.checked)} /><span><strong>Recordar sesión en este equipo</strong><small>Desactivado por defecto. Las credenciales se protegen con el almacén seguro de este dispositivo.</small></span></label></>}
-      {stage === "phone" && <><label htmlFor="telegram-phone">Teléfono</label><input id="telegram-phone" type="tel" value={phone} onChange={(event) => setPhone(event.target.value)} placeholder="+52XXXXXXXXXX" autoComplete="tel" /></>}
+      {stage === "phone" && <><label htmlFor="telegram-phone">Teléfono</label><input id="telegram-phone" type="tel" value={phone} onChange={(event) => setPhone(event.target.value)} placeholder="+52XXXXXXXXXX" autoComplete="tel" autoFocus /></>}
       {stage === "email" && <><label htmlFor="telegram-email">Correo de autenticación</label><input id="telegram-email" type="email" value={email} onChange={(event) => setEmail(event.target.value)} autoComplete="email" /></>}
-      {(stage === "code" || stage === "emailCode") && <><label htmlFor="telegram-code">{stage === "emailCode" ? "Código de correo" : "Código de Telegram"}</label>{snapshot.hint && <span className="auth-hint">{snapshot.hint}</span>}<input id="telegram-code" inputMode="numeric" value={code} onChange={(event) => setCode(event.target.value)} autoComplete="one-time-code" /></>}
+      {(stage === "code" || stage === "emailCode") && (
+        editingPhone ? (
+          <div className="auth-correct-phone-container">
+            <label htmlFor="telegram-phone-edit">Corregir o cambiar número de teléfono</label>
+            <span className="auth-hint">Ingresa tu número correcto con código de país (ej. +521234567890)</span>
+            <input
+              id="telegram-phone-edit"
+              type="tel"
+              value={phone}
+              onChange={(event) => setPhone(event.target.value)}
+              placeholder="+52XXXXXXXXXX"
+              autoComplete="tel"
+              autoFocus
+            />
+            <div className="auth-recovery-actions">
+              <button
+                className="primary-button modal-primary"
+                type="button"
+                disabled={busy}
+                onClick={() => {
+                  if (!phone.trim().startsWith("+") || phone.trim().length < 8) {
+                    return setError("Usa el número en formato internacional, por ejemplo +52 seguido de tu número");
+                  }
+                  void run(
+                    () => submitTelegramPhone(phone.trim()),
+                    () => {
+                      setEditingPhone(false);
+                      setCode("");
+                      setResendNotice("Código solicitado al número corregido.");
+                    },
+                  );
+                }}
+              >
+                {busy ? "Enviando…" : "Reenviar código al nuevo número"}
+              </button>
+              <button
+                className="secondary-button modal-secondary"
+                type="button"
+                disabled={busy}
+                onClick={() => {
+                  setEditingPhone(false);
+                  setError(null);
+                }}
+              >
+                Cancelar y volver a ingresar código
+              </button>
+            </div>
+          </div>
+        ) : (
+          <>
+            <label htmlFor="telegram-code">{stage === "emailCode" ? "Código de correo" : "Código de Telegram"}</label>
+            {snapshot.hint && <span className="auth-hint">{snapshot.hint}</span>}
+            <input id="telegram-code" inputMode="numeric" value={code} onChange={(event) => setCode(event.target.value)} autoComplete="one-time-code" autoFocus />
+            <div className="auth-recovery-buttons">
+              <button
+                type="button"
+                className="auth-link-button"
+                disabled={busy}
+                onClick={() => {
+                  setEditingPhone(true);
+                  setError(null);
+                  setResendNotice(null);
+                }}
+              >
+                ¿Te equivocaste de número? Corregir número
+              </button>
+              <button
+                type="button"
+                className="auth-link-button"
+                disabled={busy || resendCooldown > 0}
+                onClick={async () => {
+                  if (busy || resendCooldown > 0) return;
+                  try {
+                    setBusy(true);
+                    setError(null);
+                    if (stage === "code") {
+                      await applySnapshot(await resendTelegramCode());
+                    } else {
+                      await applySnapshot(await submitTelegramEmail(email));
+                    }
+                    setResendNotice("Se ha solicitado el reenvío del código.");
+                    setResendCooldown(30);
+                  } catch (value) {
+                    setError(readableError(value));
+                  } finally {
+                    setBusy(false);
+                  }
+                }}
+              >
+                {resendCooldown > 0 ? `Reenviar código (${resendCooldown}s)` : "¿No te llega el código? Reenviar código"}
+              </button>
+            </div>
+            {resendNotice && <div className="auth-resend-notice">{resendNotice}</div>}
+          </>
+        )
+      )}
       {stage === "password" && <><label htmlFor="telegram-password">Contraseña 2FA</label>{snapshot.hint && <span className="auth-hint">Pista: {snapshot.hint}</span>}<input id="telegram-password" type="password" value={password} onChange={(event) => setPassword(event.target.value)} autoComplete="current-password" /></>}
       {stage === "registration" && <><label htmlFor="telegram-first-name">Nombre</label><input id="telegram-first-name" value={firstName} onChange={(event) => setFirstName(event.target.value)} /><label htmlFor="telegram-last-name">Apellido</label><input id="telegram-last-name" value={lastName} onChange={(event) => setLastName(event.target.value)} /></>}
       {stage === "qr" && <div className="qr-auth-card"><strong>Autoriza desde Telegram</strong><span>Telegram → Ajustes → Dispositivos → Vincular dispositivo de escritorio.</span>{snapshot.qrSvg && <img className="auth-qr" alt="QR de Telegram" src={`data:image/svg+xml;charset=utf-8,${encodeURIComponent(snapshot.qrSvg)}`} />}</div>}
       {(stage === "initializing" || stage === "loggingOut" || stage === "closing") && <div className="auth-loading">{snapshot.message}</div>}
-      {!new Set(["initializing", "qr", "loggingOut", "closing"]).has(stage ?? "") && <button className="primary-button modal-primary" type="submit" disabled={busy}>{busy ? "Procesando…" : authActionLabel(stage)}</button>}
+      {!editingPhone && !new Set(["initializing", "qr", "loggingOut", "closing"]).has(stage ?? "") && <button className="primary-button modal-primary" type="submit" disabled={busy}>{busy ? "Procesando…" : authActionLabel(stage)}</button>}
       {stage === "phone" && <button className="secondary-button modal-secondary" type="button" disabled={busy} onClick={() => void run(requestTelegramQr)}>Usar otra sesión / QR</button>}
     </form>}
     <small>Los códigos, el teléfono y la contraseña 2FA no se guardan en los logs de Nuvio.</small>
@@ -1621,6 +2177,107 @@ function authActionLabel(stage?: TelegramAuthSnapshot["stage"]): string {
     case "registration": return "Completar registro";
     default: return "Continuar";
   }
+}
+
+function SkippedUploadsModal({
+  items,
+  isPremium,
+  onClose,
+}: {
+  items: SkippedUploadItem[];
+  isPremium: boolean;
+  onClose: () => void;
+}) {
+  const [copied, setCopied] = useState(false);
+
+  const copyList = async () => {
+    try {
+      const text = items
+        .map(
+          (item, idx) =>
+            `${idx + 1}. ${item.fileName}\n   Ruta: ${item.path}\n   Motivo: ${item.reason}${
+              item.sizeBytes ? ` (${formatBytes(item.sizeBytes)})` : ""
+            }`,
+        )
+        .join("\n\n");
+      await navigator.clipboard.writeText(text);
+      setCopied(true);
+      window.setTimeout(() => setCopied(false), 2500);
+    } catch {
+      // ignore
+    }
+  };
+
+  const limitGb = isPremium ? 4 : 2;
+
+  return (
+    <Dialog className="skipped-modal" labelledBy="skipped-title" onClose={onClose}>
+      <button className="icon-button modal-close" onClick={onClose} aria-label="Cerrar">
+        <X size={18} />
+      </button>
+      <div className="skipped-icon-badge">
+        <AlertTriangle size={24} />
+      </div>
+      <div className="modal-eyebrow">Límite de Telegram · Archivos omitidos</div>
+      <div className="skipped-modal-header">
+        <h2 id="skipped-title">Archivos no subidos ({items.length})</h2>
+        <p>
+          Telegram limita la subida a un máximo de <strong>{limitGb} GB por archivo</strong>
+          {isPremium ? " (con tu suscripción Telegram Premium)" : " (o 4 GB con Telegram Premium)"}.
+          Nuvio omitió los siguientes archivos para que el resto de tu contenido continúe subiéndose con normalidad.
+        </p>
+      </div>
+
+      <div className="skipped-list-container" role="region" aria-label="Lista de archivos omitidos">
+        {items.map((item, idx) => (
+          <div key={`${item.path}-${idx}`} className="skipped-item-card">
+            <div className="skipped-item-main">
+              <div className="skipped-file-icon">
+                <File size={18} />
+              </div>
+              <div className="skipped-file-details">
+                <span className="skipped-file-name" title={item.fileName}>
+                  {item.fileName}
+                </span>
+                <span className="skipped-file-path" title={item.path}>
+                  {item.path}
+                </span>
+              </div>
+            </div>
+            <div className="skipped-item-status">
+              <span className="skipped-reason-badge" title={item.reason}>
+                <AlertTriangle size={12} />
+                {item.reason}
+              </span>
+              {item.sizeBytes != null && item.sizeBytes > 0 && (
+                <span className="file-meta">{formatBytes(item.sizeBytes)}</span>
+              )}
+            </div>
+          </div>
+        ))}
+      </div>
+
+      <div className="skipped-modal-actions">
+        <button
+          type="button"
+          className="secondary-button"
+          onClick={() => void copyList()}
+          title="Copiar lista de archivos al portapapeles"
+        >
+          {copied ? <Check size={16} /> : <Copy size={16} />}
+          <span>{copied ? "¡Copiado!" : "Copiar lista"}</span>
+        </button>
+        <button
+          type="button"
+          className="primary-button modal-primary"
+          style={{ width: "auto", margin: 0 }}
+          onClick={onClose}
+        >
+          Entendido
+        </button>
+      </div>
+    </Dialog>
+  );
 }
 
 type FileActions = {
