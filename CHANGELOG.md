@@ -1,11 +1,14 @@
-## Actualización 2026-09-11
-
-- Barra de sincronización con avance del historial, fase de aplicación del catálogo, estimación del tiempo restante y errores visibles.
-- Ocho subidas simultáneas por defecto y selector de 1 a 16 aplicable sin reiniciar.
-- Orden natural de números en nombres de archivos y carpetas; Recientes muestra todos sus resultados.
-- Corrección de la lectura de preferencias de concurrencia y pruebas de filtros combinados, arrastre y progreso en escritorio y móvil.
-
 # Historial de Nuvio
+
+## 1.2.0 — 2026-09-11
+
+- Opción de compresión previa en ZIP con límite estricto de 2 GB por paquete (integrada en subida de archivos, carpetas y arrastre externo desde PC).
+- Creación automática de múltiples paquetes independientes si la selección supera el presupuesto de 2 GB.
+- Compresión por bloques con omisión de recompresión para formatos multimedia ya comprimidos (imágenes, vídeos, zip, etc.) para acelerar el procesamiento y ahorrar memoria en Android.
+- Optimización de subida y preparación: cálculo de hash SHA-256 en una sola pasada en streaming durante la copia a caché para archivos no cifrados.
+- Optimización del catálogo: inserción en SQLite por lotes de 250 documentos y eliminación del reescaneo completo redundante de Telegram al vaciarse la cola de transferencias.
+- Optimización de interfaz: sondeo adaptativo (750ms en transferencias activas, 2.5s en reposo, 10s en segundo plano), cálculo de dashboard en segundo plano (`spawn_blocking`) y caché de uso de disco.
+
 
 ## 1.1.0 — 2026-09-10
 

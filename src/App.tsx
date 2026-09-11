@@ -78,6 +78,7 @@ import {
   pauseTransfer,
   prepareMedia,
   prepareUploadBatch,
+  prepareZipUploads,
   prepareUploadItemsBatch,
   queueDownloads,
   readableError,
@@ -296,6 +297,8 @@ function App() {
   const [mobileMenu, setMobileMenu] = useState(false);
   const [darkMode, setDarkMode] = useState(initialDarkMode);
   const [uploadBusy, setUploadBusy] = useState(false);
+  const [zipBeforeUpload, setZipBeforeUpload] = useState(false);
+  const [zipProgress, setZipProgress] = useState<{ processed: number; total: number; name: string } | null>(null);
   const [syncBusy, setSyncBusy] = useState(false);
   const [loadError, setLoadError] = useState<string | null>(null);
   const [appNotice, setAppNotice] = useState<string | null>(null);
@@ -433,6 +436,7 @@ function App() {
       if (request !== dashboardRequestRef.current) return;
       setDashboard(next);
       setLoadError(null);
+      return next;
     } catch (error) {
       if (request === dashboardRequestRef.current) setLoadError(readableError(error));
     }
@@ -443,8 +447,9 @@ function App() {
     let timer = 0;
     const poll = async () => {
       if (disposed) return;
-      await refreshDashboard();
-      if (!disposed) timer = window.setTimeout(poll, 750);
+      const next = await refreshDashboard();
+      const active = next?.syncProgress?.active || (next?.queueSummary.pending ?? 0) > 0;
+      if (!disposed) timer = window.setTimeout(poll, document.hidden ? 10000 : active ? 750 : 2500);
     };
     void poll();
     return () => { disposed = true; dashboardRequestRef.current++; mediaRequestRef.current++; window.clearTimeout(timer); };
@@ -470,14 +475,6 @@ function App() {
     );
     void (async () => {
       try {
-        if (dashboard.telegramConnected && failed === 0) {
-          try {
-            await syncFiles();
-            await refreshDashboard();
-          } catch {
-            // El núcleo también intenta sincronizar cuando la cola queda vacía.
-          }
-        }
         let granted = await isPermissionGranted();
         if (!granted) granted = (await requestPermission()) === "granted";
         if (granted) {
@@ -562,7 +559,7 @@ function App() {
     return () => {
       if (unlisten) unlisten();
     };
-  }, [dashboard?.folders, currentFolder, currentFolderId, section]);
+  }, [dashboard?.folders, currentFolder, currentFolderId, section, zipBeforeUpload]);
 
   const files = useMemo(() => {
     if (!dashboard) return [];
@@ -623,6 +620,17 @@ function App() {
     }
   };
 
+  const zipUploads = async (items: { path: string; name?: string }[], folderId?: string | null) => {
+    setZipProgress({ processed: 0, total: 0, name: "Preparando ZIP…" });
+    setAppNotice("Comprimiendo en paquetes ZIP de hasta 2 GB…");
+    try {
+      return await prepareZipUploads(items, folderId, (processed, total, name) => setZipProgress({ processed, total, name }));
+    } finally { setZipProgress(null); }
+  };
+  const prepareSelectedUploads: typeof prepareUploadBatch = (paths, concurrency, onSettled, folderId) => zipBeforeUpload
+    ? zipUploads(paths.map(path => ({ path })), folderId)
+    : prepareUploadBatch(paths, concurrency, onSettled, folderId);
+
   const handleUpload = async () => {
     if (uploadBusy) return;
     if (!dashboard?.telegramConnected) {
@@ -638,7 +646,7 @@ function App() {
       if (section !== "files") setCurrentFolderId(null);
       setSection("files");
       setMobileMenu(false);
-      const results = await prepareUploadBatch(
+      const results = await prepareSelectedUploads(
         selected,
         dashboard.settings.preparationConcurrency,
         (_result, completed, total) => setAppNotice(`Preparando archivos ${completed}/${total}…`),
@@ -679,6 +687,14 @@ function App() {
   ): Promise<void> => {
     if (!plan.files.length && !plan.folders.length) {
       setAppNotice(`La carpeta "${plan.rootName}" está vacía.`);
+      return;
+    }
+    if (zipBeforeUpload && plan.files.length > 0) {
+      const results = await zipUploads(plan.files.map(file => ({ path: file.absolutePath, name: `${plan.rootName}/${file.relativePath}` })), targetFolderId);
+      const queued = results.filter(result => result.ok && !result.upload.duplicate).length;
+      const duplicates = results.filter(result => result.ok && result.upload.duplicate).length;
+      const errors = results.filter(result => !result.ok);
+      setAppNotice(`${queued} ZIP listos · ${duplicates} duplicados${errors.length ? ` · ${errors.map(result => result.ok ? "" : result.error).join("; ")}` : ""}`);
       return;
     }
     setAppNotice(`Creando estructura de carpeta "${plan.rootName}"…`);
@@ -834,7 +850,7 @@ function App() {
         const filePaths = files.map((f) => f.path);
         setAppNotice(`Preparando ${files.length} archivo${files.length === 1 ? "" : "s"}…`);
         const concurrency = dashboard?.settings.preparationConcurrency || 4;
-        const results = await prepareUploadBatch(
+        const results = await prepareSelectedUploads(
           filePaths,
           concurrency,
           (_result, completed, total) => setAppNotice(`Preparando archivos (${completed}/${total})…`),
@@ -1408,6 +1424,16 @@ function App() {
               <button className="primary-button" onClick={() => void handleUpload()} disabled={uploadBusy}><Upload size={17} /> {uploadBusy ? "Preparando…" : "Subir"}</button>
             </div>
           </section>
+
+          <div className="zip-upload-options">
+            <label><input type="checkbox" checked={zipBeforeUpload} disabled={uploadBusy} onChange={event => setZipBeforeUpload(event.target.checked)} /> Comprimir antes de subir (ZIP, máximo 2 GB por paquete)</label>
+            {zipBeforeUpload && <small>Conserva los originales y la ruta de cada archivo dentro del ZIP. Si la selección es grande, crea varios ZIP independientes. Un archivo que no cabe comprimido en 2 GB se informa sin subirlo. Fotos y vídeos pueden ahorrar poco espacio.</small>}
+          </div>
+          {zipProgress && <section className="sync-progress-panel" aria-label="Progreso de compresión">
+            <div><strong>{zipProgress.processed === zipProgress.total && zipProgress.total > 0 ? "Preparando ZIP para subir…" : "Comprimiendo…"}</strong><span>{zipProgress.total > 0 ? `${Math.min(100, Math.floor(zipProgress.processed * 100 / zipProgress.total))}%` : "Calculando…"}</span></div>
+            <progress aria-label="Compresión ZIP" max={zipProgress.total || 1} value={zipProgress.total ? zipProgress.processed : undefined} />
+            <small>{zipProgress.name}</small>
+          </section>}
 
           {(dashboard.syncProgress?.phase || syncBusy) && <section className="sync-progress-panel" aria-label="Progreso de sincronización">
             <div><strong>{dashboard.syncProgress?.active ? (dashboard.syncProgress.phase === "applying" ? "Actualizando catálogo…" : "Sincronizando…") : syncBusy ? "Iniciando sincronización…" : dashboard.syncProgress?.error ? "Sincronización interrumpida" : "Sincronización completada"}</strong>

@@ -1,3 +1,4 @@
+import { listen } from "@tauri-apps/api/event";
 import { invoke } from "@tauri-apps/api/core";
 import { onBackButtonPress } from "@tauri-apps/api/app";
 import { open, save } from "@tauri-apps/plugin-dialog";
@@ -325,4 +326,12 @@ export function readableError(value: unknown): string {
   } catch {
     return "Ocurrió un error inesperado";
   }
+}
+
+export async function prepareZipUploads(items: { path: string; name?: string }[], folderId: string | null | undefined, onProgress: (processed: number, total: number, name: string) => void): Promise<PreparedUploadResult[]> {
+  const unlisten = await listen<{ processedBytes: number; totalBytes: number; fileName: string }>("nuvio-zip-progress", event => onProgress(event.payload.processedBytes, event.payload.totalBytes, event.payload.fileName));
+  try {
+    const results = await invoke<({ Ok: PreparedUpload } | { Err: string })[]>("prepare_zip_uploads", { items, folderId: folderId ?? null });
+    return results.map((result, index) => "Ok" in result ? { ok: true, path: result.Ok.fileName, upload: result.Ok } : { ok: false, path: `ZIP ${index + 1}`, error: result.Err });
+  } finally { unlisten(); }
 }

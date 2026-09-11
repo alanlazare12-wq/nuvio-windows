@@ -283,48 +283,54 @@ impl CatalogRepository {
     }
 
     pub fn record_remote(&self, doc: &RemoteDocument) -> Result<(), RepositoryError> {
+        self.record_remote_batch(std::slice::from_ref(doc))
+    }
+
+    fn record_remote_batch(&self, documents: &[RemoteDocument]) -> Result<(), RepositoryError> {
         let mut c = self.connection.lock().expect("catalog");
         let tx = c.transaction()?;
-        let id = format!("tg-{}", doc.message_id);
-        let path = Path::new(&doc.name);
-        let ext = path
-            .extension()
-            .and_then(|x| x.to_str())
-            .unwrap_or("")
-            .to_lowercase();
-        let name = path
-            .file_stem()
-            .and_then(|x| x.to_str())
-            .unwrap_or(&doc.name);
-        let kind = classify_extension(&ext);
-        tx.execute(
+        for doc in documents {
+            let id = format!("tg-{}", doc.message_id);
+            let path = Path::new(&doc.name);
+            let ext = path
+                .extension()
+                .and_then(|x| x.to_str())
+                .unwrap_or("")
+                .to_lowercase();
+            let name = path
+                .file_stem()
+                .and_then(|x| x.to_str())
+                .unwrap_or(&doc.name);
+            let kind = classify_extension(&ext);
+            tx.execute(
             "INSERT INTO files (id,name,extension,kind,size_bytes,updated_at,folder,provider,telegram_message_id)
              VALUES (?1,?2,?3,?4,?5,strftime('%Y-%m-%dT%H:%M:%SZ',?6,'unixepoch'),'Mensajes guardados','telegram',?7)
              ON CONFLICT(id) DO UPDATE SET name=excluded.name,extension=excluded.extension,kind=excluded.kind,size_bytes=excluded.size_bytes,updated_at=excluded.updated_at",
             params![id,name,ext,kind,doc.size,doc.date,doc.message_id.to_string()],
         )?;
-        tx.execute(
+            tx.execute(
             "INSERT INTO file_locations(file_id,folder_id) VALUES (?1,CASE WHEN EXISTS(SELECT 1 FROM folders WHERE id=?2 AND trashed=0) THEN ?2 ELSE NULL END)
              ON CONFLICT(file_id) DO UPDATE SET folder_id=excluded.folder_id",
             params![id, doc.folder_id],
         )?;
-        tx.execute(
-            "INSERT OR REPLACE INTO remote_documents VALUES (?1,?2)",
-            params![id, serde_json::to_string(doc)?],
-        )?;
-        tx.execute(
+            tx.execute(
+                "INSERT OR REPLACE INTO remote_documents VALUES (?1,?2)",
+                params![id, serde_json::to_string(doc)?],
+            )?;
+            tx.execute(
             "UPDATE transfers SET status='completed',progress=100,speed_label='Guardado en Telegram' WHERE id=?1 AND direction='upload'",
             [&doc.transfer],
         )?;
-        tx.execute(
-            "UPDATE transfer_metadata SET remote_message_id=?1,error=NULL WHERE transfer_id=?2",
-            params![doc.message_id.to_string(), doc.transfer],
-        )?;
-        tx.execute(
+            tx.execute(
+                "UPDATE transfer_metadata SET remote_message_id=?1,error=NULL WHERE transfer_id=?2",
+                params![doc.message_id.to_string(), doc.transfer],
+            )?;
+            tx.execute(
             "UPDATE transfer_runtime SET phase='completed',processed_bytes=total_bytes,speed_bps=0,eta_seconds=0,updated_at=unixepoch(),completed_at=unixepoch() WHERE transfer_id=?1",
             [&doc.transfer],
         )?;
-        tx.execute("DELETE FROM transfer_pending WHERE id=?1", [&doc.transfer])?;
+            tx.execute("DELETE FROM transfer_pending WHERE id=?1", [&doc.transfer])?;
+        }
         tx.commit()?;
         Ok(())
     }
@@ -883,9 +889,11 @@ impl TelegramService {
         repo.apply_folder_snapshot(latest_folder_events.into_values().collect())?;
 
         let count = documents.len();
-        for (index, doc) in documents.into_iter().rev().enumerate() {
-            repo.record_remote(&doc).map_err(|e| e.to_string())?;
-            progress.applying(index + 1, count);
+        documents.reverse();
+        for (index, batch) in documents.chunks(250).enumerate() {
+            repo.record_remote_batch(batch).map_err(|e| e.to_string())?;
+            progress.applying(((index + 1) * 250).min(count), count);
+            tokio::task::yield_now().await;
         }
         for (message_id, folder_id) in latest_moves {
             let file_id = format!("tg-{message_id}");
@@ -1594,5 +1602,41 @@ mod tests {
             .unwrap()
             .iter()
             .all(|file| file.id != "tg-22"));
+    }
+    #[test]
+    fn catalog_batch_rolls_back_on_error() {
+        let root = tempfile::tempdir().unwrap();
+        let repo = CatalogRepository::open(&root.path().join("db")).unwrap();
+        repo.init_cloud().unwrap();
+        repo.connection.lock().unwrap().execute_batch("CREATE TRIGGER fail_test BEFORE INSERT ON files WHEN NEW.id='tg-2' BEGIN SELECT RAISE(ABORT, 'test failure'); END;").unwrap();
+        assert!(repo
+            .record_remote_batch(&[test_document(1, "a.txt"), test_document(2, "b.txt")])
+            .is_err());
+        assert!(repo.list_files().unwrap().is_empty());
+    }
+    #[test]
+    fn catalog_batch_keeps_favorites_and_indexes_all_documents() {
+        let root = tempfile::tempdir().unwrap();
+        let repo = CatalogRepository::open(&root.path().join("db")).unwrap();
+        repo.init_cloud().unwrap();
+        repo.record_remote(&test_document(1, "a.txt")).unwrap();
+        repo.set_favorite("tg-1", true).unwrap();
+        let documents: Vec<_> = (1..=500)
+            .map(|id| test_document(id, &format!("{id}.txt")))
+            .collect();
+        let start = Instant::now();
+        for batch in documents.chunks(250) {
+            repo.record_remote_batch(batch).unwrap();
+        }
+        println!("500 documents in batch: {:?}", start.elapsed());
+        let files = repo.list_files().unwrap();
+        assert_eq!(files.len(), 500);
+        assert!(
+            files
+                .iter()
+                .find(|file| file.id == "tg-1")
+                .unwrap()
+                .favorite
+        );
     }
 }

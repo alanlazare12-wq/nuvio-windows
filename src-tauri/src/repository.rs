@@ -975,6 +975,7 @@ impl CatalogRepository {
         Ok(count.max(0) as usize)
     }
 
+    #[allow(dead_code)]
     pub fn unfinished_count(&self) -> Result<usize, RepositoryError> {
         let connection = self.connection.lock().expect("catalog mutex poisoned");
         let count: i64 = connection.query_row(

@@ -146,6 +146,57 @@ impl TransferService {
             )
             .map_err(|error| error.to_string())?;
 
+        if !encrypt {
+            let result: Result<PreparedUpload, String> = (|| {
+                let directory = staging_dir.join(&transfer_id);
+                fs::create_dir_all(&directory).map_err(|e| e.to_string())?;
+                let snapshot = directory.join(&file_name);
+                let sha256 = copy_with_progress(
+                    repository,
+                    &transfer_id,
+                    &source_path,
+                    &snapshot,
+                    size_bytes,
+                    "",
+                )?;
+                let duplicate = repository
+                    .finish_preparation(
+                        &transfer_id,
+                        &snapshot.to_string_lossy(),
+                        &sha256,
+                        size_bytes,
+                        false,
+                    )
+                    .map_err(|e| e.to_string())?;
+                if duplicate {
+                    let _ = fs::remove_file(&snapshot);
+                }
+                Ok(PreparedUpload {
+                    transfer_id: transfer_id.clone(),
+                    file_name: file_name.clone(),
+                    local_path: if duplicate {
+                        source_path.to_string_lossy().into_owned()
+                    } else {
+                        snapshot.to_string_lossy().into_owned()
+                    },
+                    size_bytes,
+                    sha256,
+                    duplicate,
+                    encrypted: false,
+                    status: if duplicate { "duplicate" } else { "ready" }.into(),
+                })
+            })();
+            if let Err(error) = &result {
+                mark_preparation_failure(
+                    repository,
+                    &transfer_id,
+                    size_bytes,
+                    "Error al preparar",
+                    error,
+                );
+            }
+            return result;
+        }
         let sha256 = match hash_with_progress(repository, &transfer_id, &source_path, size_bytes) {
             Ok(hash) => hash,
             Err(error) => {
@@ -365,7 +416,8 @@ fn copy_with_progress(
     destination: &Path,
     total: i64,
     expected_hash: &str,
-) -> Result<(), String> {
+) -> Result<String, String> {
+    let before = fs::metadata(source).map_err(|e| e.to_string())?;
     let mut reader = BufReader::with_capacity(
         2 * 1024 * 1024,
         fs::File::open(source).map_err(|e| e.to_string())?,
@@ -410,11 +462,17 @@ fn copy_with_progress(
         }
     }
     writer.flush().map_err(|e| e.to_string())?;
-    if processed != total || hex::encode(hasher.finalize()) != expected_hash {
+    let hash = hex::encode(hasher.finalize());
+    let after = fs::metadata(source).map_err(|e| e.to_string())?;
+    if processed != total
+        || before.len() != after.len()
+        || before.modified().ok() != after.modified().ok()
+        || (!expected_hash.is_empty() && hash != expected_hash)
+    {
         let _ = fs::remove_file(destination);
         return Err("El archivo cambió mientras se preparaba. Inténtalo de nuevo.".to_string());
     }
-    Ok(())
+    Ok(hash)
 }
 
 fn check_control(repository: &CatalogRepository, transfer_id: &str) -> Result<(), String> {

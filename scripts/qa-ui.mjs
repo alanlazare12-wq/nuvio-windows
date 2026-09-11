@@ -27,7 +27,9 @@ async function setup(viewport = { width: 1280, height: 820 }) {
       favorite: index === 2, trashed: false, folder: "Mi unidad", folderId: null, tags: [], provider: "telegram",
     }));
     window.__qa = { files, folders: [], calls: [], media: {}, dashboardError: null, dashboardPolls: 0 };
+    window.__TAURI_EVENT_PLUGIN_INTERNALS__ = { unregisterListener() {} };
     window.__TAURI_INTERNALS__ = {
+      transformCallback: () => 1,
       convertFileSrc: file => `/qa-media/${file}`,
       invoke: async (cmd, args = {}) => {
         const qa = window.__qa;
@@ -59,7 +61,13 @@ async function setup(viewport = { width: 1280, height: 820 }) {
         if (cmd === "prepare_media") return new Promise(resolve => { qa.media[args.id] = resolve; });
         if (cmd === "prepare_thumbnail") return qa.thumbnails?.[args.id] ?? null;
         if (cmd === "telegram_auth_state") return { stage: "needsCredentials", connected: false, message: "Configura tus credenciales", isPremium: false };
-        if (cmd === "plugin:dialog|open") return null;
+        if (cmd === "plugin:dialog|open") return qa.uploadPaths ?? null;
+        if (cmd === "plugin:event|listen") return 1;
+        if (cmd === "plugin:event|unlisten") return;
+        if (cmd === "prepare_zip_uploads") {
+          if (qa.zipError) throw qa.zipError;
+          return [{ Ok: { transferId: "zip-qa", fileName: "Nuvio-001.zip", localPath: "zip-qa.zip", sizeBytes: 100, sha256: "qa", duplicate: false, encrypted: false, status: "ready" } }];
+        }
         if (cmd.startsWith("plugin:notification|")) return false;
         throw new Error(`Unexpected IPC call in QA: ${cmd}`);
       },
@@ -286,6 +294,22 @@ try {
       await expect(bar).toHaveAttribute("value", "100");
       assert.equal(await page.evaluate(() => document.documentElement.scrollWidth > window.innerWidth), false);
     }, { width, height: 844 });
+  }
+  for (const width of [390, 1280]) {
+    await test(`zip-before-upload-${width}`, async page => {
+      await page.evaluate(() => { window.__qa.uploadPaths = ["C:/QA/a.txt", "C:/QA/b.txt"]; });
+      await page.getByRole("checkbox", { name: /Comprimir antes de subir/ }).check();
+      await page.getByRole("button", { name: "Subir", exact: true }).click();
+      await expect.poll(() => page.evaluate(() => window.__qa.calls.filter(c => c.cmd === "prepare_zip_uploads").length)).toBe(1);
+      const calls = await page.evaluate(() => window.__qa.calls);
+      assert.deepEqual(calls.find(c => c.cmd === "prepare_zip_uploads").args.items, [{path:"C:/QA/a.txt"},{path:"C:/QA/b.txt"}]);
+      assert.equal(calls.some(c => c.cmd === "prepare_upload"), false);
+      await expect(page.getByRole("button", { name: "Subir", exact: true })).toBeEnabled();
+      await page.evaluate(() => { window.__qa.zipError = "El ZIP supera 2 GB"; });
+      await page.getByRole("button", { name: "Subir", exact: true }).click();
+      await expect(page.getByText(/No se pudo preparar la selección: El ZIP supera 2 GB/)).toBeVisible();
+      await expect(page.getByRole("button", { name: "Subir", exact: true })).toBeEnabled();
+    }, {width,height:915});
   }
   await test("boot-error-detail", async page => {
     await page.addInitScript(() => { window.__qa.dashboardError = "No se pudo leer el catálogo de prueba"; });

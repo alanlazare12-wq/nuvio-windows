@@ -1,3 +1,4 @@
+mod archive;
 mod cloud;
 mod crypto;
 mod domain;
@@ -23,7 +24,7 @@ use domain::{AppSettings, DashboardData};
 use media::{clear_media_cache, remove_media_cache_entries, MediaReady};
 use provider::StorageProvider;
 use repository::CatalogRepository;
-use tauri::{Manager, State};
+use tauri::{Emitter, Manager, State};
 use telegram::{TelegramAuthSnapshot, TelegramService};
 use transfer::{PreparedUpload, TransferService};
 use zeroize::Zeroize;
@@ -33,6 +34,7 @@ struct AppState {
     telegram: TelegramService,
     staging_dir: PathBuf,
     media_cache_dir: PathBuf,
+    cache_usage: Mutex<(std::time::Instant, i64)>,
     preparation_slots: Arc<tokio::sync::Semaphore>,
     upload_slots: Arc<tokio::sync::Semaphore>,
     download_slots: Arc<tokio::sync::Semaphore>,
@@ -41,7 +43,14 @@ struct AppState {
 }
 
 #[tauri::command]
-fn get_dashboard(state: State<'_, Arc<AppState>>) -> Result<DashboardData, String> {
+async fn get_dashboard(state: State<'_, Arc<AppState>>) -> Result<DashboardData, String> {
+    let state = state.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || dashboard_snapshot(&state))
+        .await
+        .map_err(|e| e.to_string())?
+}
+
+fn dashboard_snapshot(state: &AppState) -> Result<DashboardData, String> {
     let files = state
         .repository
         .list_files()
@@ -66,7 +75,16 @@ fn get_dashboard(state: State<'_, Arc<AppState>>) -> Result<DashboardData, Strin
         .collect();
     let telegram_status = state.telegram.status();
     let settings = state.repository.settings().map_err(|e| e.to_string())?;
-    let cache_bytes = directory_size(&state.media_cache_dir).unwrap_or(0) as i64;
+    let cache_bytes = {
+        let mut cached = state.cache_usage.lock().map_err(|e| e.to_string())?;
+        if cached.0.elapsed() >= Duration::from_secs(30) {
+            *cached = (
+                std::time::Instant::now(),
+                directory_size(&state.media_cache_dir).unwrap_or(0) as i64,
+            );
+        }
+        cached.1
+    };
     let queue_summary = state
         .repository
         .queue_summary(cache_bytes)
@@ -129,6 +147,74 @@ fn set_favorite(
         .repository
         .set_favorite(&id, favorite)
         .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+async fn prepare_zip_uploads(
+    app: tauri::AppHandle,
+    state: State<'_, Arc<AppState>>,
+    mut items: Vec<archive::ArchiveInput>,
+    folder_id: Option<String>,
+) -> Result<Vec<Result<PreparedUpload, String>>, String> {
+    if items.is_empty() || items.len() > 10000 {
+        return Err("Selecciona entre 1 y 10000 archivos".into());
+    }
+    if let Some(id) = folder_id.as_deref() {
+        let folder = state
+            .repository
+            .folder_by_id(id)
+            .map_err(|e| e.to_string())?;
+        if folder.trashed {
+            return Err("La carpeta está en la papelera".into());
+        }
+    }
+    #[cfg(target_os = "android")]
+    for item in &mut items {
+        if item.path.starts_with("content://") {
+            item.path = mobile::stage_content_uri(&item.path).await?;
+        }
+    }
+    #[cfg(not(target_os = "android"))]
+    let _ = &mut items;
+    state.telegram.own_chat(&state.repository).await?;
+    let state = state.inner().clone();
+    let permit = state
+        .preparation_slots
+        .clone()
+        .acquire_owned()
+        .await
+        .map_err(|e| e.to_string())?;
+    tauri::async_runtime::spawn_blocking(move || {
+        let _permit = permit;
+        let temp = tempfile::Builder::new()
+            .prefix("zip-")
+            .tempdir_in(&state.staging_dir)
+            .map_err(|e| e.to_string())?;
+        let paths =
+            archive::create_archives(&items, temp.path(), archive::ZIP_LIMIT, |progress| {
+                let _ = app.emit("nuvio-zip-progress", progress);
+            })?;
+        let results: Vec<_> = paths
+            .iter()
+            .map(|path| {
+                TransferService::prepare_upload_in_folder(
+                    &state.repository,
+                    &path.to_string_lossy(),
+                    false,
+                    None,
+                    &state.staging_dir,
+                    folder_id.as_deref(),
+                )
+            })
+            .collect();
+        // A paused preparation still needs its source to resume after this command returns.
+        if results.iter().any(Result::is_err) {
+            let _ = temp.keep();
+        }
+        Ok(results)
+    })
+    .await
+    .map_err(|e| e.to_string())?
 }
 
 #[tauri::command]
@@ -718,7 +804,9 @@ async fn prepare_media(state: State<'_, Arc<AppState>>, id: String) -> Result<Me
 
 #[tauri::command]
 fn clear_media_cache_command(state: State<'_, Arc<AppState>>) -> Result<u64, String> {
-    clear_media_cache(&state.media_cache_dir)
+    let removed = clear_media_cache(&state.media_cache_dir)?;
+    *state.cache_usage.lock().map_err(|e| e.to_string())? = (std::time::Instant::now(), 0);
+    Ok(removed)
 }
 
 #[tauri::command]
@@ -732,7 +820,16 @@ fn clear_transfer_history(state: State<'_, Arc<AppState>>) -> Result<usize, Stri
 #[tauri::command]
 fn export_diagnostics(state: State<'_, Arc<AppState>>, destination: String) -> Result<(), String> {
     let settings = state.repository.settings().map_err(|e| e.to_string())?;
-    let cache_bytes = directory_size(&state.media_cache_dir).unwrap_or(0) as i64;
+    let cache_bytes = {
+        let mut cached = state.cache_usage.lock().map_err(|e| e.to_string())?;
+        if cached.0.elapsed() >= Duration::from_secs(30) {
+            *cached = (
+                std::time::Instant::now(),
+                directory_size(&state.media_cache_dir).unwrap_or(0) as i64,
+            );
+        }
+        cached.1
+    };
     let summary = state
         .repository
         .queue_summary(cache_bytes)
@@ -856,16 +953,6 @@ async fn run_job(state: Arc<AppState>, job: cloud::WorkItem) {
             if let Err(db) = state.repository.mark_retry_or_failed(&job.id, &error) {
                 *state.background_error.lock().expect("background") = Some(db.to_string());
             }
-        }
-    }
-
-    if state.repository.unfinished_count().unwrap_or(1) == 0
-        && state.telegram.cached_snapshot().connected
-    {
-        if let Ok(_guard) = state.sync_lock.try_lock() {
-            let sync_result = state.telegram.sync_catalog(&state.repository).await;
-            *state.background_error.lock().expect("background") =
-                sync_result.as_ref().err().cloned();
         }
     }
 }
@@ -1152,6 +1239,7 @@ pub fn run() {
                 preparation_slots: Arc::new(tokio::sync::Semaphore::new(
                     settings.preparation_concurrency,
                 )),
+                cache_usage: Mutex::new((std::time::Instant::now() - Duration::from_secs(31), 0)),
                 upload_slots: Arc::new(tokio::sync::Semaphore::new(16)),
                 download_slots: Arc::new(tokio::sync::Semaphore::new(
                     settings.download_concurrency,
@@ -1176,6 +1264,7 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             get_dashboard,
             set_favorite,
+            prepare_zip_uploads,
             prepare_upload,
             scan_directory_for_upload,
             inspect_dropped_paths,
