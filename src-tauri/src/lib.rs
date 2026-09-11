@@ -977,24 +977,28 @@ async fn worker(state: Arc<AppState>) {
     if let Err(error) = state.telegram.initialize(settings.remember_session).await {
         *state.background_error.lock().expect("background") = Some(error);
     }
-    let mut synced = false;
+    let mut initial_synced = false;
+    let mut last_sync = std::time::Instant::now();
     loop {
         tokio::time::sleep(Duration::from_millis(350)).await;
         let _ = state.repository.release_due_retries();
         if !state.telegram.cached_snapshot().connected {
-            synced = false;
+            initial_synced = false;
             continue;
         }
 
-        if !synced {
+        let should_sync = !initial_synced || last_sync.elapsed() >= Duration::from_secs(180);
+        if should_sync {
             if let Ok(_guard) = state.sync_lock.try_lock() {
                 match state.telegram.sync_catalog(&state.repository).await {
                     Ok(_) => {
-                        synced = true;
+                        initial_synced = true;
+                        last_sync = std::time::Instant::now();
                         *state.background_error.lock().expect("background") = None;
                     }
                     Err(error) => {
                         *state.background_error.lock().expect("background") = Some(error);
+                        last_sync = std::time::Instant::now();
                         tokio::time::sleep(Duration::from_secs(5)).await;
                         continue;
                     }

@@ -216,7 +216,7 @@ impl TelegramService {
     }
 
     pub async fn submit_phone(&self, mut phone: String) -> Result<TelegramAuthSnapshot, String> {
-        let normalized = phone.trim().to_string();
+        let normalized: String = phone.chars().filter(|c| !c.is_whitespace()).collect();
         if !normalized.starts_with('+') || normalized.len() < 8 {
             phone.zeroize();
             return Err("Usa el número en formato internacional, por ejemplo +52 seguido de los 10 dígitos de tu número".to_string());

@@ -128,6 +128,76 @@ import { MoveToFolderDialog } from "./components/MoveToFolderDialog";
 
 GlobalWorkerOptions.workerSrc = pdfWorker;
 
+const COUNTRY_CALLING_CODES: Record<string, string> = {
+  MX: "+52", US: "+1", CA: "+1", ES: "+34", CO: "+57", AR: "+54",
+  CL: "+56", PE: "+51", EC: "+593", GT: "+502", VE: "+58", BO: "+591",
+  PY: "+595", UY: "+598", CR: "+506", PA: "+507", SV: "+503", HN: "+504",
+  NI: "+505", DO: "+1", PR: "+1", BR: "+55", GB: "+44", FR: "+33",
+  DE: "+49", IT: "+39", PT: "+351", RU: "+7", UA: "+380", IN: "+91",
+  CN: "+86", JP: "+81", KR: "+82", AU: "+61", NZ: "+64",
+};
+
+const TIMEZONE_TO_CALLING_CODE: Record<string, string> = {
+  "america/mexico_city": "+52", "america/cancun": "+52", "america/merida": "+52",
+  "america/monterrey": "+52", "america/mazatlan": "+52", "america/chihuahua": "+52",
+  "america/hermosillo": "+52", "america/tijuana": "+52", "america/matamoros": "+52",
+  "america/bahia_banderas": "+52", "america/ojinaga": "+52",
+  "america/bogota": "+57",
+  "america/buenos_aires": "+54", "america/argentina/buenos_aires": "+54", "america/cordoba": "+54",
+  "europe/madrid": "+34", "atlantic/canary": "+34", "africa/ceuta": "+34",
+  "america/lima": "+51",
+  "america/santiago": "+56", "pacific/easter": "+56",
+  "america/guayaquil": "+593", "pacific/galapagos": "+593",
+  "america/guatemala": "+502",
+  "america/caracas": "+58",
+  "america/la_paz": "+591",
+  "america/asuncion": "+595",
+  "america/montevideo": "+598",
+  "america/costa_rica": "+506",
+  "america/panama": "+507",
+  "america/el_salvador": "+503",
+  "america/tegucigalpa": "+504",
+  "america/managua": "+505",
+  "america/santo_domingo": "+1",
+  "america/puerto_rico": "+1",
+  "america/sao_paulo": "+55",
+  "europe/london": "+44",
+  "europe/paris": "+33",
+  "europe/berlin": "+49",
+  "europe/rome": "+39",
+};
+
+export function detectCountryCallingCode(): string {
+  try {
+    const tz = Intl.DateTimeFormat().resolvedOptions().timeZone?.toLowerCase() || "";
+    if (tz && TIMEZONE_TO_CALLING_CODE[tz]) {
+      return TIMEZONE_TO_CALLING_CODE[tz];
+    }
+    if (tz.includes("mexico") || tz.includes("monterrey") || tz.includes("cancun") || tz.includes("tijuana")) {
+      return "+52";
+    }
+    if (tz.startsWith("america/argentina")) return "+54";
+    if (tz.startsWith("america/new_york") || tz.startsWith("america/chicago") || tz.startsWith("america/denver") || tz.startsWith("america/los_angeles")) {
+      return "+1";
+    }
+
+    const locales = (navigator.languages && navigator.languages.length) ? navigator.languages : [navigator.language || ""];
+    for (const locale of locales) {
+      if (!locale) continue;
+      const parts = locale.split(/[-_]/);
+      if (parts.length >= 2) {
+        const country = parts[1].toUpperCase();
+        if (COUNTRY_CALLING_CODES[country]) {
+          return COUNTRY_CALLING_CODES[country];
+        }
+      }
+    }
+  } catch (_e) {
+    // fallback
+  }
+  return "+52";
+}
+
 const navItems: Array<{ key: SectionKey; label: string; icon: typeof Home }> = [
   { key: "home", label: "Inicio", icon: Home },
   { key: "files", label: "Mis archivos", icon: Files },
@@ -353,6 +423,16 @@ function App() {
     };
   }, []);
   useEffect(() => { if (!dashboard?.telegramConnected) clearThumbnailCache(); }, [dashboard?.telegramConnected]);
+  const hasAutoPromptedLoginRef = useRef(false);
+  useEffect(() => {
+    if (!dashboard) return;
+    if (!hasAutoPromptedLoginRef.current) {
+      hasAutoPromptedLoginRef.current = true;
+      if (!dashboard.telegramConnected) {
+        setConnectModal(true);
+      }
+    }
+  }, [dashboard?.telegramConnected]);
   useEffect(() => {
     if (!draggingFileIds.length || !touchDragPosition) return;
     let frame = 0;
@@ -457,7 +537,7 @@ function App() {
       }
       const next = await refreshDashboard();
       const active = next?.syncProgress?.active || (next?.queueSummary.pending ?? 0) > 0;
-      if (!disposed) timer = window.setTimeout(poll, document.hidden ? 10000 : active ? 1200 : 3000);
+      if (!disposed) timer = window.setTimeout(poll, active ? 1200 : document.hidden ? 8000 : 3000);
     };
     void poll();
     return () => { disposed = true; dashboardRequestRef.current++; mediaRequestRef.current++; window.clearTimeout(timer); };
@@ -598,8 +678,15 @@ function App() {
     return result;
   }, [dashboard, currentFolderId]);
   const visibleFolders = useMemo(() => {
-    if (!dashboard || section !== "files") return [] as CloudFolder[];
+    if (!dashboard) return [] as CloudFolder[];
     const needle = query.trim().toLowerCase();
+    if (section === "home") {
+      if (!needle) return [] as CloudFolder[];
+      return dashboard.folders
+        .filter((folder) => !folder.trashed && folder.name.toLowerCase().includes(needle))
+        .sort((a, b) => a.name.localeCompare(b.name, "es", { numeric: true, sensitivity: "base" }));
+    }
+    if (section !== "files") return [] as CloudFolder[];
     return dashboard.folders
       .filter((folder) => !folder.trashed && (needle ? true : (folder.parentId ?? null) === currentFolderId))
       .filter((folder) => !needle || folder.name.toLowerCase().includes(needle))
@@ -685,7 +772,7 @@ function App() {
       output.sort((a, b) => (Date.parse(a.updatedAt) || 0) - (Date.parse(b.updatedAt) || 0));
     }
     // Nota: para sort === "recent", dashboard.files ya viene ordenado por updated_at DESC desde SQLite
-    return section === "home" ? output.slice(0, 12) : output;
+    return section === "home" ? (needle ? output : output.slice(0, 12)) : output;
   }, [dashboard, currentFolderId, fileFilter, query, section, selectedTag, sort]);
 
   const [visibleCount, setVisibleCount] = useState(80);
@@ -1750,7 +1837,7 @@ function App() {
 
           {section !== "history" && <section className="files-section">
             <div className="section-toolbar-top">
-              <div><h2>{section === "home" ? "Archivos recientes" : activeSection}</h2><span>{files.length + (section === "files" ? visibleFolders.length : 0)} elementos</span></div>
+              <div><h2>{section === "home" ? (query.trim() ? "Resultados de búsqueda" : "Archivos recientes") : activeSection}</h2><span>{files.length + (section === "files" || (section === "home" && Boolean(query.trim())) ? visibleFolders.length : 0)} elementos</span></div>
               {section === "home" && <button className="text-button" onClick={() => { setCurrentFolderId(null); setSection("files"); }}>Ver todos →</button>}
               {section === "trash" && files.length > 0 && <button className="secondary-button danger-button" onClick={() => void handleEmptyTrash()}><Trash2 size={15} /> Vaciar papelera</button>}
             </div>
@@ -1818,11 +1905,11 @@ function App() {
 
             {filterPanel && <div className="advanced-filter-card"><div><span className="filter-title">Etiqueta</span><div className="compact-chip-row"><button className={!selectedTag ? "active" : ""} onClick={() => setSelectedTag(null)}>Todas</button>{tagOptions.map((tag) => <button className={selectedTag === tag ? "active" : ""} key={tag} onClick={() => setSelectedTag(tag)}>{tag}</button>)}</div></div><button className="clear-filter" onClick={() => { setSelectedTag(null); setFileFilter("all"); setQuery(""); }}>Limpiar filtros</button></div>}
 
-            {section === "files" && visibleFolders.length > 0 && <div className="folder-grid">{visibleFolders.map((folder) => <FolderCard
+            {(section === "files" || (section === "home" && Boolean(query.trim()))) && visibleFolders.length > 0 && <div className="folder-grid">{visibleFolders.map((folder) => <FolderCard
               key={folder.id}
               folder={folder}
               dropActive={dragTarget === folder.id}
-              onOpen={() => { setCurrentFolderId(folder.id); setSelectedFiles(new Set()); }}
+              onOpen={() => { setCurrentFolderId(folder.id); setSelectedFiles(new Set()); setSection("files"); }}
               onRename={() => setFolderEditor({ mode: "rename", folder })}
               onMove={() => setMoveDialog({ kind: "folder", folder })}
               onDelete={() => void handleDeleteFolder(folder)}
@@ -2149,7 +2236,7 @@ function TelegramConnectModal({ rememberDefault, onClose, onChanged }: { remembe
   const [rememberSession, setRememberSession] = useState(rememberDefault);
   const [apiId, setApiId] = useState("");
   const [apiHash, setApiHash] = useState("");
-  const [phone, setPhone] = useState("");
+  const [phone, setPhone] = useState(() => `${detectCountryCallingCode()} `);
   const [editingPhone, setEditingPhone] = useState(false);
   const [resendCooldown, setResendCooldown] = useState(0);
   const [resendNotice, setResendNotice] = useState<string | null>(null);
@@ -2191,7 +2278,7 @@ function TelegramConnectModal({ rememberDefault, onClose, onChanged }: { remembe
         if (!/^[a-fA-F0-9]{32}$/.test(apiHash.trim())) return setError("API Hash no parece válido");
         void run(() => configureTelegram(id, apiHash.trim(), rememberSession), () => setApiHash("")); break;
       }
-      case "phone": void run(() => submitTelegramPhone(phone.trim())); break;
+      case "phone": void run(() => submitTelegramPhone(phone.replace(/\s+/g, "").trim())); break;
       case "email": void run(() => submitTelegramEmail(email.trim())); break;
       case "emailCode": void run(() => submitTelegramEmailCode(code), () => setCode("")); break;
       case "code": void run(() => submitTelegramCode(code), () => setCode("")); break;
@@ -2202,6 +2289,7 @@ function TelegramConnectModal({ rememberDefault, onClose, onChanged }: { remembe
   };
 
   const stage = snapshot?.stage;
+  const defaultLada = detectCountryCallingCode();
   return <Dialog className="connect-modal" labelledBy="connect-title" onClose={onClose}>
     <button className="icon-button modal-close" onClick={onClose} aria-label="Cerrar"><X size={18} /></button>
     <div className="modal-brand"><Cloud size={24} /></div><div className="modal-eyebrow">Proveedor remoto</div><h2 id="connect-title">{snapshot?.connected ? "Telegram conectado" : "Conectar Telegram"}</h2><p>{snapshot?.message ?? "Consultando la conexión de Telegram…"}</p>
@@ -2212,19 +2300,19 @@ function TelegramConnectModal({ rememberDefault, onClose, onChanged }: { remembe
       <div className="account-actions"><button className="secondary-button" disabled={busy} onClick={() => void run(logOutTelegram)}>Cerrar sesión</button><button className="secondary-button danger-button" disabled={busy} onClick={() => void run(forgetTelegramSession)}>Olvidar sesión</button></div>
     </div> : stage === "closed" ? <div className="auth-closed"><strong>Sesión cerrada</strong><p>{snapshot.message}</p></div> : <form className="credential-placeholder" onSubmit={submit}>
       {stage === "needsCredentials" && <><label htmlFor="telegram-api-id">API ID</label><input id="telegram-api-id" inputMode="numeric" value={apiId} onChange={(event) => setApiId(event.target.value)} autoComplete="off" /><label htmlFor="telegram-api-hash">API Hash</label><input id="telegram-api-hash" type="password" value={apiHash} onChange={(event) => setApiHash(event.target.value)} autoComplete="off" /><label className="remember-session-control"><input type="checkbox" checked={rememberSession} onChange={(event) => setRememberSession(event.target.checked)} /><span><strong>Recordar sesión en este equipo</strong><small>Desactivado por defecto. Las credenciales se protegen con el almacén seguro de este dispositivo.</small></span></label></>}
-      {stage === "phone" && <><label htmlFor="telegram-phone">Teléfono</label><input id="telegram-phone" type="tel" value={phone} onChange={(event) => setPhone(event.target.value)} placeholder="+52XXXXXXXXXX" autoComplete="tel" autoFocus /></>}
+      {stage === "phone" && <><label htmlFor="telegram-phone">Teléfono</label><input id="telegram-phone" type="tel" value={phone} onChange={(event) => setPhone(event.target.value)} placeholder={`${defaultLada}XXXXXXXXXX`} autoComplete="tel" autoFocus /></>}
       {stage === "email" && <><label htmlFor="telegram-email">Correo de autenticación</label><input id="telegram-email" type="email" value={email} onChange={(event) => setEmail(event.target.value)} autoComplete="email" /></>}
       {(stage === "code" || stage === "emailCode") && (
         editingPhone ? (
           <div className="auth-correct-phone-container">
             <label htmlFor="telegram-phone-edit">Corregir o cambiar número de teléfono</label>
-            <span className="auth-hint">Ingresa tu número correcto con código de país (ej. +521234567890)</span>
+            <span className="auth-hint">Ingresa tu número correcto con código de país (ej. {defaultLada}1234567890)</span>
             <input
               id="telegram-phone-edit"
               type="tel"
               value={phone}
               onChange={(event) => setPhone(event.target.value)}
-              placeholder="+52XXXXXXXXXX"
+              placeholder={`${defaultLada}XXXXXXXXXX`}
               autoComplete="tel"
               autoFocus
             />
@@ -2234,11 +2322,12 @@ function TelegramConnectModal({ rememberDefault, onClose, onChanged }: { remembe
                 type="button"
                 disabled={busy}
                 onClick={() => {
-                  if (!phone.trim().startsWith("+") || phone.trim().length < 8) {
+                  const sanitized = phone.replace(/\s+/g, "").trim();
+                  if (!sanitized.startsWith("+") || sanitized.length < 8) {
                     return setError("Usa el número en formato internacional, por ejemplo +52 seguido de tu número");
                   }
                   void run(
-                    () => submitTelegramPhone(phone.trim()),
+                    () => submitTelegramPhone(sanitized),
                     () => {
                       setEditingPhone(false);
                       setCode("");
