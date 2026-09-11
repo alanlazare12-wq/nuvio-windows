@@ -521,8 +521,17 @@ function App() {
       const webview = getCurrentWebview();
       if (webview && typeof webview.onDragDropEvent === "function") {
         void webview.onDragDropEvent((event) => {
+          if (event.payload.type === "enter") {
+            const hasPaths = Array.isArray(event.payload.paths) && event.payload.paths.length > 0;
+            if (hasPaths) {
+              setExternalDragActive(true);
+            } else {
+              return;
+            }
+          } else if (event.payload.type === "over") {
+            if (!externalDragActive) return;
+          }
           if (event.payload.type === "enter" || event.payload.type === "over") {
-            setExternalDragActive(true);
             const pos = event.payload.position;
             if (pos) {
               const dpr = window.devicePixelRatio || 1;
@@ -1098,7 +1107,7 @@ function App() {
     }
     const ids = dragIdsFor(file);
     suppressClickUntilRef.current = Date.now() + 400;
-    event.dataTransfer.effectAllowed = "move";
+    event.dataTransfer.effectAllowed = "copyMove";
     event.dataTransfer.setData("application/x-nuvio-files", JSON.stringify(ids));
     event.dataTransfer.setData("text/plain", ids.join(","));
     draggingFileIdsRef.current = ids;
@@ -1146,6 +1155,7 @@ function App() {
 
   const touchDragStart = (event: React.PointerEvent<HTMLElement>, file: CloudFile) => {
     if (file.trashed) return;
+    if (event.pointerType === "mouse") return;
     const interactive = (event.target as Element).closest("button,input,label,select,a");
     if (interactive || !event.isPrimary) return;
     clearFileDrag();
@@ -1163,9 +1173,7 @@ function App() {
       element: event.currentTarget,
     };
     touchDragRef.current = state;
-    if (event.pointerType === "mouse") {
-      state.timer = null;
-    } else if (!selectedFiles.has(file.id)) {
+    if (!selectedFiles.has(file.id)) {
       state.timer = window.setTimeout(() => {
         const current = touchDragRef.current;
         if (!current || current.pointerId !== event.pointerId || current.active) return;
@@ -1447,6 +1455,7 @@ function App() {
               data-nuvio-drop-folder="__root__"
               className={`${!currentFolderId ? "active" : ""} ${dragTarget === "__root__" ? "drag-over" : ""}`}
               onClick={() => setCurrentFolderId(null)}
+              onDragEnter={(event) => { event.preventDefault(); event.stopPropagation(); event.dataTransfer.dropEffect = "move"; if (dragTarget !== "__root__") setDragTarget("__root__"); }}
               onDragOver={(event) => { event.preventDefault(); event.stopPropagation(); event.dataTransfer.dropEffect = "move"; if (dragTarget !== "__root__") setDragTarget("__root__"); }}
               onDragLeave={(event) => { if (event.currentTarget.contains(event.relatedTarget as Node)) return; if (dragTarget === "__root__") setDragTarget(null); }}
               onDrop={(event) => { event.preventDefault(); event.stopPropagation(); desktopDrop(event, null); }}
@@ -1455,6 +1464,7 @@ function App() {
               data-nuvio-drop-folder={folder.id}
               className={`${folder.id === currentFolderId ? "active" : ""} ${dragTarget === folder.id ? "drag-over" : ""}`}
               onClick={() => setCurrentFolderId(folder.id)}
+              onDragEnter={(event) => { event.preventDefault(); event.stopPropagation(); event.dataTransfer.dropEffect = "move"; if (dragTarget !== folder.id) setDragTarget(folder.id); }}
               onDragOver={(event) => { event.preventDefault(); event.stopPropagation(); event.dataTransfer.dropEffect = "move"; if (dragTarget !== folder.id) setDragTarget(folder.id); }}
               onDragLeave={(event) => { if (event.currentTarget.contains(event.relatedTarget as Node)) return; if (dragTarget === folder.id) setDragTarget(null); }}
               onDrop={(event) => { event.preventDefault(); event.stopPropagation(); desktopDrop(event, folder.id); }}
@@ -2327,8 +2337,7 @@ type FileActions = {
 
 function FileCard({ file, selected, isDragging, onSelect, onFavorite, onDownload, onPreview, onMove, onTrash, onDelete, onDragStart, onDragEnd, onPointerDown, onPointerMove, onPointerUp, onPointerCancel }: FileActions) {
   const Icon = kindIcon(file.kind);
-  const [nativeDrag, setNativeDrag] = useState(false);
-  return <article className={`file-card ${selected ? "selected" : ""} ${isDragging ? "is-touch-dragging" : ""}`} draggable={nativeDrag && !file.trashed} tabIndex={0} aria-label={fileName(file)} onClick={(event) => { if (!(event.target as Element).closest("button,input,label,select,a")) onSelect(); }} onKeyDown={(event) => { if (event.target === event.currentTarget && event.key === " ") { event.preventDefault(); onSelect(); } }} onDragStart={onDragStart} onDragEnd={onDragEnd} onPointerDown={(event) => { setNativeDrag(event.pointerType === "mouse"); onPointerDown(event); }} onPointerMove={onPointerMove} onPointerUp={onPointerUp} onPointerCancel={onPointerCancel}>
+  return <article className={`file-card ${selected ? "selected" : ""} ${isDragging ? "is-touch-dragging" : ""}`} draggable={!file.trashed} tabIndex={0} aria-label={fileName(file)} onClick={(event) => { if (!(event.target as Element).closest("button,input,label,select,a")) onSelect(); }} onKeyDown={(event) => { if (event.target === event.currentTarget && event.key === " ") { event.preventDefault(); onSelect(); } }} onDragStart={onDragStart} onDragEnd={onDragEnd} onPointerDown={onPointerDown} onPointerMove={onPointerMove} onPointerUp={onPointerUp} onPointerCancel={onPointerCancel}>
     <div className={`file-preview kind-${file.kind}`}>
       <label className="file-select-checkbox"><input type="checkbox" checked={selected} onChange={onSelect} aria-label={`Seleccionar ${file.name}`} /></label>
       <FileThumbnail file={file}><div className="file-type-icon"><Icon size={27} strokeWidth={1.7} /></div></FileThumbnail>
@@ -2353,8 +2362,7 @@ function FileCard({ file, selected, isDragging, onSelect, onFavorite, onDownload
 
 function FileRow({ file, selected, isDragging, onSelect, onFavorite, onDownload, onPreview, onMove, onTrash, onDelete, onDragStart, onDragEnd, onPointerDown, onPointerMove, onPointerUp, onPointerCancel }: FileActions) {
   const Icon = kindIcon(file.kind);
-  const [nativeDrag, setNativeDrag] = useState(false);
-  return <article className={`file-row ${selected ? "selected" : ""} ${isDragging ? "is-touch-dragging" : ""}`} draggable={nativeDrag && !file.trashed} tabIndex={0} aria-label={fileName(file)} onClick={(event) => { if (!(event.target as Element).closest("button,input,label,select,a")) onSelect(); }} onKeyDown={(event) => { if (event.target === event.currentTarget && event.key === " ") { event.preventDefault(); onSelect(); } }} onDragStart={onDragStart} onDragEnd={onDragEnd} onPointerDown={(event) => { setNativeDrag(event.pointerType === "mouse"); onPointerDown(event); }} onPointerMove={onPointerMove} onPointerUp={onPointerUp} onPointerCancel={onPointerCancel}>
+  return <article className={`file-row ${selected ? "selected" : ""} ${isDragging ? "is-touch-dragging" : ""}`} draggable={!file.trashed} tabIndex={0} aria-label={fileName(file)} onClick={(event) => { if (!(event.target as Element).closest("button,input,label,select,a")) onSelect(); }} onKeyDown={(event) => { if (event.target === event.currentTarget && event.key === " ") { event.preventDefault(); onSelect(); } }} onDragStart={onDragStart} onDragEnd={onDragEnd} onPointerDown={onPointerDown} onPointerMove={onPointerMove} onPointerUp={onPointerUp} onPointerCancel={onPointerCancel}>
     <div className="file-row-name">
       <input type="checkbox" checked={selected} onChange={onSelect} aria-label={`Seleccionar ${file.name}`} />
       <div className={`small-file-icon kind-${file.kind}`}><FileThumbnail file={file}><Icon size={18} /></FileThumbnail></div>

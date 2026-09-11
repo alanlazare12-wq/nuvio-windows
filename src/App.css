@@ -228,8 +228,15 @@ kbd { border: 1px solid var(--border); background: var(--panel); border-radius: 
 .file-card { min-width: 0; background: var(--panel); border: 1px solid var(--border); border-radius: 15px; overflow: hidden; transition: .18s ease; box-shadow: 0 2px 8px rgba(25,30,40,.02); }
 .file-card[draggable="true"], .file-row[draggable="true"] { cursor: grab; user-select: none; -webkit-user-select: none; -webkit-user-drag: element; }
 .file-card[draggable="true"]:active, .file-row[draggable="true"]:active { cursor: grabbing; }
-.file-card[draggable="true"] strong, .file-card[draggable="true"] span, .file-card[draggable="true"] small,
-.file-row[draggable="true"] strong, .file-row[draggable="true"] span, .file-row[draggable="true"] small { user-select: none; -webkit-user-select: none; }
+.file-card[draggable="true"] *, .file-row[draggable="true"] * {
+  -webkit-user-drag: none;
+  user-select: none;
+  -webkit-user-select: none;
+}
+.file-card input, .file-row input, .file-card button, .file-row button {
+  user-select: auto;
+  -webkit-user-select: auto;
+}
 .file-card:hover { transform: translateY(-2px); box-shadow: var(--shadow-soft); border-color: var(--border-strong); }
 .file-preview { height: 120px; background: linear-gradient(145deg, #f1f4ff, #e6ebff); position: relative; display: grid; place-items: center; }
 :root[data-theme="dark"] .file-preview { background: linear-gradient(145deg, #232b40, #202431); }
