@@ -931,6 +931,21 @@ fn update_setting(
     state.repository.settings().map_err(|e| e.to_string())
 }
 
+#[tauri::command]
+async fn update_mobile_sync_notification(data: serde_json::Value) -> Result<(), String> {
+    mobile::update_sync_notification(&data)
+}
+
+#[tauri::command]
+async fn update_mobile_upload_notification(data: serde_json::Value) -> Result<(), String> {
+    mobile::update_upload_notification(&data)
+}
+
+#[tauri::command]
+async fn clear_mobile_notification(id: i32) -> Result<(), String> {
+    mobile::clear_notification(id)
+}
+
 async fn run_job(state: Arc<AppState>, job: cloud::WorkItem) {
     let result = if job.direction == "upload" {
         state.telegram.run_upload(&state.repository, &job).await
@@ -1308,7 +1323,10 @@ pub fn run() {
             telegram_request_qr,
             telegram_register_user,
             telegram_log_out,
-            telegram_forget_session
+            telegram_forget_session,
+            update_mobile_sync_notification,
+            update_mobile_upload_notification,
+            clear_mobile_notification
         ])
         .run(tauri::generate_context!())
         .expect("error while running Nuvio");

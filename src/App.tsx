@@ -102,6 +102,8 @@ import {
   submitTelegramPassword,
   submitTelegramPhone,
   syncFiles,
+  updateSyncNotification,
+  updateUploadNotification,
   updateSetting,
 } from "./bridge";
 import type {
@@ -449,11 +451,81 @@ function App() {
       if (disposed) return;
       const next = await refreshDashboard();
       const active = next?.syncProgress?.active || (next?.queueSummary.pending ?? 0) > 0;
-      if (!disposed) timer = window.setTimeout(poll, document.hidden ? 10000 : active ? 750 : 2500);
+      if (!disposed) timer = window.setTimeout(poll, document.hidden ? 10000 : active ? 600 : 2500);
     };
     void poll();
     return () => { disposed = true; dashboardRequestRef.current++; mediaRequestRef.current++; window.clearTimeout(timer); };
   }, []);
+
+  const previousSyncActiveRef = useRef(false);
+  useEffect(() => {
+    if (!dashboard) return;
+    const sync = dashboard.syncProgress;
+    const active = Boolean(sync?.active);
+    const wasActive = previousSyncActiveRef.current;
+    if (active) {
+      previousSyncActiveRef.current = true;
+      void updateSyncNotification({
+        active: true,
+        percent: sync?.percent,
+        scanned: sync?.scanned ?? 0,
+        total: sync?.total,
+        phase: sync?.phase,
+        error: sync?.error,
+      });
+    } else if (wasActive) {
+      previousSyncActiveRef.current = false;
+      void updateSyncNotification({
+        active: false,
+        percent: 100,
+        scanned: sync?.scanned ?? 0,
+        total: sync?.total,
+        phase: sync?.phase ?? "complete",
+        error: sync?.error,
+      });
+    }
+  }, [dashboard?.syncProgress?.active, dashboard?.syncProgress?.percent, dashboard?.syncProgress?.scanned, dashboard?.syncProgress?.error]);
+
+  const previousUploadActiveRef = useRef(false);
+  useEffect(() => {
+    if (!dashboard) return;
+    const q = dashboard.queueSummary;
+    const activeUploads = dashboard.transfers.filter(
+      (t) => t.direction === "upload" && isTransferPending(t)
+    );
+    const hasActive = activeUploads.length > 0 || (q.pending > 0 && q.active > 0);
+    const wasActive = previousUploadActiveRef.current;
+
+    if (hasActive) {
+      previousUploadActiveRef.current = true;
+      const currentFileName = activeUploads[0]?.fileName ?? null;
+      void updateUploadNotification({
+        active: true,
+        total: q.total,
+        completed: q.completed,
+        pending: q.pending,
+        failed: q.failed,
+        percent: q.totalBytes > 0 ? Math.round((q.processedBytes / q.totalBytes) * 100) : null,
+        processedBytes: q.processedBytes,
+        totalBytes: q.totalBytes,
+        speedBps: q.speedBps,
+        currentFileName,
+      });
+    } else if (wasActive) {
+      previousUploadActiveRef.current = false;
+      void updateUploadNotification({
+        active: false,
+        total: q.total,
+        completed: q.completed,
+        pending: 0,
+        failed: q.failed,
+        percent: 100,
+        processedBytes: q.totalBytes,
+        totalBytes: q.totalBytes,
+        speedBps: 0,
+      });
+    }
+  }, [dashboard?.queueSummary?.pending, dashboard?.queueSummary?.completed, dashboard?.queueSummary?.processedBytes, dashboard?.queueSummary?.speedBps, dashboard?.transfers]);
 
   useEffect(() => {
     document.documentElement.dataset.theme = darkMode ? "dark" : "light";
@@ -1141,6 +1213,7 @@ function App() {
     if (!touch || touch.pointerId !== event.pointerId || touch.active) return;
     touch.active = true;
     touch.timer = null;
+    suppressClickUntilRef.current = Date.now() + 500;
     try { event.currentTarget.setPointerCapture(event.pointerId); } catch { /* Some webviews may reject capture. */ }
     touch.lastX = event.clientX;
     touch.lastY = event.clientY;
@@ -1155,11 +1228,12 @@ function App() {
 
   const touchDragStart = (event: React.PointerEvent<HTMLElement>, file: CloudFile) => {
     if (file.trashed) return;
-    if (event.pointerType === "mouse") return;
     const interactive = (event.target as Element).closest("button,input,label,select,a");
     if (interactive || !event.isPrimary) return;
+    if (event.pointerType === "mouse" && event.button !== 0) return;
     clearFileDrag();
     const ids = dragIdsFor(file);
+    const isMouse = event.pointerType === "mouse";
     const state = {
       pointerId: event.pointerId,
       ids,
@@ -1173,12 +1247,15 @@ function App() {
       element: event.currentTarget,
     };
     touchDragRef.current = state;
-    if (!selectedFiles.has(file.id)) {
+    if (isMouse) {
+      state.timer = null;
+    } else if (!selectedFiles.has(file.id)) {
       state.timer = window.setTimeout(() => {
         const current = touchDragRef.current;
         if (!current || current.pointerId !== event.pointerId || current.active) return;
         current.active = true;
         current.timer = null;
+        suppressClickUntilRef.current = Date.now() + 500;
         try { current.element.setPointerCapture(current.pointerId); } catch { /* Pointer capture is optional. */ }
         current.lastX = current.startX;
         current.lastY = current.startY;
@@ -1198,9 +1275,12 @@ function App() {
     if (!touch || touch.pointerId !== event.pointerId) return;
     if (!touch.active) {
       const distance = Math.hypot(event.clientX - touch.startX, event.clientY - touch.startY);
-      if (distance > 6 && touch.timer == null) {
+      const isMouse = event.pointerType === "mouse";
+      if (isMouse && distance > 4) {
         activateTouchDrag(event);
-      } else if (distance > 12 && touch.timer != null) {
+      } else if (!isMouse && distance > 6 && touch.timer == null) {
+        activateTouchDrag(event);
+      } else if (!isMouse && distance > 12 && touch.timer != null) {
         window.clearTimeout(touch.timer);
         touch.timer = null;
         touchDragRef.current = null;
@@ -1220,6 +1300,7 @@ function App() {
     const touch = touchDragRef.current;
     if (!touch || touch.pointerId !== event.pointerId) return;
     if (touch.timer != null) window.clearTimeout(touch.timer);
+    try { event.currentTarget.releasePointerCapture(event.pointerId); } catch { /* Optional */ }
     if (!touch.active) {
       touchDragRef.current = null;
       return;
@@ -1229,7 +1310,6 @@ function App() {
     const ids = touch.ids;
     clearFileDrag();
     if (key == null) {
-      clearFileDrag();
       setAppNotice("Movimiento cancelado.");
       return;
     }
@@ -1881,7 +1961,9 @@ function FolderCard({ folder, dropActive, onOpen, onRename, onMove, onDelete, on
         className="folder-open-area"
         onClick={onOpen}
         aria-label={`Abrir ${folder.name}`}
+        onDragEnter={onFileDragOver}
         onDragOver={onFileDragOver}
+        onDragLeave={onFileDragLeave}
         onDrop={onFileDrop}
       >
         <span className="folder-icon"><Folder size={23} fill="currentColor" /></span>
@@ -2337,7 +2419,7 @@ type FileActions = {
 
 function FileCard({ file, selected, isDragging, onSelect, onFavorite, onDownload, onPreview, onMove, onTrash, onDelete, onDragStart, onDragEnd, onPointerDown, onPointerMove, onPointerUp, onPointerCancel }: FileActions) {
   const Icon = kindIcon(file.kind);
-  return <article className={`file-card ${selected ? "selected" : ""} ${isDragging ? "is-touch-dragging" : ""}`} draggable={!file.trashed} tabIndex={0} aria-label={fileName(file)} onClick={(event) => { if (!(event.target as Element).closest("button,input,label,select,a")) onSelect(); }} onKeyDown={(event) => { if (event.target === event.currentTarget && event.key === " ") { event.preventDefault(); onSelect(); } }} onDragStart={onDragStart} onDragEnd={onDragEnd} onPointerDown={onPointerDown} onPointerMove={onPointerMove} onPointerUp={onPointerUp} onPointerCancel={onPointerCancel}>
+  return <article className={`file-card ${selected ? "selected" : ""} ${isDragging ? "is-touch-dragging" : ""}`} draggable={false} tabIndex={0} aria-label={fileName(file)} onClick={(event) => { if (!(event.target as Element).closest("button,input,label,select,a")) onSelect(); }} onKeyDown={(event) => { if (event.target === event.currentTarget && event.key === " ") { event.preventDefault(); onSelect(); } }} onDragStart={onDragStart} onDragEnd={onDragEnd} onPointerDown={onPointerDown} onPointerMove={onPointerMove} onPointerUp={onPointerUp} onPointerCancel={onPointerCancel}>
     <div className={`file-preview kind-${file.kind}`}>
       <label className="file-select-checkbox"><input type="checkbox" checked={selected} onChange={onSelect} aria-label={`Seleccionar ${file.name}`} /></label>
       <FileThumbnail file={file}><div className="file-type-icon"><Icon size={27} strokeWidth={1.7} /></div></FileThumbnail>
@@ -2362,7 +2444,7 @@ function FileCard({ file, selected, isDragging, onSelect, onFavorite, onDownload
 
 function FileRow({ file, selected, isDragging, onSelect, onFavorite, onDownload, onPreview, onMove, onTrash, onDelete, onDragStart, onDragEnd, onPointerDown, onPointerMove, onPointerUp, onPointerCancel }: FileActions) {
   const Icon = kindIcon(file.kind);
-  return <article className={`file-row ${selected ? "selected" : ""} ${isDragging ? "is-touch-dragging" : ""}`} draggable={!file.trashed} tabIndex={0} aria-label={fileName(file)} onClick={(event) => { if (!(event.target as Element).closest("button,input,label,select,a")) onSelect(); }} onKeyDown={(event) => { if (event.target === event.currentTarget && event.key === " ") { event.preventDefault(); onSelect(); } }} onDragStart={onDragStart} onDragEnd={onDragEnd} onPointerDown={onPointerDown} onPointerMove={onPointerMove} onPointerUp={onPointerUp} onPointerCancel={onPointerCancel}>
+  return <article className={`file-row ${selected ? "selected" : ""} ${isDragging ? "is-touch-dragging" : ""}`} draggable={false} tabIndex={0} aria-label={fileName(file)} onClick={(event) => { if (!(event.target as Element).closest("button,input,label,select,a")) onSelect(); }} onKeyDown={(event) => { if (event.target === event.currentTarget && event.key === " ") { event.preventDefault(); onSelect(); } }} onDragStart={onDragStart} onDragEnd={onDragEnd} onPointerDown={onPointerDown} onPointerMove={onPointerMove} onPointerUp={onPointerUp} onPointerCancel={onPointerCancel}>
     <div className="file-row-name">
       <input type="checkbox" checked={selected} onChange={onSelect} aria-label={`Seleccionar ${file.name}`} />
       <div className={`small-file-icon kind-${file.kind}`}><FileThumbnail file={file}><Icon size={18} /></FileThumbnail></div>

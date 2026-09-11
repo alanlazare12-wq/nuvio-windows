@@ -814,6 +814,13 @@ impl TelegramService {
         let mut progress = crate::progress::SyncRun::new(&self.sync_progress);
         let result = self.sync_catalog_inner(repo, &progress).await;
         progress.finish(result.as_ref().err().cloned());
+        if let Err(ref err) = result {
+            let _ = crate::mobile::update_sync_notification(&serde_json::json!({
+                "active": false,
+                "error": err,
+                "phase": "error"
+            }));
+        }
         result
     }
 
@@ -840,6 +847,13 @@ impl TelegramService {
         };
         let mut scanned = 0;
         progress.scanned(scanned, total);
+        let _ = crate::mobile::update_sync_notification(&serde_json::json!({
+            "active": true,
+            "scanned": scanned,
+            "total": total,
+            "percent": null,
+            "phase": "scanning"
+        }));
         let mut cursor = 0;
         let mut documents = Vec::new();
         let mut latest_folder_events = std::collections::HashMap::<String, FolderEvent>::new();
@@ -856,6 +870,8 @@ impl TelegramService {
             .await?;
             let mut last = cursor;
             let mut found = false;
+            let mut page_documents = Vec::new();
+            let mut has_new_folders = false;
             for msg in page.messages.into_iter().flatten() {
                 if msg.id == cursor {
                     continue;
@@ -864,9 +880,16 @@ impl TelegramService {
                 scanned += 1;
                 last = msg.id;
                 if let Some(event) = folder_event(&msg) {
-                    latest_folder_events
-                        .entry(event.id.clone())
-                        .or_insert(event);
+                    let is_new = match latest_folder_events.entry(event.id.clone()) {
+                        std::collections::hash_map::Entry::Vacant(v) => {
+                            v.insert(event);
+                            true
+                        }
+                        std::collections::hash_map::Entry::Occupied(_) => false,
+                    };
+                    if is_new {
+                        has_new_folders = true;
+                    }
                 } else if let Some(event) = file_move_event(&msg) {
                     for message_id in event.message_ids {
                         latest_moves
@@ -874,10 +897,30 @@ impl TelegramService {
                             .or_insert_with(|| event.folder_id.clone());
                     }
                 } else if let Some(doc) = document(&msg) {
+                    page_documents.push(doc.clone());
                     documents.push(doc);
                 }
             }
+            if has_new_folders {
+                let _ = repo.apply_folder_snapshot(latest_folder_events.values().cloned().collect());
+            }
+            if !page_documents.is_empty() {
+                for doc in &mut page_documents {
+                    if let Some(moved) = latest_moves.get(&doc.message_id) {
+                        doc.folder_id = moved.clone();
+                    }
+                }
+                let _ = repo.record_remote_batch(&page_documents);
+            }
             progress.scanned(scanned, total);
+            let percent = total.filter(|n| *n > 0).map(|n| ((scanned as f64 / n as f64 * 90.0) as u8).min(89));
+            let _ = crate::mobile::update_sync_notification(&serde_json::json!({
+                "active": true,
+                "scanned": scanned,
+                "total": total,
+                "percent": percent,
+                "phase": "scanning"
+            }));
             if !found || last == cursor {
                 break;
             }
@@ -889,21 +932,27 @@ impl TelegramService {
         repo.apply_folder_snapshot(latest_folder_events.into_values().collect())?;
 
         let count = documents.len();
-        documents.reverse();
-        for (index, batch) in documents.chunks(250).enumerate() {
-            repo.record_remote_batch(batch).map_err(|e| e.to_string())?;
-            progress.applying(((index + 1) * 250).min(count), count);
-            tokio::task::yield_now().await;
-        }
-        for (message_id, folder_id) in latest_moves {
-            let file_id = format!("tg-{message_id}");
+        // Reconcile all documents with final folder hierarchy and moves
+        for doc in &documents {
+            let target_folder = latest_moves
+                .get(&doc.message_id)
+                .cloned()
+                .unwrap_or_else(|| doc.folder_id.clone());
+            let file_id = format!("tg-{}", doc.message_id);
             if repo.remote(&file_id).is_ok() {
-                let folder = folder_id
+                let valid_folder = target_folder
                     .filter(|id| repo.folder_by_id(id).is_ok_and(|folder| !folder.trashed));
-                repo.set_file_folder_local(&[file_id], folder.as_deref())
-                    .map_err(|e| e.to_string())?;
+                let _ = repo.set_file_folder_local(&[file_id], valid_folder.as_deref());
             }
         }
+        progress.applying(count, count);
+        let _ = crate::mobile::update_sync_notification(&serde_json::json!({
+            "active": false,
+            "scanned": scanned,
+            "total": total,
+            "percent": 100,
+            "phase": "complete"
+        }));
         Ok(count)
     }
 

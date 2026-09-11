@@ -177,3 +177,27 @@ pub async fn pick_upload_directory() -> Result<Option<crate::DirectoryUploadPlan
 pub async fn stage_content_uri(_uri: &str) -> Result<String, String> {
     Err("Los URI de Android sólo están soportados en Android".into())
 }
+
+pub fn update_sync_notification(_data: &serde_json::Value) -> Result<(), String> {
+    #[cfg(target_os = "android")]
+    {
+        let _: serde_json::Value = call("updateSyncNotification", _data.clone())?;
+    }
+    Ok(())
+}
+
+pub fn update_upload_notification(_data: &serde_json::Value) -> Result<(), String> {
+    #[cfg(target_os = "android")]
+    {
+        let _: serde_json::Value = call("updateUploadNotification", _data.clone())?;
+    }
+    Ok(())
+}
+
+pub fn clear_notification(_id: i32) -> Result<(), String> {
+    #[cfg(target_os = "android")]
+    {
+        let _: serde_json::Value = call("clearNotification", serde_json::json!({ "id": _id }))?;
+    }
+    Ok(())
+}
