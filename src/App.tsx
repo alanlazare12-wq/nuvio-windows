@@ -22,7 +22,6 @@ import {
   Files,
   Filter,
   Folder,
-  FolderOpen,
   FolderPlus,
   FolderUp,
   Grid2X2,
@@ -123,6 +122,9 @@ import type {
 import "./App.css";
 import { Dialog } from "./Dialog";
 import { FileThumbnail, clearThumbnailCache } from "./FileThumbnail";
+import { SyncProgressPanel } from "./components/SyncProgressPanel";
+import { FolderEditorDialog } from "./components/FolderEditorDialog";
+import { MoveToFolderDialog } from "./components/MoveToFolderDialog";
 
 GlobalWorkerOptions.workerSrc = pdfWorker;
 
@@ -1011,9 +1013,31 @@ function App() {
     }
   };
 
+  const isSyncing = syncBusy || Boolean(dashboard?.syncProgress?.active);
+  const [syncDismissed, setSyncDismissed] = useState(false);
+
+  useEffect(() => {
+    if (dashboard?.syncProgress?.active) {
+      setSyncDismissed(false);
+    }
+  }, [dashboard?.syncProgress?.active]);
+
+  useEffect(() => {
+    if (!dashboard?.syncProgress?.active && dashboard?.syncProgress?.phase === "complete" && !syncDismissed) {
+      const timer = window.setTimeout(() => {
+        setSyncDismissed(true);
+      }, 6000);
+      return () => window.clearTimeout(timer);
+    }
+  }, [dashboard?.syncProgress?.active, dashboard?.syncProgress?.phase, syncDismissed]);
+
   const handleSync = async () => {
-    if (syncBusy) return;
+    if (isSyncing) {
+      setAppNotice("La sincronización ya está en curso y actualizándose en vivo.");
+      return;
+    }
     setSyncBusy(true);
+    setSyncDismissed(false);
     await action(async () => {
       const count = await syncFiles();
       setAppNotice(`${count} archivos de Nuvio encontrados en Mensajes guardados.`);
@@ -1552,7 +1576,7 @@ function App() {
             <div className="heading-actions">
               {section === "files" && <button className="secondary-button folder-create-button" disabled={!dashboard.telegramConnected} onClick={() => setFolderEditor({ mode: "create" })}><FolderPlus size={17} /> Nueva carpeta</button>}
               <button className="secondary-button folder-upload-button" disabled={uploadBusy || !dashboard.telegramConnected} onClick={() => void handleUploadFolder()}><FolderUp size={17} /> Subir carpeta</button>
-              <button className={`secondary-button sync-action-button ${syncBusy ? "is-syncing" : ""}`} disabled={syncBusy || !dashboard.telegramConnected} onClick={() => void handleSync()} title={syncBusy ? "Sincronizando con Telegram…" : "Sincronizar con Telegram"} aria-label={syncBusy ? "Sincronizando…" : "Sincronizar"}><RefreshCw size={17} className={syncBusy ? "spin-icon" : ""} /><span className="sync-button-label">{syncBusy ? "Sincronizando…" : "Sincronizar"}</span></button>
+              <button className={`secondary-button sync-action-button ${isSyncing ? "is-syncing" : ""}`} disabled={isSyncing || !dashboard.telegramConnected} onClick={() => void handleSync()} title={isSyncing ? "Sincronización en curso con Telegram…" : "Sincronizar con Telegram"} aria-label={isSyncing ? "Sincronizando…" : "Sincronizar"}><RefreshCw size={17} className={isSyncing ? "spin-icon" : ""} /><span className="sync-button-label">{isSyncing ? "Sincronizando…" : "Sincronizar"}</span></button>
               <button className="primary-button" onClick={() => void handleUpload()} disabled={uploadBusy}><Upload size={17} /> {uploadBusy ? "Preparando…" : "Subir"}</button>
             </div>
           </section>
@@ -1567,12 +1591,13 @@ function App() {
             <small>{zipProgress.name}</small>
           </section>}
 
-          {(dashboard.syncProgress?.phase || syncBusy) && <section className="sync-progress-panel" aria-label="Progreso de sincronización">
-            <div><strong>{dashboard.syncProgress?.active ? (dashboard.syncProgress.phase === "applying" ? "Actualizando catálogo…" : "Sincronizando…") : syncBusy ? "Iniciando sincronización…" : dashboard.syncProgress?.error ? "Sincronización interrumpida" : "Sincronización completada"}</strong>
-              <span>{dashboard.syncProgress?.active ? (dashboard.syncProgress.percent == null ? "Calculando…" : `${dashboard.syncProgress.percent}% aprox.`) : syncBusy ? "Calculando…" : dashboard.syncProgress?.error ? "Pendiente de reintentar" : "100%"}</span></div>
-            <progress aria-label="Sincronización" max={100} value={syncBusy && !dashboard.syncProgress?.active ? undefined : dashboard.syncProgress?.percent ?? undefined} />
-            <small>{dashboard.syncProgress?.error || (dashboard.syncProgress?.active ? `${dashboard.syncProgress.scanned} mensajes revisados${dashboard.syncProgress.etaSeconds != null ? ` · Quedan aproximadamente ${dashboard.syncProgress.etaSeconds < 60 ? `${dashboard.syncProgress.etaSeconds} s` : `${Math.ceil(dashboard.syncProgress.etaSeconds / 60)} min`}` : ""}` : syncBusy ? "Consultando Telegram…" : "Catálogo actualizado")}</small>
-          </section>}
+          {!syncDismissed && (
+            <SyncProgressPanel
+              syncProgress={dashboard.syncProgress}
+              syncBusy={syncBusy}
+              onDismiss={() => setSyncDismissed(true)}
+            />
+          )}
 
           {section === "files" && <nav className="folder-breadcrumbs" aria-label="Ruta de carpetas">
             <button
@@ -2041,56 +2066,6 @@ function FolderCard({ folder, dropActive, onOpen, onRename, onMove, onDelete, on
   );
 }
 
-function FolderEditorDialog({ mode, initialName, parentName, onClose, onSave }: { mode: "create" | "rename"; initialName: string; parentName: string; onClose: () => void; onSave: (name: string) => Promise<void> }) {
-  const [name, setName] = useState(initialName);
-  const [busy, setBusy] = useState(false);
-  const [error, setError] = useState<string | null>(null);
-  const submit = async (event: React.FormEvent) => {
-    event.preventDefault();
-    const normalized = name.trim();
-    if (!normalized) return setError("Escribe un nombre para la carpeta");
-    setBusy(true); setError(null);
-    try { await onSave(normalized); } catch (value) { setError(readableError(value)); } finally { setBusy(false); }
-  };
-  return <Dialog className="folder-modal" label={mode === "create" ? "Nueva carpeta" : "Renombrar carpeta"} onClose={onClose}>
-    <button className="icon-button modal-close" onClick={onClose} aria-label="Cerrar"><X size={18} /></button>
-    <div className="modal-brand"><FolderPlus size={23} /></div><div className="modal-eyebrow">{parentName}</div><h2>{mode === "create" ? "Nueva carpeta" : "Renombrar carpeta"}</h2>
-    <p>{mode === "create" ? "La estructura se sincronizará con Telegram y aparecerá igual en Windows y Android." : "El nuevo nombre se sincronizará en tus dispositivos."}</p>
-    {error && <div className="modal-error" role="alert">{error}</div>}
-    <form className="credential-placeholder" onSubmit={submit}><label htmlFor="folder-name">Nombre</label><input id="folder-name" autoFocus maxLength={120} value={name} onChange={(event) => setName(event.target.value)} /><button className="primary-button modal-primary" disabled={busy} type="submit">{busy ? "Guardando…" : mode === "create" ? "Crear carpeta" : "Guardar nombre"}</button></form>
-  </Dialog>;
-}
-
-function folderPathLabel(folder: CloudFolder, folders: CloudFolder[]): string {
-  const names = [folder.name];
-  const seen = new Set([folder.id]);
-  let parent = folder.parentId ?? null;
-  while (parent && !seen.has(parent)) {
-    seen.add(parent);
-    const found = folders.find((item) => item.id === parent);
-    if (!found) break;
-    names.unshift(found.name);
-    parent = found.parentId ?? null;
-  }
-  return names.join(" / ");
-}
-
-function MoveToFolderDialog({ folders, movingFolderId, itemLabel, onClose, onMove }: { folders: CloudFolder[]; movingFolderId: string | null; itemLabel: string; onClose: () => void; onMove: (folderId: string | null) => Promise<void> }) {
-  const [target, setTarget] = useState("__root__");
-  const [busy, setBusy] = useState(false);
-  const [error, setError] = useState<string | null>(null);
-  const choices = folders.filter((folder) => !folder.trashed && folder.id !== movingFolderId).sort((a, b) => folderPathLabel(a, folders).localeCompare(folderPathLabel(b, folders), "es", { numeric: true, sensitivity: "base" }));
-  const submit = async (event: React.FormEvent) => {
-    event.preventDefault(); setBusy(true); setError(null);
-    try { await onMove(target === "__root__" ? null : target); } catch (value) { setError(readableError(value)); } finally { setBusy(false); }
-  };
-  return <Dialog className="folder-modal" label="Mover a carpeta" onClose={onClose}>
-    <button className="icon-button modal-close" onClick={onClose} aria-label="Cerrar"><X size={18} /></button>
-    <div className="modal-brand"><FolderOpen size={23} /></div><div className="modal-eyebrow">Organización Nuvio</div><h2>Mover a…</h2><p>Elige el destino para {itemLabel}. El cambio se sincronizará mediante Telegram.</p>
-    {error && <div className="modal-error" role="alert">{error}</div>}
-    <form className="credential-placeholder" onSubmit={submit}><label htmlFor="folder-target">Destino</label><select id="folder-target" value={target} onChange={(event) => setTarget(event.target.value)}><option value="__root__">Mi unidad</option>{choices.map((folder) => <option key={folder.id} value={folder.id}>{folderPathLabel(folder, folders)}</option>)}</select><button className="primary-button modal-primary" disabled={busy} type="submit">{busy ? "Moviendo…" : "Mover"}</button></form>
-  </Dialog>;
-}
 
 function TransferRow({ job, connected, onAction }: { job: TransferJob; connected: boolean; onAction: (operation: () => Promise<unknown>) => void }) {
   const calculating = ["analyzing", "copying", "uploading", "downloading", "confirming", "running"].includes(job.status);

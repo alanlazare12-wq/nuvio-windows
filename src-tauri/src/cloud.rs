@@ -170,6 +170,43 @@ impl CatalogRepository {
         tx.commit().map_err(|e| e.to_string())
     }
 
+    pub fn reconcile_moves_and_orphans(
+        &self,
+        moves: &std::collections::HashMap<i64, Option<String>>,
+    ) -> Result<(), String> {
+        let mut connection = self.connection.lock().map_err(|e| e.to_string())?;
+        let tx = connection.transaction().map_err(|e| e.to_string())?;
+
+        if !moves.is_empty() {
+            let mut stmt = tx
+                .prepare("UPDATE file_locations SET folder_id=?1 WHERE file_id=?2")
+                .map_err(|e| e.to_string())?;
+            for (&message_id, target_folder) in moves {
+                let file_id = format!("tg-{}", message_id);
+                let valid_folder = target_folder.as_deref().filter(|fid| {
+                    tx.query_row(
+                        "SELECT 1 FROM folders WHERE id=?1 AND trashed=0",
+                        [fid],
+                        |_| Ok(()),
+                    )
+                    .is_ok()
+                });
+                let _ = stmt.execute(params![valid_folder, file_id]);
+            }
+        }
+
+        tx.execute(
+            "UPDATE file_locations SET folder_id=NULL 
+             WHERE folder_id IS NOT NULL 
+               AND NOT EXISTS (SELECT 1 FROM folders WHERE folders.id = file_locations.folder_id AND folders.trashed = 0)",
+            [],
+        )
+        .map_err(|e| e.to_string())?;
+
+        tx.commit().map_err(|e| e.to_string())?;
+        Ok(())
+    }
+
     pub fn init_cloud(&self) -> Result<(), RepositoryError> {
         self.connection.lock().expect("catalog").execute_batch(
             "CREATE TABLE IF NOT EXISTS remote_documents (id TEXT PRIMARY KEY, document TEXT NOT NULL);
@@ -927,7 +964,7 @@ impl TelegramService {
         }
 
         let mut cursor = 0;
-        let mut documents = Vec::new();
+        let mut total_documents = 0usize;
         let mut pending_documents = Vec::new();
         let mut last_flush = Instant::now();
 
@@ -975,7 +1012,7 @@ impl TelegramService {
                         doc_to_save.folder_id = moved.clone();
                     }
                     pending_documents.push(doc_to_save);
-                    documents.push(doc);
+                    total_documents += 1;
                 }
             }
             if has_new_folders {
@@ -1007,24 +1044,13 @@ impl TelegramService {
             pending_documents.clear();
         }
 
-        progress.applying(0, documents.len());
+        progress.applying(0, total_documents.max(1));
         repo.apply_folder_snapshot(latest_folder_events.into_values().collect())?;
 
-        let count = documents.len();
-        // Reconcile all documents with final folder hierarchy and moves
-        for doc in &documents {
-            let target_folder = latest_moves
-                .get(&doc.message_id)
-                .cloned()
-                .unwrap_or_else(|| doc.folder_id.clone());
-            let file_id = format!("tg-{}", doc.message_id);
-            if repo.remote(&file_id).is_ok() {
-                let valid_folder = target_folder
-                    .filter(|id| repo.folder_by_id(id).is_ok_and(|folder| !folder.trashed));
-                let _ = repo.set_file_folder_local(&[file_id], valid_folder.as_deref());
-            }
-        }
-        progress.applying(count, count);
+        // Reconciliación atómica instantánea (1 ms) para movimientos y carpetas huérfanas
+        repo.reconcile_moves_and_orphans(&latest_moves)?;
+
+        progress.applying(total_documents, total_documents.max(1));
         let _ = crate::mobile::update_sync_notification(&serde_json::json!({
             "active": false,
             "scanned": scanned,
@@ -1032,7 +1058,7 @@ impl TelegramService {
             "percent": 100,
             "phase": "complete"
         }));
-        Ok(count)
+        Ok(total_documents)
     }
 
     pub async fn delete_files_permanently(
