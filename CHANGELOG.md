@@ -4,6 +4,23 @@
 
 ## 1.2.4 — 2026-09-17 — Respaldos por volúmenes ZIP y release final
 
+### Autenticación Telegram 2026 — métodos ampliados y future-auth
+
+- Graphify se reconstruyó después de la implementación y quedó en 1,153 nodos / 3,219 aristas / 44 comunidades. Se trazó de extremo a extremo la máquina de autorización TDLib → `TelegramService` → comandos Tauri → bridge TypeScript → `TelegramConnectModal`.
+- `TelegramAuthSnapshot` conserva ahora metadata que antes se descartaba: longitud del código, URL de Fragment, patrón/longitud del correo, disponibilidad de Google ID/Apple ID, estado de reset del correo y número de tokens future-auth disponibles.
+- Fragment queda soportado de extremo a extremo cuando Telegram lo ofrece: TDLib entrega `authenticationCodeTypeFragment.url`, Nuvio la conserva, muestra el canal y abre exclusivamente URLs HTTPS de `fragment.com` mediante el plugin opener; el código sigue validándose por el flujo normal de TDLib.
+- Google ID y Apple ID quedan conectados al backend real de TDLib mediante `EmailAddressAuthenticationGoogleId` / `EmailAddressAuthenticationAppleId`. La UI solo los muestra cuando `allow_google_id` / `allow_apple_id` llegan activos desde Telegram; los tokens se tratan como secretos temporales y se limpian del estado local después del envío.
+- Añadido reset de correo de autenticación usando `resetAuthenticationEmailAddress`, incluyendo estados `available` / `pending`, cuenta regresiva y retorno seguro al flujo por teléfono cuando Telegram lo permite.
+- Añadida configuración de correo de login para futuras autenticaciones: `setLoginEmailAddress`, reenvío y `checkLoginEmailAddressCode`, disponibles desde una sesión ya conectada.
+- El panel de correo de login consulta `getPasswordState` + `isLoginEmailAddressRequired` antes de habilitar cambios: distingue cuentas que lo requieren, cuentas con correo ya configurado y cuentas donde Telegram no ofrece esta capacidad, evitando botones que fallen por diseño.
+- Implementado future-auth real de TDLib. Nuvio captura `updateOption("authentication_token")`, conserva hasta 20 tokens deduplicados, los protege con el almacén de secretos existente (DPAPI en Windows / protección móvil en Android) y los reenvía automáticamente en `PhoneNumberAuthenticationSettings.authentication_tokens` para accesos posteriores.
+- Si el usuario desactiva “Recordar sesión” o usa “Olvidar sesión”, los future-auth tokens se eliminan junto con las credenciales persistentes. La base TDLib y el ciclo de logout mantienen la semántica existente.
+- Passkey / Windows Hello se muestra como no disponible para clientes no oficiales en vez de ofrecer un botón falso; Nuvio no intenta registrar una credencial que Telegram no permite usar desde un RP ID de terceros.
+- Se añadió soporte opcional para credenciales de aplicación preconfiguradas mediante `NUVIO_TELEGRAM_API_ID` y `NUVIO_TELEGRAM_API_HASH`, manteniendo el formulario manual cuando no existen.
+- QA de autenticación ampliado a 29 escenarios Playwright, todos aprobados: canales Telegram/SMS/llamada/correo/Fragment, reenvíos, errores y reintentos, 2FA, Google ID, Apple ID, reset de correo, future-auth, política de passkey, correo de login y layouts desktop/móvil.
+- Suite Rust completa: 89/89 aprobadas. Suite UI general de producción: 31/31 aprobadas. TypeScript, build Vite, `cargo clippy --all-targets -- -D warnings`, `cargo fmt --check` y `git diff --check`: aprobados.
+- La primera QA nueva detectó que `codeLength` de Fragment no llegaba al `maxLength` del input. Se corrigió la propagación y la batería completa volvió a pasar.
+
 ### Archivos individuales mayores de 2 GB
 
 - Extendido el pipeline existente de compresión previa para que un único archivo que supere el presupuesto de un ZIP pueda respaldarse automáticamente en múltiples volúmenes independientes de menos de 2 GB, incluidos archivos ya comprimidos como ZIP, RAR y 7z.
@@ -38,8 +55,8 @@
 - TypeScript `tsc --noEmit` y build de producción Vite: aprobados.
 - `cargo fmt --check` y `git diff --check`: aprobados después de aplicar el formato final.
 - Suite UI completa: 31/31 aprobadas, incluyendo drag mouse/touch, carpetas, WebView2, previews, sincronización incremental, limpieza segura, ZIP, Upload Advisor y layouts 390/768/1280.
-- Setup Windows x64 generado con Tauri/NSIS 1.2.4 e instalado silenciosamente en un entorno QA. `verify-windows.mjs` confirmó 15 DLL x64, ejecutable coincidente, marcador `UNK -> NSS` y el frontend `index-CxlZVdPj.js` embebido.
-- Instalador final: `release/Windows/Nuvio-Setup-Windows11-x64.exe`, 231,639,502 bytes, SHA-256 `D201E7E8F33350BB100B822CFB0BF63D2F719C0009BC7E976934CF4E7A58199C`.
+- Setup Windows x64 generado con Tauri/NSIS 1.2.4 e instalado silenciosamente en un entorno QA. `verify-windows.mjs` confirmó 15 DLL x64, ejecutable coincidente, marcador `UNK -> NSS` y el frontend `index-DyiU8NGq.js` embebido.
+- Instalador final: `release/Windows/Nuvio-Setup-Windows11-x64.exe`, 231,633,297 bytes, SHA-256 `FFEE9D039C5B59A1E395A46A784AB7C5D541FE6C4E44A2BDEC1A57974EDB29A9`.
 - Authenticode: `NotSigned`, sin cambio respecto a las builds anteriores; no se declara firma de editor.
 
 ## 1.2.3 — 2026-09-15 — Final QA / empaquetado

@@ -12,3 +12,14 @@
 .auth-delivery-explanation { color: var(--muted); font-size: 11px; line-height: 1.5; margin: 10px 0 0; }
 .auth-delivery-unavailable { color: var(--muted); font-size: 11px; line-height: 1.5; margin: 0; }
 @media (max-width: 350px) { .auth-delivery-option { padding: 10px 8px; } }
+
+.auth-passkey-unavailable { margin-top: 10px; display: flex; gap: 8px; align-items: flex-start; padding: 10px; border: 1px dashed var(--border); border-radius: 10px; color: var(--muted); background: var(--panel-soft); }
+.auth-passkey-unavailable span { display: grid; gap: 2px; min-width: 0; }
+.auth-passkey-unavailable strong { color: var(--text); font-size: 11px; font-weight: 650; }
+.auth-passkey-unavailable small { font-size: 10px; line-height: 1.4; }
+
+.auth-identity-options, .fragment-auth-panel, .auth-email-reset, .auth-login-email-panel { display: grid; gap: 8px; padding: 10px; border: 1px solid var(--border); border-radius: 10px; background: var(--panel-soft); }
+.auth-identity-options .auth-hint, .fragment-auth-panel span, .auth-login-email-panel > span { margin: 0; color: var(--muted); font-size: 10px; line-height: 1.5; }
+.auth-inline-actions { display: flex; flex-wrap: wrap; gap: 8px; }
+.auth-inline-actions .secondary-button.selected { border-color: var(--text); box-shadow: inset 0 0 0 1px var(--text); }
+.fragment-auth-panel strong, .auth-login-email-panel > strong { font-size: 12px; }

@@ -26,7 +26,9 @@ use media::{clear_media_cache, remove_media_cache_entries, MediaReady};
 use provider::StorageProvider;
 use repository::CatalogRepository;
 use tauri::{Emitter, Manager, State};
-use telegram::{TelegramAuthSnapshot, TelegramService};
+use telegram::{
+    TelegramAuthSnapshot, TelegramLoginEmailCodeInfo, TelegramLoginEmailStatus, TelegramService,
+};
 use transfer::{PreparedUpload, TransferService};
 use zeroize::Zeroize;
 
@@ -1483,6 +1485,52 @@ async fn telegram_submit_email_code(
     state.telegram.submit_email_code(code).await
 }
 #[tauri::command]
+async fn telegram_submit_email_identity(
+    state: State<'_, Arc<AppState>>,
+    provider: String,
+    token: String,
+) -> Result<TelegramAuthSnapshot, String> {
+    state.telegram.submit_email_identity(&provider, token).await
+}
+
+#[tauri::command]
+async fn telegram_reset_authentication_email(
+    state: State<'_, Arc<AppState>>,
+) -> Result<TelegramAuthSnapshot, String> {
+    state.telegram.reset_authentication_email().await
+}
+
+#[tauri::command]
+async fn telegram_login_email_status(
+    state: State<'_, Arc<AppState>>,
+) -> Result<TelegramLoginEmailStatus, String> {
+    state.telegram.login_email_status().await
+}
+
+#[tauri::command]
+async fn telegram_set_login_email(
+    state: State<'_, Arc<AppState>>,
+    email: String,
+) -> Result<TelegramLoginEmailCodeInfo, String> {
+    state.telegram.set_login_email(email).await
+}
+
+#[tauri::command]
+async fn telegram_resend_login_email(
+    state: State<'_, Arc<AppState>>,
+) -> Result<TelegramLoginEmailCodeInfo, String> {
+    state.telegram.resend_login_email().await
+}
+
+#[tauri::command]
+async fn telegram_check_login_email(
+    state: State<'_, Arc<AppState>>,
+    code: String,
+) -> Result<TelegramAuthSnapshot, String> {
+    state.telegram.check_login_email(code).await
+}
+
+#[tauri::command]
 async fn telegram_submit_code(
     state: State<'_, Arc<AppState>>,
     code: String,
@@ -1661,6 +1709,12 @@ pub fn run() {
             telegram_reset_to_phone,
             telegram_submit_email,
             telegram_submit_email_code,
+            telegram_submit_email_identity,
+            telegram_reset_authentication_email,
+            telegram_login_email_status,
+            telegram_set_login_email,
+            telegram_resend_login_email,
+            telegram_check_login_email,
             telegram_submit_code,
             telegram_resend_code,
             telegram_submit_password,

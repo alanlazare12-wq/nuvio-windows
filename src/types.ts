@@ -173,6 +173,24 @@ export type TelegramAuthStage =
   | "closing"
   | "closed";
 
+export type TelegramEmailResetSnapshot = {
+  state: "available" | "pending";
+  seconds: number;
+};
+
+export type TelegramLoginEmailCodeInfo = {
+  emailPattern: string;
+  codeLength: number;
+};
+
+export type TelegramLoginEmailStatus = {
+  available: boolean;
+  required: boolean;
+  emailPattern?: string | null;
+};
+
+export type TelegramIdentityProvider = "google" | "apple";
+
 export type TelegramAuthSnapshot = {
   stage: TelegramAuthStage;
   message: string;
@@ -185,6 +203,14 @@ export type TelegramAuthSnapshot = {
   timeout?: number | null;
   codeType?: string | null;
   nextCodeType?: string | null;
+  codeLength?: number | null;
+  fragmentUrl?: string | null;
+  emailPattern?: string | null;
+  emailCodeLength?: number | null;
+  allowGoogleId: boolean;
+  allowAppleId: boolean;
+  emailReset?: TelegramEmailResetSnapshot | null;
+  futureAuthTokenCount: number;
 };
 
 export type PreparedUpload = {

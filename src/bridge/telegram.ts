@@ -1,5 +1,10 @@
 import { invoke } from "@tauri-apps/api/core";
-import type { TelegramAuthSnapshot } from "../types";
+import type {
+  TelegramAuthSnapshot,
+  TelegramIdentityProvider,
+  TelegramLoginEmailCodeInfo,
+  TelegramLoginEmailStatus,
+} from "../types";
 
 export function getTelegramAuthState(): Promise<TelegramAuthSnapshot> {
   return invoke<TelegramAuthSnapshot>("telegram_auth_state");
@@ -30,6 +35,33 @@ export function submitTelegramEmail(email: string): Promise<TelegramAuthSnapshot
 
 export function submitTelegramEmailCode(code: string): Promise<TelegramAuthSnapshot> {
   return invoke<TelegramAuthSnapshot>("telegram_submit_email_code", { code });
+}
+
+export function submitTelegramEmailIdentity(
+  provider: TelegramIdentityProvider,
+  token: string,
+): Promise<TelegramAuthSnapshot> {
+  return invoke<TelegramAuthSnapshot>("telegram_submit_email_identity", { provider, token });
+}
+
+export function resetTelegramAuthenticationEmail(): Promise<TelegramAuthSnapshot> {
+  return invoke<TelegramAuthSnapshot>("telegram_reset_authentication_email");
+}
+
+export function getTelegramLoginEmailStatus(): Promise<TelegramLoginEmailStatus> {
+  return invoke<TelegramLoginEmailStatus>("telegram_login_email_status");
+}
+
+export function setTelegramLoginEmail(email: string): Promise<TelegramLoginEmailCodeInfo> {
+  return invoke<TelegramLoginEmailCodeInfo>("telegram_set_login_email", { email });
+}
+
+export function resendTelegramLoginEmail(): Promise<TelegramLoginEmailCodeInfo> {
+  return invoke<TelegramLoginEmailCodeInfo>("telegram_resend_login_email");
+}
+
+export function checkTelegramLoginEmail(code: string): Promise<TelegramAuthSnapshot> {
+  return invoke<TelegramAuthSnapshot>("telegram_check_login_email", { code });
 }
 
 export function submitTelegramCode(code: string): Promise<TelegramAuthSnapshot> {

@@ -1,23 +1,35 @@
 import { Cloud, X } from "lucide-react";
+import { openUrl } from "@tauri-apps/plugin-opener";
 import { useEffect, useRef, useState, type FormEvent } from "react";
 import {
+  checkTelegramLoginEmail,
   configureTelegram,
   forgetTelegramSession,
   getTelegramAuthState,
+  getTelegramLoginEmailStatus,
   logOutTelegram,
   registerTelegramUser,
   requestTelegramQr,
   resendTelegramCode,
+  resendTelegramLoginEmail,
+  resetTelegramAuthenticationEmail,
   resetTelegramToPhone,
+  setTelegramLoginEmail,
   submitTelegramCode,
   submitTelegramEmail,
   submitTelegramEmailCode,
+  submitTelegramEmailIdentity,
   submitTelegramPassword,
   submitTelegramPhone,
 } from "../bridge/telegram";
 import { readableError } from "../bridge/shared";
 import { Dialog } from "../Dialog";
-import type { TelegramAuthSnapshot } from "../types";
+import type {
+  TelegramAuthSnapshot,
+  TelegramIdentityProvider,
+  TelegramLoginEmailCodeInfo,
+  TelegramLoginEmailStatus,
+} from "../types";
 import {
   AuthDeliveryOptions,
   deliveryFamily,
@@ -112,6 +124,20 @@ type TelegramConnectModalProps = {
   onChanged: (snapshot: TelegramAuthSnapshot) => void | Promise<void>;
 };
 
+function trustedFragmentUrl(value?: string | null): string | null {
+  if (!value) return null;
+  try {
+    const url = new URL(value);
+    const host = url.hostname.toLowerCase();
+    if (url.protocol !== "https:" || host !== "fragment.com") {
+      return null;
+    }
+    return url.toString();
+  } catch {
+    return null;
+  }
+}
+
 function channelName(kind?: string | null): string {
   return ({
     telegram: "mensaje de Telegram",
@@ -141,15 +167,23 @@ export function TelegramConnectModal({
   const [delivery, setDelivery] = useState<AuthDelivery>("sms");
   const deliveryPicked = useRef(false);
   const [email, setEmail] = useState("");
+  const [identityProvider, setIdentityProvider] = useState<TelegramIdentityProvider | null>(null);
+  const [identityToken, setIdentityToken] = useState("");
   const [code, setCode] = useState("");
+  const [loginEmail, setLoginEmail] = useState("");
+  const [loginEmailInfo, setLoginEmailInfo] = useState<TelegramLoginEmailCodeInfo | null>(null);
+  const [loginEmailStatus, setLoginEmailStatus] = useState<TelegramLoginEmailStatus | null | undefined>(undefined);
+  const [loginEmailCode, setLoginEmailCode] = useState("");
   const [password, setPassword] = useState("");
   const [firstName, setFirstName] = useState("");
   const [lastName, setLastName] = useState("");
   const [deadline, setDeadline] = useState(0);
+  const [emailResetDeadline, setEmailResetDeadline] = useState(0);
   const [now, setNow] = useState(Date.now());
   const request = useRef(0);
   const working = useRef(false);
   const mounted = useRef(true);
+  const previousConnected = useRef<boolean | null>(null);
 
   const apply = (next: TelegramAuthSnapshot) => {
     setSnapshot(next);
@@ -164,13 +198,21 @@ export function TelegramConnectModal({
         );
       }
     }
+    const appliedAt = Date.now();
     setDeadline(
       next.stage === "code"
-        ? Date.now() + Math.max(0, next.timeout ?? 0) * 1000
+        ? appliedAt + Math.max(0, next.timeout ?? 0) * 1000
         : 0,
     );
-    setNow(Date.now());
-    if (next.connected) {
+    setEmailResetDeadline(
+      next.stage === "emailCode" && next.emailReset
+        ? appliedAt + Math.max(0, next.emailReset.seconds) * 1000
+        : 0,
+    );
+    setNow(appliedAt);
+    const wasConnected = previousConnected.current;
+    previousConnected.current = next.connected;
+    if (next.connected && wasConnected === false) {
       void Promise.resolve(onChanged(next)).catch((value) => setError(readableError(value)));
     }
   };
@@ -183,6 +225,18 @@ export function TelegramConnectModal({
       if (mounted.current && id === request.current && !working.current) apply(next);
     } catch (value) {
       if (mounted.current && id === request.current) setError(readableError(value));
+    }
+  };
+
+  const loadLoginEmailStatus = async () => {
+    try {
+      const status = await getTelegramLoginEmailStatus();
+      if (mounted.current) setLoginEmailStatus(status);
+    } catch (value) {
+      if (mounted.current) {
+        setLoginEmailStatus(null);
+        setError(readableError(value));
+      }
     }
   };
 
@@ -204,7 +258,16 @@ export function TelegramConnectModal({
   }, [snapshot?.stage]);
 
   useEffect(() => {
-    if (!deadline) return;
+    if (!snapshot?.connected) {
+      setLoginEmailStatus(undefined);
+      return;
+    }
+    setLoginEmailStatus(undefined);
+    void loadLoginEmailStatus();
+  }, [snapshot?.connected]);
+
+  useEffect(() => {
+    if (!deadline && !emailResetDeadline) return;
     const tick = () => setNow(Date.now());
     const timer = window.setInterval(tick, 250);
     document.addEventListener("visibilitychange", tick);
@@ -212,7 +275,7 @@ export function TelegramConnectModal({
       window.clearInterval(timer);
       document.removeEventListener("visibilitychange", tick);
     };
-  }, [deadline]);
+  }, [deadline, emailResetDeadline]);
 
   const run = async (
     operation: () => Promise<TelegramAuthSnapshot>,
@@ -237,8 +300,61 @@ export function TelegramConnectModal({
     }
   };
 
+  const runLoginEmailInfo = async (
+    operation: () => Promise<TelegramLoginEmailCodeInfo>,
+  ) => {
+    if (working.current) return;
+    working.current = true;
+    ++request.current;
+    setBusy(true);
+    setError(null);
+    try {
+      const info = await operation();
+      if (mounted.current) {
+        setLoginEmailInfo(info);
+        setLoginEmailCode("");
+      }
+    } catch (value) {
+      if (mounted.current) setError(readableError(value));
+    } finally {
+      working.current = false;
+      if (mounted.current) setBusy(false);
+    }
+  };
+
+  const submitIdentity = (provider: TelegramIdentityProvider) => {
+    if (!identityToken.trim()) {
+      setError("Introduce el ID token OAuth emitido para Nuvio.");
+      return;
+    }
+    void run(
+      () => submitTelegramEmailIdentity(provider, identityToken.trim()),
+      () => {
+        setIdentityToken("");
+        setIdentityProvider(null);
+      },
+    );
+  };
+
+  const openFragment = async () => {
+    const url = trustedFragmentUrl(snapshot?.fragmentUrl);
+    if (!url) {
+      setError("Telegram no proporcionó una URL HTTPS válida de Fragment para este intento.");
+      return;
+    }
+    try {
+      await openUrl(url);
+    } catch (value) {
+      setError(readableError(value));
+    }
+  };
+
   const stage = snapshot?.stage;
   const remaining = Math.max(0, Math.ceil((deadline - now) / 1000));
+  const emailResetRemaining = Math.max(
+    0,
+    Math.ceil((emailResetDeadline - now) / 1000),
+  );
   const nextType = snapshot?.nextCodeType;
   const canResend =
     stage === "emailCode"
@@ -321,6 +437,96 @@ export function TelegramConnectModal({
         <div className="auth-success account-connected-panel">
           <strong>{snapshot.accountLabel ?? "Cuenta de Telegram"}</strong>
           <span>{snapshot.isPremium ? "Telegram Premium" : "Cuenta estándar"}</span>
+          <div className="auth-login-email-panel" data-testid="login-email-setup">
+            <strong>Correo para futuros accesos</strong>
+            <span>
+              Telegram puede usar un correo de login para reducir la dependencia de otra sesión.
+              Nuvio solo permite configurarlo cuando TDLib confirma que la cuenta es elegible.
+            </span>
+            {loginEmailStatus === undefined ? (
+              <span>Consultando disponibilidad con Telegram…</span>
+            ) : loginEmailStatus === null ? (
+              <span data-testid="login-email-status-error">
+                No se pudo consultar la disponibilidad del correo de acceso.
+              </span>
+            ) : loginEmailInfo ? (
+              <>
+                <span>
+                  Código enviado a {loginEmailInfo.emailPattern || "tu correo"}
+                  {loginEmailInfo.codeLength > 0 ? ` · ${loginEmailInfo.codeLength} caracteres` : ""}
+                </span>
+                <input
+                  aria-label="Código del correo de login"
+                  inputMode="numeric"
+                  value={loginEmailCode}
+                  onChange={(event) => setLoginEmailCode(event.target.value)}
+                  autoComplete="one-time-code"
+                  maxLength={loginEmailInfo.codeLength > 0 ? loginEmailInfo.codeLength : undefined}
+                />
+                <div className="auth-inline-actions">
+                  <button
+                    type="button"
+                    className="secondary-button"
+                    disabled={busy || !loginEmailCode.trim()}
+                    onClick={() => void run(
+                      () => checkTelegramLoginEmail(loginEmailCode),
+                      () => {
+                        setLoginEmailInfo(null);
+                        setLoginEmailCode("");
+                        setLoginEmail("");
+                        void loadLoginEmailStatus();
+                      },
+                    )}
+                  >
+                    Verificar correo
+                  </button>
+                  <button
+                    type="button"
+                    className="auth-link-button"
+                    disabled={busy}
+                    onClick={() => void runLoginEmailInfo(resendTelegramLoginEmail)}
+                  >
+                    Reenviar código
+                  </button>
+                </div>
+              </>
+            ) : loginEmailStatus.available ? (
+              <>
+                {loginEmailStatus.emailPattern && (
+                  <span data-testid="login-email-current">
+                    Correo actual: {loginEmailStatus.emailPattern}
+                  </span>
+                )}
+                {loginEmailStatus.required && (
+                  <span data-testid="login-email-required">
+                    Telegram solicita configurar un correo de acceso para esta cuenta.
+                  </span>
+                )}
+                <input
+                  aria-label="Correo para futuros accesos"
+                  type="email"
+                  value={loginEmail}
+                  onChange={(event) => setLoginEmail(event.target.value)}
+                  placeholder="correo@ejemplo.com"
+                  autoComplete="email"
+                />
+                <button
+                  type="button"
+                  className="secondary-button"
+                  disabled={busy || !loginEmail.trim()}
+                  onClick={() => void runLoginEmailInfo(
+                    () => setTelegramLoginEmail(loginEmail.trim()),
+                  )}
+                >
+                  {loginEmailStatus.emailPattern ? "Cambiar correo de acceso" : "Configurar correo de acceso"}
+                </button>
+              </>
+            ) : (
+              <span data-testid="login-email-unavailable">
+                Telegram no habilitó la configuración de correo de acceso para esta cuenta.
+              </span>
+            )}
+          </div>
           <div className="account-actions">
             <button
               disabled={busy}
@@ -401,6 +607,13 @@ export function TelegramConnectModal({
                 required
                 autoFocus
               />
+              {snapshot && snapshot.futureAuthTokenCount > 0 && !editingPhone && (
+                <span className="auth-hint" data-testid="future-auth-ready">
+                  Acceso automático preparado con {snapshot.futureAuthTokenCount}
+                  {" "}token{snapshot.futureAuthTokenCount === 1 ? "" : "s"} cifrado{snapshot.futureAuthTokenCount === 1 ? "" : "s"}.
+                  Telegram intentará reutilizarlo antes de pedir otro código.
+                </span>
+              )}
             </>
           )}
 
@@ -421,6 +634,73 @@ export function TelegramConnectModal({
             </>
           )}
 
+          {snapshot
+            && !editingPhone
+            && (stage === "email" || stage === "emailCode")
+            && (snapshot.allowGoogleId || snapshot.allowAppleId)
+            && (
+              <div className="auth-identity-options" data-testid="identity-options">
+                <span className="auth-delivery-label">Identidad vinculada al correo</span>
+                <p className="auth-hint">
+                  Telegram habilitó identidad federada para este paso. Nuvio valida el ID token
+                  directamente con TDLib; el token debe haber sido emitido por Google o Apple para Nuvio.
+                </p>
+                <div className="auth-inline-actions">
+                  {snapshot.allowGoogleId && (
+                    <button
+                      type="button"
+                      className={`secondary-button ${identityProvider === "google" ? "selected" : ""}`}
+                      disabled={busy}
+                      onClick={() => {
+                        setIdentityProvider("google");
+                        setIdentityToken("");
+                        setError(null);
+                      }}
+                    >
+                      Google ID
+                    </button>
+                  )}
+                  {snapshot.allowAppleId && (
+                    <button
+                      type="button"
+                      className={`secondary-button ${identityProvider === "apple" ? "selected" : ""}`}
+                      disabled={busy}
+                      onClick={() => {
+                        setIdentityProvider("apple");
+                        setIdentityToken("");
+                        setError(null);
+                      }}
+                    >
+                      Apple ID
+                    </button>
+                  )}
+                </div>
+                {identityProvider && (
+                  <>
+                    <label htmlFor="telegram-identity-token">
+                      ID token de {identityProvider === "google" ? "Google" : "Apple"}
+                    </label>
+                    <input
+                      id="telegram-identity-token"
+                      type="password"
+                      value={identityToken}
+                      onChange={(event) => setIdentityToken(event.target.value)}
+                      autoComplete="off"
+                      placeholder="Token OAuth emitido para Nuvio"
+                    />
+                    <button
+                      type="button"
+                      className="secondary-button"
+                      disabled={busy || !identityToken.trim()}
+                      onClick={() => submitIdentity(identityProvider)}
+                    >
+                      Continuar con {identityProvider === "google" ? "Google ID" : "Apple ID"}
+                    </button>
+                  </>
+                )}
+              </div>
+            )}
+
           {(stage === "code" || stage === "emailCode") && !editingPhone && (
             <>
               <label htmlFor="telegram-code">
@@ -439,11 +719,65 @@ export function TelegramConnectModal({
                 value={code}
                 onChange={(event) => setCode(event.target.value)}
                 autoComplete="one-time-code"
+                maxLength={
+                  stage === "emailCode"
+                    ? snapshot?.emailCodeLength ?? undefined
+                    : snapshot?.codeLength ?? undefined
+                }
                 required
                 autoFocus
               />
             </>
           )}
+
+          {stage === "code"
+            && snapshot?.codeType === "fragment"
+            && snapshot.fragmentUrl
+            && !editingPhone
+            && (
+              <div className="fragment-auth-panel" data-testid="fragment-auth">
+                <strong>Obtener código en Fragment</strong>
+                <span>
+                  Telegram proporcionó una URL oficial de Fragment para este intento.
+                  Nuvio abrirá esa dirección en tu navegador; vuelve aquí con el código.
+                </span>
+                <button
+                  type="button"
+                  className="secondary-button"
+                  disabled={busy}
+                  onClick={() => void openFragment()}
+                >
+                  Abrir Fragment
+                </button>
+              </div>
+            )}
+
+          {stage === "emailCode"
+            && snapshot?.emailReset
+            && !editingPhone
+            && (
+              <div className="auth-email-reset" data-testid="email-reset">
+                <span className="auth-hint">
+                  {snapshot.emailReset.state === "pending"
+                    ? emailResetRemaining > 0
+                      ? `Restablecimiento de correo solicitado · faltan ${emailResetRemaining}s.`
+                      : "El periodo de espera terminó. Puedes comprobar el restablecimiento."
+                    : emailResetRemaining > 0
+                      ? `Telegram permitirá restablecer este correo en ${emailResetRemaining}s.`
+                      : "Telegram permite restablecer el correo y volver a un método de teléfono."}
+                </span>
+                <button
+                  type="button"
+                  className="secondary-button"
+                  disabled={busy || emailResetRemaining > 0}
+                  onClick={() => void run(resetTelegramAuthenticationEmail)}
+                >
+                  {snapshot.emailReset.state === "pending"
+                    ? "Comprobar restablecimiento"
+                    : "Restablecer correo de autenticación"}
+                </button>
+              </div>
+            )}
 
           {stage === "password" && !editingPhone && (
             <>

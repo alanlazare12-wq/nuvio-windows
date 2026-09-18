@@ -78,7 +78,26 @@ async function setup(viewport = { width: 1280, height: 820 }) {
           return qa.telegramAuthState;
         }
         if (cmd === "telegram_submit_email") {
-          qa.telegramAuthState = { stage: "emailCode", connected: false, message: "Ingresa el código enviado al correo", hint: "Revisa tu correo", isPremium: false };
+          qa.telegramAuthState = { stage: "emailCode", connected: false, message: "Ingresa el código enviado al correo", hint: "Revisa tu correo", isPremium: false, allowGoogleId: false, allowAppleId: false, futureAuthTokenCount: 0 };
+          return qa.telegramAuthState;
+        }
+        if (cmd === "telegram_submit_email_identity") {
+          qa.telegramAuthState = { stage: "password", connected: false, message: "Verificación en dos pasos", hint: "Contraseña adicional", isPremium: false, allowGoogleId: false, allowAppleId: false, futureAuthTokenCount: 0 };
+          return qa.telegramAuthState;
+        }
+        if (cmd === "telegram_reset_authentication_email") {
+          qa.telegramAuthState = { stage: "phone", connected: false, message: "Ingresa el teléfono", isPremium: false, allowGoogleId: false, allowAppleId: false, futureAuthTokenCount: 0 };
+          return qa.telegramAuthState;
+        }
+        if (cmd === "telegram_login_email_status") {
+          return qa.loginEmailStatus ?? { available: false, required: false, emailPattern: null };
+        }
+        if (cmd === "telegram_set_login_email" || cmd === "telegram_resend_login_email") {
+          return { emailPattern: "q***@example.com", codeLength: 6 };
+        }
+        if (cmd === "telegram_check_login_email") {
+          qa.loginEmailStatus = { available: true, required: false, emailPattern: "q***@example.com" };
+          qa.telegramAuthState = { stage: "ready", connected: true, message: "Telegram conectado", accountLabel: "Cuenta QA", isPremium: false, allowGoogleId: false, allowAppleId: false, futureAuthTokenCount: 0 };
           return qa.telegramAuthState;
         }
         if (cmd === "telegram_request_qr") {
@@ -90,6 +109,7 @@ async function setup(viewport = { width: 1280, height: 820 }) {
           return qa.telegramAuthState;
         }
         if (cmd === "plugin:dialog|open") return qa.uploadPaths ?? null;
+        if (cmd === "plugin:opener|open_url") return;
         if (cmd === "plugin:event|listen") return 1;
         if (cmd === "plugin:event|unlisten") return;
         if (cmd === "prepare_zip_uploads") {
@@ -175,7 +195,7 @@ try {
   await test("auth-phone-email-gating-and-qr-return",async page=>{
     await page.evaluate(()=>{window.__qa.telegramAuthState={stage:"phone",connected:false,message:"Teléfono"};});
     await page.locator(".profile-button").click();
-    await expect(page.locator(".auth-delivery-option")).toHaveCount(4);
+    await expect(page.locator(".auth-delivery-option")).toHaveCount(5);
     await expect(page.locator("#telegram-email")).toHaveCount(0);
     await page.getByRole("button",{name:"Vincular con código QR",exact:true}).click();
     await expect(page.locator(".telegram-qr svg")).toBeVisible();
@@ -212,7 +232,7 @@ try {
     });
   }
 
-  for (const [kind, title] of [["sms", "SMS al teléfono"], ["email", "Correo electrónico"], ["call", "Llamada telefónica"], ["telegram", "Mensaje de Telegram"]]) {
+  for (const [kind, title] of [["sms", "SMS al teléfono"], ["email", "Correo electrónico"], ["call", "Llamada telefónica"], ["telegram", "Mensaje de Telegram"], ["fragment", "Fragment"]]) {
     await test(`auth-choice-${kind}-reaches-backend`, async page => {
       await page.evaluate(kind => {
         window.__qa.telegramAuthState = { stage: "phone", connected: false, message: "Ingresa tu teléfono" };
@@ -227,7 +247,7 @@ try {
         };
       }, kind);
       await page.locator(".profile-button").click();
-      await expect(page.locator(".auth-delivery-option")).toHaveCount(4);
+      await expect(page.locator(".auth-delivery-option")).toHaveCount(5);
       await page.getByRole("button", { name: title, exact: true }).click();
       await expect(page.getByRole("button", { name: title, exact: true })).toHaveAttribute("aria-pressed", "true");
       await page.getByLabel("Teléfono con código de país").fill("+525555555555");
@@ -266,7 +286,7 @@ try {
   await test("auth-unavailable-choice-explains-without-sending", async page => {
     await page.evaluate(() => { window.__qa.telegramAuthState = { stage: "code", connected: false, message: "Verificación", codeType: "telegram", nextCodeType: null }; });
     await page.locator(".profile-button").click();
-    for (const title of ["Correo electrónico", "Llamada telefónica", "SMS al teléfono"]) {
+    for (const title of ["Correo electrónico", "Llamada telefónica", "SMS al teléfono", "Fragment"]) {
       await page.getByRole("button", { name: title, exact: true }).click();
       await expect(page.getByRole("button", { name: title, exact: true })).toHaveAttribute("aria-pressed", "true");
       await expect(page.locator(".auth-delivery-explanation")).toContainText(/no habilitó|no ofrece/);
@@ -275,12 +295,184 @@ try {
     await expect(page.getByRole("button", { name: /Solicitar código por/ })).toHaveCount(0);
   });
 
+  await test("auth-fragment-opens-server-url", async page => {
+    await page.evaluate(() => {
+      window.__qa.telegramAuthState = {
+        stage: "code",
+        connected: false,
+        message: "Código mediante Fragment",
+        codeType: "fragment",
+        nextCodeType: null,
+        timeout: 0,
+        fragmentUrl: "https://fragment.com/number/123",
+        codeLength: 5,
+        allowGoogleId: false,
+        allowAppleId: false,
+        futureAuthTokenCount: 0,
+      };
+    });
+    await page.locator(".profile-button").click();
+    await expect(page.getByRole("button", { name: "Fragment", exact: true })).toHaveAttribute("aria-pressed", "true");
+    await expect(page.getByTestId("fragment-auth")).toBeVisible();
+    await expect(page.locator("#telegram-code")).toHaveAttribute("maxlength", "5");
+    await page.getByRole("button", { name: "Abrir Fragment", exact: true }).click();
+    const calls = await page.evaluate(() => window.__qa.calls.filter(c => c.cmd === "plugin:opener|open_url"));
+    assert.equal(calls.length, 1);
+    assert.equal(calls[0].args.url, "https://fragment.com/number/123");
+  });
+
+  await test("auth-fragment-rejects-untrusted-url", async page => {
+    await page.evaluate(() => {
+      window.__qa.telegramAuthState = {
+        stage: "code",
+        connected: false,
+        message: "Código mediante Fragment",
+        codeType: "fragment",
+        nextCodeType: null,
+        timeout: 0,
+        fragmentUrl: "javascript:alert(1)",
+        codeLength: 5,
+        allowGoogleId: false,
+        allowAppleId: false,
+        futureAuthTokenCount: 0,
+      };
+    });
+    await page.locator(".profile-button").click();
+    await page.getByRole("button", { name: "Abrir Fragment", exact: true }).click();
+    await expect(page.getByRole("alert")).toContainText("URL HTTPS válida de Fragment");
+    assert.equal(
+      await page.evaluate(() => window.__qa.calls.filter(c => c.cmd === "plugin:opener|open_url").length),
+      0,
+    );
+  });
+
+  for (const provider of ["google", "apple"]) {
+    await test(`auth-${provider}-identity-token-reaches-tdlib-command`, async page => {
+      await page.evaluate(() => {
+        window.__qa.telegramAuthState = {
+          stage: "emailCode",
+          connected: false,
+          message: "Verifica el correo",
+          hint: "q***@example.com",
+          emailPattern: "q***@example.com",
+          emailCodeLength: 6,
+          allowGoogleId: true,
+          allowAppleId: true,
+          futureAuthTokenCount: 0,
+        };
+      });
+      await page.locator(".profile-button").click();
+      await expect(page.getByTestId("identity-options")).toBeVisible();
+      const label = provider === "google" ? "Google ID" : "Apple ID";
+      await page.getByRole("button", { name: label, exact: true }).click();
+      await page.getByLabel(`ID token de ${provider === "google" ? "Google" : "Apple"}`).fill(`${provider}-qa-token`);
+      await page.getByRole("button", { name: `Continuar con ${label}`, exact: true }).click();
+      await expect(page.getByLabel("Contraseña de verificación en dos pasos")).toBeVisible();
+      const calls = await page.evaluate(() => window.__qa.calls.filter(c => c.cmd === "telegram_submit_email_identity"));
+      assert.deepEqual(calls.map(c => c.args), [{ provider, token: `${provider}-qa-token` }]);
+    });
+  }
+
+  await test("auth-email-reset-returns-to-phone", async page => {
+    await page.evaluate(() => {
+      window.__qa.telegramAuthState = {
+        stage: "emailCode",
+        connected: false,
+        message: "Verifica el correo",
+        emailPattern: "q***@example.com",
+        emailCodeLength: 6,
+        allowGoogleId: false,
+        allowAppleId: false,
+        emailReset: { state: "available", seconds: 0 },
+        futureAuthTokenCount: 0,
+      };
+    });
+    await page.locator(".profile-button").click();
+    await expect(page.getByTestId("email-reset")).toBeVisible();
+    await page.getByRole("button", { name: "Restablecer correo de autenticación", exact: true }).click();
+    await expect(page.getByLabel("Teléfono con código de país")).toBeVisible();
+    assert.equal(await page.evaluate(() => window.__qa.calls.filter(c => c.cmd === "telegram_reset_authentication_email").length), 1);
+  });
+
+  await test("auth-future-token-and-passkey-policy-are-explicit", async page => {
+    await page.evaluate(() => {
+      window.__qa.telegramAuthState = {
+        stage: "phone",
+        connected: false,
+        message: "Ingresa tu teléfono",
+        allowGoogleId: false,
+        allowAppleId: false,
+        futureAuthTokenCount: 2,
+      };
+    });
+    await page.locator(".profile-button").click();
+    await expect(page.getByTestId("future-auth-ready")).toContainText("2 tokens");
+    await expect(page.getByTestId("passkey-unavailable")).toContainText("No disponible en clientes no oficiales");
+    await expect(page.getByTestId("identity-options")).toHaveCount(0);
+  });
+
+  await test("auth-connected-can-configure-login-email", async page => {
+    await page.evaluate(() => {
+      window.__qa.loginEmailStatus = { available: true, required: true, emailPattern: null };
+      window.__qa.telegramAuthState = {
+        stage: "ready",
+        connected: true,
+        message: "Telegram conectado",
+        accountLabel: "Cuenta QA",
+        isPremium: false,
+        allowGoogleId: false,
+        allowAppleId: false,
+        futureAuthTokenCount: 1,
+      };
+    });
+    await page.locator(".profile-button").click();
+    await expect(page.getByTestId("login-email-setup")).toBeVisible();
+    await expect(page.getByTestId("login-email-required")).toContainText("Telegram solicita configurar");
+    await page.getByLabel("Correo para futuros accesos").fill("qa@example.com");
+    await page.getByRole("button", { name: "Configurar correo de acceso", exact: true }).click();
+    await expect(page.getByLabel("Código del correo de login")).toBeVisible();
+    await expect(page.getByLabel("Código del correo de login")).toHaveAttribute("maxlength", "6");
+    await page.getByLabel("Código del correo de login").fill("123456");
+    await page.getByRole("button", { name: "Verificar correo", exact: true }).click();
+    await expect(page.getByTestId("login-email-current")).toContainText("q***@example.com");
+    const commands = await page.evaluate(() => window.__qa.calls
+      .filter(c => ["telegram_set_login_email", "telegram_check_login_email"].includes(c.cmd))
+      .map(c => ({ cmd: c.cmd, args: c.args })));
+    assert.deepEqual(commands, [
+      { cmd: "telegram_set_login_email", args: { email: "qa@example.com" } },
+      { cmd: "telegram_check_login_email", args: { code: "123456" } },
+    ]);
+  });
+
+  await test("auth-connected-does-not-offer-login-email-when-telegram-disables-it", async page => {
+    await page.evaluate(() => {
+      window.__qa.loginEmailStatus = { available: false, required: false, emailPattern: null };
+      window.__qa.telegramAuthState = {
+        stage: "ready",
+        connected: true,
+        message: "Telegram conectado",
+        accountLabel: "Cuenta QA",
+        isPremium: false,
+        allowGoogleId: false,
+        allowAppleId: false,
+        futureAuthTokenCount: 0,
+      };
+    });
+    await page.locator(".profile-button").click();
+    await expect(page.getByTestId("login-email-unavailable")).toContainText("no habilitó");
+    await expect(page.getByLabel("Correo para futuros accesos")).toHaveCount(0);
+    assert.equal(
+      await page.evaluate(() => window.__qa.calls.filter(c => c.cmd === "telegram_set_login_email").length),
+      0,
+    );
+  });
+
   for (const [device, viewport] of [["desktop", { width: 1280, height: 820 }], ["s24", { width: 412, height: 915 }], ["s24-keyboard", { width: 412, height: 500 }], ["s24-landscape", { width: 915, height: 412 }]]) {
     await test(`auth-choice-layout-${device}`, async page => {
       await page.evaluate(() => { window.__qa.telegramAuthState = { stage: "phone", connected: false, message: "Ingresa el teléfono asociado a tu cuenta" }; });
       await page.locator(".profile-button").click();
       const dialog = page.getByRole("dialog");
-      for (const title of ["SMS al teléfono", "Correo electrónico", "Llamada telefónica", "Mensaje de Telegram"]) {
+      for (const title of ["SMS al teléfono", "Correo electrónico", "Llamada telefónica", "Mensaje de Telegram", "Fragment"]) {
         const button = page.getByRole("button", { name: title, exact: true });
         await button.click();
         await expect(button).toHaveAttribute("aria-pressed", "true");

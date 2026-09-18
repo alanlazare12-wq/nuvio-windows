@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::fs;
 use std::future::Future;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicI32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::time::timeout;
@@ -11,6 +11,28 @@ use serde_json::Value;
 use zeroize::Zeroize;
 
 use crate::provider::{ProviderStatus, StorageProvider};
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct TelegramEmailResetSnapshot {
+    pub state: String,
+    pub seconds: i32,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct TelegramLoginEmailCodeInfo {
+    pub email_pattern: String,
+    pub code_length: i32,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct TelegramLoginEmailStatus {
+    pub available: bool,
+    pub required: bool,
+    pub email_pattern: Option<String>,
+}
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -26,6 +48,14 @@ pub struct TelegramAuthSnapshot {
     pub timeout: Option<i32>,
     pub code_type: Option<String>,
     pub next_code_type: Option<String>,
+    pub code_length: Option<i32>,
+    pub fragment_url: Option<String>,
+    pub email_pattern: Option<String>,
+    pub email_code_length: Option<i32>,
+    pub allow_google_id: bool,
+    pub allow_apple_id: bool,
+    pub email_reset: Option<TelegramEmailResetSnapshot>,
+    pub future_auth_token_count: usize,
 }
 
 impl Default for TelegramAuthSnapshot {
@@ -42,8 +72,81 @@ impl Default for TelegramAuthSnapshot {
             timeout: None,
             code_type: None,
             next_code_type: None,
+            code_length: None,
+            fragment_url: None,
+            email_pattern: None,
+            email_code_length: None,
+            allow_google_id: false,
+            allow_apple_id: false,
+            email_reset: None,
+            future_auth_token_count: 0,
         }
     }
+}
+
+fn normalize_future_auth_tokens(tokens: Vec<String>) -> Vec<String> {
+    let mut normalized = Vec::with_capacity(tokens.len().min(20));
+    for token in tokens.into_iter().rev() {
+        let token = token.trim().to_string();
+        if token.is_empty() || token.len() > 4096 || normalized.contains(&token) {
+            continue;
+        }
+        normalized.push(token);
+        if normalized.len() == 20 {
+            break;
+        }
+    }
+    normalized.reverse();
+    normalized
+}
+
+fn load_future_auth_tokens(path: &Path) -> Result<Vec<String>, String> {
+    let Some(bytes) = crate::secrets::load(path)? else {
+        return Ok(Vec::new());
+    };
+    let tokens: Vec<String> = serde_json::from_slice(&bytes)
+        .map_err(|_| "Tokens de autenticación guardados inválidos")?;
+    Ok(normalize_future_auth_tokens(tokens))
+}
+
+fn persist_future_auth_tokens(path: &Path, tokens: &[String]) -> Result<(), String> {
+    if tokens.is_empty() {
+        return crate::secrets::remove(path);
+    }
+    let bytes =
+        zeroize::Zeroizing::new(serde_json::to_vec(tokens).map_err(|error| error.to_string())?);
+    crate::secrets::save(path, &bytes)
+}
+
+fn remember_future_auth_token(
+    tokens: &Arc<Mutex<Vec<String>>>,
+    path: &Path,
+    token: String,
+) -> Result<(), String> {
+    let mut guard = tokens
+        .lock()
+        .map_err(|_| "No se pudo actualizar el acceso automático de Telegram")?;
+    let mut next = guard.clone();
+    next.push(token);
+    next = normalize_future_auth_tokens(next);
+    persist_future_auth_tokens(path, &next)?;
+    *guard = next;
+    Ok(())
+}
+
+fn configured_app_api_credentials() -> Option<(i32, String)> {
+    let api_id = std::env::var("NUVIO_TELEGRAM_API_ID")
+        .ok()
+        .or_else(|| option_env!("NUVIO_TELEGRAM_API_ID").map(str::to_owned))?;
+    let api_hash = std::env::var("NUVIO_TELEGRAM_API_HASH")
+        .ok()
+        .or_else(|| option_env!("NUVIO_TELEGRAM_API_HASH").map(str::to_owned))?;
+    let id = api_id.trim().parse::<i32>().ok()?;
+    let hash = api_hash.trim();
+    if id <= 0 || hash.len() != 32 || !hash.bytes().all(|c| c.is_ascii_hexdigit()) {
+        return None;
+    }
+    Some((id, hash.to_string()))
 }
 
 pub struct TelegramService {
@@ -57,11 +160,37 @@ pub struct TelegramService {
     pub(crate) sent: Arc<Mutex<HashMap<i64, Result<tdlib_rs::types::Message, String>>>>,
     credentials_path: PathBuf,
     saved_api: Mutex<Option<(i32, String)>>,
+    future_tokens_path: PathBuf,
+    future_auth_tokens: Arc<Mutex<Vec<String>>>,
+    accept_future_auth_tokens: Arc<AtomicBool>,
 }
 
 impl TelegramService {
     pub(crate) fn client_id(&self) -> i32 {
         self.client_id_atomic.load(Ordering::SeqCst)
+    }
+
+    fn set_future_auth_persistence(&self, enabled: bool) -> Result<(), String> {
+        self.accept_future_auth_tokens
+            .store(enabled, Ordering::SeqCst);
+        if enabled {
+            return Ok(());
+        }
+        self.future_auth_tokens
+            .lock()
+            .map_err(|_| "No se pudo limpiar el acceso automático de Telegram")?
+            .clear();
+        crate::secrets::remove(&self.future_tokens_path)
+    }
+
+    fn future_auth_tokens_for_login(&self) -> Vec<String> {
+        if !self.accept_future_auth_tokens.load(Ordering::SeqCst) {
+            return Vec::new();
+        }
+        self.future_auth_tokens
+            .lock()
+            .map(|tokens| tokens.clone())
+            .unwrap_or_default()
     }
     pub fn new(app_data_dir: &Path) -> Result<Self, String> {
         let root = app_data_dir.join("telegram");
@@ -70,12 +199,19 @@ impl TelegramService {
         fs::create_dir_all(&database_directory).map_err(|error| error.to_string())?;
         fs::create_dir_all(&files_directory).map_err(|error| error.to_string())?;
         let database_key = load_or_create_database_key(&root)?;
+        let future_tokens_path = root.join("future-auth-tokens.dpapi");
+        let future_auth_tokens =
+            Arc::new(Mutex::new(load_future_auth_tokens(&future_tokens_path)?));
+        let accept_future_auth_tokens = Arc::new(AtomicBool::new(false));
 
         let client_id_atomic = Arc::new(AtomicI32::new(tdlib_rs::create_client()));
         let cached = Arc::new(Mutex::new(TelegramAuthSnapshot::default()));
         let sent = Arc::new(Mutex::new(HashMap::new()));
         let auth_updates = cached.clone();
         let send_updates = sent.clone();
+        let future_tokens_updates = future_auth_tokens.clone();
+        let future_tokens_path_updates = future_tokens_path.clone();
+        let accept_future_tokens_updates = accept_future_auth_tokens.clone();
         let client_id_recv = client_id_atomic.clone();
         std::thread::Builder::new()
             .name("telegram-receive".into())
@@ -88,11 +224,37 @@ impl TelegramService {
                         tdlib_rs::enums::Update::AuthorizationState(v) => {
                             let value =
                                 serde_json::to_value(&v.authorization_state).unwrap_or_default();
-                            let snapshot = snapshot_from_state(
+                            let mut snapshot = snapshot_from_state(
                                 &value,
                                 &format!("{:?}", v.authorization_state),
                             );
+                            snapshot.future_auth_token_count = future_tokens_updates
+                                .lock()
+                                .expect("future auth tokens")
+                                .len();
                             *auth_updates.lock().expect("auth mutex") = snapshot;
+                        }
+                        tdlib_rs::enums::Update::Option(v)
+                            if v.name == "authentication_token"
+                                && accept_future_tokens_updates.load(Ordering::SeqCst) =>
+                        {
+                            if let tdlib_rs::enums::OptionValue::String(value) = v.value {
+                                if remember_future_auth_token(
+                                    &future_tokens_updates,
+                                    &future_tokens_path_updates,
+                                    value.value,
+                                )
+                                .is_ok()
+                                {
+                                    auth_updates
+                                        .lock()
+                                        .expect("auth mutex")
+                                        .future_auth_token_count = future_tokens_updates
+                                        .lock()
+                                        .expect("future auth tokens")
+                                        .len();
+                                }
+                            }
                         }
                         tdlib_rs::enums::Update::MessageSendSucceeded(v) => {
                             send_updates
@@ -122,10 +284,14 @@ impl TelegramService {
             sent,
             credentials_path: root.join("api-credentials.dpapi"),
             saved_api: Mutex::new(None),
+            future_tokens_path,
+            future_auth_tokens,
+            accept_future_auth_tokens,
         })
     }
 
     pub async fn initialize(&self, remember_session: bool) -> Result<TelegramAuthSnapshot, String> {
+        self.set_future_auth_persistence(remember_session)?;
         if !remember_session {
             crate::secrets::remove(&self.credentials_path)?;
         }
@@ -135,12 +301,18 @@ impl TelegramService {
         ))
         .await?;
         let state = self.refresh().await?;
-        if remember_session && state.stage == "needsCredentials" {
-            if let Some(bytes) = crate::secrets::load(&self.credentials_path)? {
-                let (id, hash): (i32, String) = serde_json::from_slice(&bytes)
-                    .map_err(|_| "Credenciales guardadas inválidas")?;
+        if state.stage == "needsCredentials" {
+            if remember_session {
+                if let Some(bytes) = crate::secrets::load(&self.credentials_path)? {
+                    let (id, hash): (i32, String) = serde_json::from_slice(&bytes)
+                        .map_err(|_| "Credenciales guardadas inválidas")?;
+                    *self.saved_api.lock().unwrap() = Some((id, hash.clone()));
+                    return self.configure(id, hash, true).await;
+                }
+            }
+            if let Some((id, hash)) = configured_app_api_credentials() {
                 *self.saved_api.lock().unwrap() = Some((id, hash.clone()));
-                return self.configure(id, hash, true).await;
+                return self.configure(id, hash, remember_session).await;
             }
         }
         Ok(state)
@@ -161,6 +333,11 @@ impl TelegramService {
         let value = serde_json::to_value(&state).map_err(|error| error.to_string())?;
         let debug = format!("{state:?}");
         let mut snapshot = snapshot_from_state(&value, &debug);
+        snapshot.future_auth_token_count = self
+            .future_auth_tokens
+            .lock()
+            .map(|tokens| tokens.len())
+            .unwrap_or_default();
 
         if snapshot.connected {
             if let Ok(tdlib_rs::enums::User::User(me)) =
@@ -194,6 +371,7 @@ impl TelegramService {
         {
             return Err("API ID o API Hash inválidos".to_string());
         }
+        self.set_future_auth_persistence(remember_session)?;
 
         let result = call(tdlib_rs::functions::set_tdlib_parameters(
             false,
@@ -285,7 +463,7 @@ impl TelegramService {
         mut phone: String,
         delivery: &str,
     ) -> Result<TelegramAuthSnapshot, String> {
-        let settings = phone_delivery_settings(delivery)?;
+        let settings = phone_delivery_settings(delivery, self.future_auth_tokens_for_login())?;
         let normalized: String = phone.chars().filter(|c| !c.is_whitespace()).collect();
         if !normalized.starts_with('+')
             || !(8..=16).contains(&normalized.len())
@@ -338,6 +516,170 @@ impl TelegramService {
             tdlib_rs::types::EmailAddressAuthenticationCode { code: value },
         );
         let result = call(tdlib_rs::functions::check_authentication_email_code(
+            authentication,
+            self.client_id(),
+        ))
+        .await;
+        code.zeroize();
+        result?;
+        self.refresh().await
+    }
+
+    pub async fn submit_email_identity(
+        &self,
+        provider: &str,
+        mut token: String,
+    ) -> Result<TelegramAuthSnapshot, String> {
+        let state = self.refresh().await?;
+        if state.stage != "email" && state.stage != "emailCode" {
+            token.zeroize();
+            return Err("Telegram no está esperando autenticación por correo.".into());
+        }
+
+        let value = token.trim().to_string();
+        if value.is_empty() {
+            token.zeroize();
+            return Err("El token de identidad no puede estar vacío.".into());
+        }
+
+        let authentication = match provider {
+            "google" if state.allow_google_id => {
+                tdlib_rs::enums::EmailAddressAuthentication::GoogleId(
+                    tdlib_rs::types::EmailAddressAuthenticationGoogleId { token: value },
+                )
+            }
+            "apple" if state.allow_apple_id => {
+                tdlib_rs::enums::EmailAddressAuthentication::AppleId(
+                    tdlib_rs::types::EmailAddressAuthenticationAppleId { token: value },
+                )
+            }
+            "google" => {
+                token.zeroize();
+                return Err("Telegram no habilitó Google ID para este intento.".into());
+            }
+            "apple" => {
+                token.zeroize();
+                return Err("Telegram no habilitó Apple ID para este intento.".into());
+            }
+            _ => {
+                token.zeroize();
+                return Err("Proveedor de identidad no compatible.".into());
+            }
+        };
+
+        let result = call(tdlib_rs::functions::check_authentication_email_code(
+            authentication,
+            self.client_id(),
+        ))
+        .await;
+        token.zeroize();
+        result?;
+        self.refresh().await
+    }
+
+    pub async fn reset_authentication_email(&self) -> Result<TelegramAuthSnapshot, String> {
+        let state = self.refresh().await?;
+        if state.stage != "emailCode" || state.email_reset.is_none() {
+            return Err("Telegram no permite restablecer el correo en este momento.".into());
+        }
+        call(tdlib_rs::functions::reset_authentication_email_address(
+            self.client_id(),
+        ))
+        .await?;
+        self.refresh().await
+    }
+
+    pub async fn login_email_status(&self) -> Result<TelegramLoginEmailStatus, String> {
+        if !self.refresh().await?.connected {
+            return Err("Conecta Telegram antes de consultar el correo de acceso.".into());
+        }
+        let password_state =
+            call(tdlib_rs::functions::get_password_state(self.client_id())).await?;
+        let email_pattern = match password_state {
+            tdlib_rs::enums::PasswordState::PasswordState(state) => {
+                let pattern = state.login_email_address_pattern.trim().to_string();
+                (!pattern.is_empty()).then_some(pattern)
+            }
+        };
+        let required = if email_pattern.is_none() {
+            call(tdlib_rs::functions::is_login_email_address_required(
+                self.client_id(),
+            ))
+            .await
+            .is_ok()
+        } else {
+            false
+        };
+        Ok(TelegramLoginEmailStatus {
+            available: email_pattern.is_some() || required,
+            required,
+            email_pattern,
+        })
+    }
+
+    pub async fn set_login_email(
+        &self,
+        mut email: String,
+    ) -> Result<TelegramLoginEmailCodeInfo, String> {
+        let status = self.login_email_status().await?;
+        if !status.available {
+            email.zeroize();
+            return Err(
+                "Telegram no habilitó la configuración de correo de acceso para esta cuenta."
+                    .into(),
+            );
+        }
+        let value = email.trim().to_string();
+        if !value.contains('@') || value.starts_with('@') || value.ends_with('@') {
+            email.zeroize();
+            return Err("Ingresa un correo válido.".into());
+        }
+        let info = call(tdlib_rs::functions::set_login_email_address(
+            value,
+            self.client_id(),
+        ))
+        .await?;
+        email.zeroize();
+        let value = serde_json::to_value(info).map_err(|error| error.to_string())?;
+        Ok(TelegramLoginEmailCodeInfo {
+            email_pattern: find_string(&value, &["email_address_pattern", "emailAddressPattern"])
+                .unwrap_or_default(),
+            code_length: find_field(&value, "length")
+                .and_then(Value::as_i64)
+                .unwrap_or(0)
+                .clamp(0, i32::MAX as i64) as i32,
+        })
+    }
+
+    pub async fn resend_login_email(&self) -> Result<TelegramLoginEmailCodeInfo, String> {
+        let info = call(tdlib_rs::functions::resend_login_email_address_code(
+            self.client_id(),
+        ))
+        .await?;
+        let value = serde_json::to_value(info).map_err(|error| error.to_string())?;
+        Ok(TelegramLoginEmailCodeInfo {
+            email_pattern: find_string(&value, &["email_address_pattern", "emailAddressPattern"])
+                .unwrap_or_default(),
+            code_length: find_field(&value, "length")
+                .and_then(Value::as_i64)
+                .unwrap_or(0)
+                .clamp(0, i32::MAX as i64) as i32,
+        })
+    }
+
+    pub async fn check_login_email(
+        &self,
+        mut code: String,
+    ) -> Result<TelegramAuthSnapshot, String> {
+        let value = code.trim().to_string();
+        if value.is_empty() {
+            code.zeroize();
+            return Err("Introduce el código enviado al correo.".into());
+        }
+        let authentication = tdlib_rs::enums::EmailAddressAuthentication::Code(
+            tdlib_rs::types::EmailAddressAuthenticationCode { code: value },
+        );
+        let result = call(tdlib_rs::functions::check_login_email_address_code(
             authentication,
             self.client_id(),
         ))
@@ -440,9 +782,22 @@ impl TelegramService {
 
     pub async fn log_out(&self) -> Result<TelegramAuthSnapshot, String> {
         call(tdlib_rs::functions::log_out(self.client_id())).await?;
+        let deadline = std::time::Instant::now() + Duration::from_secs(12);
+        while std::time::Instant::now() < deadline {
+            let snapshot = self.cached_snapshot();
+            if snapshot.stage == "closed" {
+                return Ok(snapshot);
+            }
+            tokio::time::sleep(Duration::from_millis(150)).await;
+        }
         let snapshot = TelegramAuthSnapshot {
             stage: "closed".to_string(),
             message: "Sesión cerrada".to_string(),
+            future_auth_token_count: self
+                .future_auth_tokens
+                .lock()
+                .map(|tokens| tokens.len())
+                .unwrap_or_default(),
             ..TelegramAuthSnapshot::default()
         };
         *self.cached.lock().expect("telegram auth mutex poisoned") = snapshot.clone();
@@ -450,6 +805,7 @@ impl TelegramService {
     }
 
     pub async fn forget_session(&self) -> Result<TelegramAuthSnapshot, String> {
+        self.set_future_auth_persistence(false)?;
         crate::secrets::remove(&self.credentials_path)?;
         let _ = call(tdlib_rs::functions::log_out(self.client_id())).await;
         let deadline = std::time::Instant::now() + Duration::from_secs(12);
@@ -522,12 +878,65 @@ fn snapshot_from_state(value: &Value, debug: &str) -> TelegramAuthSnapshot {
     {
         snapshot.stage = "email".to_string();
         snapshot.message = "Telegram solicita un correo de autenticación".to_string();
+        snapshot.allow_apple_id = find_field(value, "allow_apple_id")
+            .or_else(|| find_field(value, "allowAppleId"))
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        snapshot.allow_google_id = find_field(value, "allow_google_id")
+            .or_else(|| find_field(value, "allowGoogleId"))
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
     } else if state_text.contains("waitemailcode")
         || state_text.contains("authorizationstatewaitemailcode")
     {
         snapshot.stage = "emailCode".to_string();
         snapshot.message = "Ingresa el código enviado al correo".to_string();
-        snapshot.hint = find_string(value, &["email_address_pattern"]);
+        snapshot.allow_apple_id = find_field(value, "allow_apple_id")
+            .or_else(|| find_field(value, "allowAppleId"))
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        snapshot.allow_google_id = find_field(value, "allow_google_id")
+            .or_else(|| find_field(value, "allowGoogleId"))
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        snapshot.email_pattern =
+            find_string(value, &["email_address_pattern", "emailAddressPattern"]);
+        snapshot.hint = snapshot.email_pattern.clone();
+        snapshot.email_code_length = find_field(value, "code_info")
+            .or_else(|| find_field(value, "codeInfo"))
+            .and_then(|info| find_field(info, "length"))
+            .and_then(Value::as_i64)
+            .map(|value| value.clamp(0, i32::MAX as i64) as i32);
+        if let Some(reset) = find_field(value, "email_address_reset_state")
+            .or_else(|| find_field(value, "emailAddressResetState"))
+        {
+            let kind = reset
+                .get("@type")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_ascii_lowercase();
+            if kind.contains("available") {
+                let seconds = find_field(reset, "wait_period")
+                    .or_else(|| find_field(reset, "waitPeriod"))
+                    .and_then(Value::as_i64)
+                    .unwrap_or(0)
+                    .clamp(0, i32::MAX as i64) as i32;
+                snapshot.email_reset = Some(TelegramEmailResetSnapshot {
+                    state: "available".into(),
+                    seconds,
+                });
+            } else if kind.contains("pending") {
+                let seconds = find_field(reset, "reset_in")
+                    .or_else(|| find_field(reset, "resetIn"))
+                    .and_then(Value::as_i64)
+                    .unwrap_or(0)
+                    .clamp(0, i32::MAX as i64) as i32;
+                snapshot.email_reset = Some(TelegramEmailResetSnapshot {
+                    state: "pending".into(),
+                    seconds,
+                });
+            }
+        }
     } else if state_text.contains("waitcode") || state_text.contains("authorizationstatewaitcode") {
         snapshot.stage = "code".to_string();
         snapshot.message = "Ingresa el código de verificación".to_string();
@@ -594,6 +1003,13 @@ fn find_string(value: &Value, keys: &[&str]) -> Option<String> {
         Value::Array(values) => values.iter().find_map(|child| find_string(child, keys)),
         _ => None,
     }
+}
+
+fn is_trusted_fragment_url(url: &str) -> bool {
+    let Some(rest) = url.strip_prefix("https://fragment.com") else {
+        return false;
+    };
+    rest.is_empty() || rest.starts_with('/') || rest.starts_with('?') || rest.starts_with('#')
 }
 
 fn load_or_create_database_key(root: &Path) -> Result<String, String> {
@@ -787,8 +1203,18 @@ fn apply_code_metadata(snapshot: &mut TelegramAuthSnapshot, value: &Value) {
         .get("timeout")
         .and_then(Value::as_i64)
         .map(|v| v.clamp(0, i32::MAX as i64) as i32);
-    let current = info.get("type").and_then(code_channel);
+    let current_details = info.get("type");
+    let current = current_details.and_then(code_channel);
     snapshot.code_type = current.map(str::to_owned);
+    snapshot.code_length = current_details
+        .and_then(|details| find_field(details, "length"))
+        .and_then(Value::as_i64)
+        .map(|value| value.clamp(0, i32::MAX as i64) as i32);
+    if current == Some("fragment") {
+        snapshot.fragment_url = current_details
+            .and_then(|details| find_string(details, &["url"]))
+            .filter(|url| is_trusted_fragment_url(url));
+    }
     snapshot.next_code_type = info
         .get("next_type")
         .or_else(|| info.get("nextType"))
@@ -877,7 +1303,72 @@ mod auth_channel_regressions {
         let snapshot = snapshot_from_state(&value, "WaitEmailCode");
         assert_eq!(snapshot.stage, "emailCode");
         assert_eq!(snapshot.hint.as_deref(), Some("a***@example.com"));
+        assert_eq!(snapshot.email_code_length, Some(6));
         assert_eq!(snapshot.code_type, None);
+    }
+
+    #[test]
+    fn email_identity_and_reset_metadata_are_preserved() {
+        let value = serde_json::json!({
+            "@type":"authorizationStateWaitEmailCode",
+            "allow_apple_id": true,
+            "allow_google_id": true,
+            "code_info":{"email_address_pattern":"a***@example.com","length":8},
+            "email_address_reset_state":{
+                "@type":"emailAddressResetStateAvailable",
+                "wait_period":45
+            }
+        });
+        let snapshot = snapshot_from_state(&value, "WaitEmailCode");
+        assert!(snapshot.allow_apple_id);
+        assert!(snapshot.allow_google_id);
+        assert_eq!(snapshot.email_pattern.as_deref(), Some("a***@example.com"));
+        assert_eq!(snapshot.email_code_length, Some(8));
+        assert_eq!(
+            snapshot.email_reset,
+            Some(TelegramEmailResetSnapshot {
+                state: "available".into(),
+                seconds: 45,
+            })
+        );
+    }
+
+    #[test]
+    fn fragment_metadata_keeps_only_official_https_url() {
+        let trusted = serde_json::json!({"@type":"authorizationStateWaitCode", "code_info": {
+            "type":{"@type":"authenticationCodeTypeFragment","url":"https://fragment.com/number/123","length":5},
+            "next_type":null,"timeout":0
+        }});
+        let snapshot = snapshot_from_state(&trusted, "WaitCode");
+        assert_eq!(snapshot.code_type.as_deref(), Some("fragment"));
+        assert_eq!(snapshot.code_length, Some(5));
+        assert_eq!(
+            snapshot.fragment_url.as_deref(),
+            Some("https://fragment.com/number/123")
+        );
+
+        let untrusted = serde_json::json!({"@type":"authorizationStateWaitCode", "code_info": {
+            "type":{"@type":"authenticationCodeTypeFragment","url":"https://fragment.com.evil.test/phish","length":5},
+            "next_type":null,"timeout":0
+        }});
+        assert_eq!(
+            snapshot_from_state(&untrusted, "WaitCode").fragment_url,
+            None
+        );
+        assert!(is_trusted_fragment_url("https://fragment.com"));
+        assert!(is_trusted_fragment_url("https://fragment.com/?test=1"));
+        assert!(!is_trusted_fragment_url("http://fragment.com/number/123"));
+    }
+
+    #[test]
+    fn future_auth_tokens_are_deduplicated_bounded_and_keep_newest() {
+        let mut tokens: Vec<String> = (0..25).map(|index| format!("token-{index}")).collect();
+        tokens.push("token-24".into());
+        tokens.push("   ".into());
+        let normalized = normalize_future_auth_tokens(tokens);
+        assert_eq!(normalized.len(), 20);
+        assert_eq!(normalized.first().map(String::as_str), Some("token-5"));
+        assert_eq!(normalized.last().map(String::as_str), Some("token-24"));
     }
 }
 
@@ -891,20 +1382,20 @@ fn delivery_family(kind: &str) -> &str {
 
 fn phone_delivery_settings(
     delivery: &str,
+    authentication_tokens: Vec<String>,
 ) -> Result<Option<tdlib_rs::types::PhoneNumberAuthenticationSettings>, String> {
-    match delivery {
-        "telegram" | "sms" | "email" => Ok(None),
-        "call" => Ok(Some(tdlib_rs::types::PhoneNumberAuthenticationSettings {
-            allow_flash_call: false,
-            allow_missed_call: true,
-            is_current_phone_number: false,
-            has_unknown_phone_number: false,
-            allow_sms_retriever_api: false,
-            firebase_authentication_settings: None,
-            authentication_tokens: Vec::new(),
-        })),
-        _ => Err("Elige SMS, correo electrónico, llamada o Telegram.".into()),
+    if !matches!(delivery, "telegram" | "sms" | "email" | "call" | "fragment") {
+        return Err("Elige SMS, correo electrónico, llamada, Fragment o Telegram.".into());
     }
+    Ok(Some(tdlib_rs::types::PhoneNumberAuthenticationSettings {
+        allow_flash_call: false,
+        allow_missed_call: delivery == "call",
+        is_current_phone_number: false,
+        has_unknown_phone_number: false,
+        allow_sms_retriever_api: false,
+        firebase_authentication_settings: None,
+        authentication_tokens,
+    }))
 }
 
 fn validate_requested_delivery(
@@ -933,18 +1424,26 @@ mod delivery_choice_tests {
     use super::*;
     #[test]
     fn call_choice_enables_supported_manual_missed_call_verification() {
-        let settings = phone_delivery_settings("call").unwrap().unwrap();
+        let settings = phone_delivery_settings("call", vec!["future-token".into()])
+            .unwrap()
+            .unwrap();
         assert!(settings.allow_missed_call);
         assert!(!settings.allow_sms_retriever_api);
         assert!(!settings.allow_flash_call);
         assert!(settings.firebase_authentication_settings.is_none());
+        assert_eq!(settings.authentication_tokens, vec!["future-token"]);
     }
     #[test]
-    fn other_choices_do_not_claim_to_force_a_server_channel() {
-        for kind in ["sms", "email", "telegram"] {
-            assert!(phone_delivery_settings(kind).unwrap().is_none());
+    fn other_choices_keep_server_control_and_preserve_future_tokens() {
+        for kind in ["sms", "email", "telegram", "fragment"] {
+            let settings = phone_delivery_settings(kind, vec!["future-token".into()])
+                .unwrap()
+                .unwrap();
+            assert!(!settings.allow_missed_call);
+            assert!(!settings.allow_flash_call);
+            assert_eq!(settings.authentication_tokens, vec!["future-token"]);
         }
-        assert!(phone_delivery_settings("unknown").is_err());
+        assert!(phone_delivery_settings("unknown", Vec::new()).is_err());
     }
     #[test]
     fn explicit_resend_cannot_silently_use_a_different_channel() {
