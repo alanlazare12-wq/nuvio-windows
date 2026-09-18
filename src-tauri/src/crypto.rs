@@ -74,7 +74,7 @@ pub fn encrypt_file(input: &Path, output: &Path, passphrase: &str) -> Result<(),
         let aad = chunk_aad(chunk_index, true);
         let encrypted = cipher
             .encrypt(
-                XNonce::from_slice(&nonce_bytes),
+                &XNonce::from(nonce_bytes),
                 Payload {
                     msg: &buffer[..read],
                     aad: &aad,
@@ -158,7 +158,7 @@ pub fn decrypt_file(input: &Path, output: &Path, passphrase: &str) -> Result<(),
         let plain = Zeroizing::new(
             cipher
                 .decrypt(
-                    XNonce::from_slice(&nonce_bytes),
+                    &XNonce::from(nonce_bytes),
                     Payload {
                         msg: &encrypted,
                         aad: &aad,
@@ -295,7 +295,7 @@ mod tests {
         let payload = b"legacy contents";
         let ciphertext = cipher
             .encrypt(
-                XNonce::from_slice(&chunk_nonce(nonce, 0)),
+                &XNonce::from(chunk_nonce(nonce, 0)),
                 Payload {
                     msg: payload,
                     aad: &0_u64.to_le_bytes(),

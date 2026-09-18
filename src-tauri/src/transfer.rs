@@ -33,16 +33,28 @@ impl TransferService {
         passphrase: Option<String>,
         staging_dir: &Path,
     ) -> Result<PreparedUpload, String> {
-        Self::prepare_upload_in_folder(repository, path, encrypt, passphrase, staging_dir, None)
+        Self::prepare_upload_in_folder(
+            repository,
+            path,
+            Some(path),
+            encrypt,
+            passphrase,
+            staging_dir,
+            None,
+            false,
+        )
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn prepare_upload_in_folder(
         repository: &CatalogRepository,
         path: &str,
+        original_source_path: Option<&str>,
         encrypt: bool,
         passphrase: Option<String>,
         staging_dir: &Path,
         folder_id: Option<&str>,
+        delete_source_after_upload: bool,
     ) -> Result<PreparedUpload, String> {
         let source_path = normalize_path(path)?;
         let metadata = fs::metadata(&source_path).map_err(|error| error.to_string())?;
@@ -66,8 +78,10 @@ impl TransferService {
                 &transfer_id,
                 &file_name,
                 &source_path.to_string_lossy(),
+                original_source_path,
                 size_bytes,
                 folder_id,
+                delete_source_after_upload,
             )
             .map_err(|error| error.to_string())?;
 
@@ -81,6 +95,125 @@ impl TransferService {
             passphrase,
             staging_dir,
         )
+    }
+
+    pub fn adopt_generated_upload_in_folder(
+        repository: &CatalogRepository,
+        path: &str,
+        staging_dir: &Path,
+        folder_id: Option<&str>,
+    ) -> Result<PreparedUpload, String> {
+        let source_path = normalize_path(path)?;
+        let metadata = fs::metadata(&source_path).map_err(|error| error.to_string())?;
+        if !metadata.is_file() {
+            return Err("La selección generada no es un archivo".to_string());
+        }
+        let size_bytes = i64::try_from(metadata.len())
+            .map_err(|_| "El archivo es demasiado grande para indexarlo".to_string())?;
+        if size_bytes <= 0 {
+            return Err("Telegram no permite subir archivos vacíos".to_string());
+        }
+
+        let file_name = source_path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .ok_or_else(|| "No se pudo determinar el nombre del archivo".to_string())?
+            .to_string();
+        let transfer_id = new_transfer_id();
+        let directory = staging_dir.join(&transfer_id);
+        fs::create_dir_all(&directory).map_err(|error| error.to_string())?;
+        let snapshot = directory.join(&file_name);
+
+        fs::rename(&source_path, &snapshot).map_err(|error| {
+            let _ = fs::remove_dir(&directory);
+            format!("No se pudo adoptar el ZIP generado en la caché privada: {error}")
+        })?;
+
+        if let Err(error) = repository.create_upload_placeholder_in_folder(
+            &transfer_id,
+            &file_name,
+            &snapshot.to_string_lossy(),
+            None,
+            size_bytes,
+            folder_id,
+            false,
+        ) {
+            let _ = fs::rename(&snapshot, &source_path);
+            let _ = fs::remove_dir(&directory);
+            return Err(error.to_string());
+        }
+
+        if let Err(error) = repository.update_runtime(
+            &transfer_id,
+            "analyzing",
+            "analyzing",
+            0,
+            size_bytes,
+            0,
+            None,
+            "Verificando ZIP generado",
+            None,
+        ) {
+            let error = error.to_string();
+            mark_preparation_failure(
+                repository,
+                &transfer_id,
+                size_bytes,
+                "Error al preparar ZIP generado",
+                &error,
+            );
+            return Err(error);
+        }
+
+        let sha256 = match hash_with_progress(repository, &transfer_id, &snapshot, size_bytes) {
+            Ok(hash) => hash,
+            Err(error) => {
+                mark_preparation_failure(
+                    repository,
+                    &transfer_id,
+                    size_bytes,
+                    "Error al verificar ZIP generado",
+                    &error,
+                );
+                return Err(error);
+            }
+        };
+
+        let duplicate = match repository.finish_preparation(
+            &transfer_id,
+            &snapshot.to_string_lossy(),
+            &sha256,
+            size_bytes,
+            false,
+        ) {
+            Ok(value) => value,
+            Err(error) => {
+                let error = error.to_string();
+                mark_preparation_failure(
+                    repository,
+                    &transfer_id,
+                    size_bytes,
+                    "Error al registrar ZIP generado",
+                    &error,
+                );
+                return Err(error);
+            }
+        };
+
+        if duplicate {
+            let _ = fs::remove_file(&snapshot);
+        }
+
+        Ok(PreparedUpload {
+            transfer_id,
+            file_name,
+            local_path: snapshot.to_string_lossy().into_owned(),
+            size_bytes,
+            sha256,
+            duplicate,
+            encrypted: false,
+            status: if duplicate { "duplicate" } else { "ready" }.to_string(),
+        })
     }
 
     pub fn resume_preparation(
@@ -151,14 +284,21 @@ impl TransferService {
                 let directory = staging_dir.join(&transfer_id);
                 fs::create_dir_all(&directory).map_err(|e| e.to_string())?;
                 let snapshot = directory.join(&file_name);
-                let sha256 = copy_with_progress(
-                    repository,
-                    &transfer_id,
-                    &source_path,
-                    &snapshot,
-                    size_bytes,
-                    "",
-                )?;
+                let sha256 = if source_path == snapshot {
+                    // Generated archives can already live in their final private
+                    // staging location. Re-hash them in place instead of copying
+                    // the file over itself (also makes paused adoption resumable).
+                    hash_with_progress(repository, &transfer_id, &source_path, size_bytes)?
+                } else {
+                    copy_with_progress(
+                        repository,
+                        &transfer_id,
+                        &source_path,
+                        &snapshot,
+                        size_bytes,
+                        "",
+                    )?
+                };
                 let duplicate = repository
                     .finish_preparation(
                         &transfer_id,
@@ -617,6 +757,37 @@ mod tests {
         assert!(duplicate.duplicate);
         assert_eq!(duplicate.status, "duplicate");
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn generated_archive_is_adopted_without_second_copy() {
+        let root = tempfile::tempdir().unwrap();
+        let staging = root.path().join("staging");
+        let generated_dir = staging.join("zip-source");
+        fs::create_dir_all(&generated_dir).unwrap();
+        let generated = generated_dir.join("Nuvio-respaldo-parte-001-de-002.zip");
+        let content = vec![9_u8; 512 * 1024];
+        fs::write(&generated, &content).unwrap();
+
+        let repository = CatalogRepository::open(&root.path().join("catalog.db")).unwrap();
+        let prepared = TransferService::adopt_generated_upload_in_folder(
+            &repository,
+            generated.to_str().unwrap(),
+            &staging,
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(prepared.status, "ready");
+        assert!(!generated.exists());
+        let adopted = PathBuf::from(&prepared.local_path);
+        assert!(adopted.exists());
+        assert!(adopted.starts_with(&staging));
+        assert_eq!(fs::read(&adopted).unwrap(), content);
+        assert_eq!(
+            prepared.sha256,
+            crate::crypto::sha256_file(&adopted).unwrap()
+        );
     }
 
     #[test]

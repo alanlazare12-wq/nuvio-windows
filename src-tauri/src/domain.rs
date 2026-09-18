@@ -52,6 +52,9 @@ pub struct TransferJob {
     pub can_pause: bool,
     pub can_retry: bool,
     pub can_cancel: bool,
+    pub source_delete_available: bool,
+    pub source_deleted: bool,
+    pub source_delete_error: Option<String>,
     pub started_at: Option<i64>,
     pub updated_at: i64,
 }
@@ -81,6 +84,7 @@ pub struct AppSettings {
     pub cache_limit_bytes: i64,
     pub remember_session: bool,
     pub conflict_policy: String,
+    pub delete_original_after_upload: bool,
     pub speed_limit_bps: Option<i64>,
 }
 
@@ -93,6 +97,7 @@ impl Default for AppSettings {
             cache_limit_bytes: 2 * 1024 * 1024 * 1024,
             remember_session: false,
             conflict_policy: "skip".to_string(),
+            delete_original_after_upload: false,
             speed_limit_bps: None,
         }
     }

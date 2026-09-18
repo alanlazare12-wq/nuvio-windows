@@ -8,4 +8,5 @@ pub struct ProviderStatus {
 pub trait StorageProvider: Send + Sync {
     fn provider_id(&self) -> &'static str;
     fn status(&self) -> ProviderStatus;
+    fn max_upload_bytes(&self) -> u64;
 }

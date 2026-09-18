@@ -25,6 +25,7 @@ pub struct ThumbnailSource {
     pub kind: String,
     pub path: Option<String>,
     pub data_url: Option<String>,
+    pub blurred: bool,
 }
 
 impl TelegramService {
@@ -36,9 +37,21 @@ impl TelegramService {
         cache_limit: i64,
     ) -> Result<Option<ThumbnailSource>, String> {
         let doc = repo.remote(file_id)?;
+        if let Some(mini) = doc
+            .minithumbnail
+            .as_ref()
+            .filter(|data| !data.is_empty() && data.len() <= 64 * 1024)
+        {
+            return Ok(Some(ThumbnailSource {
+                kind: "image".into(),
+                path: None,
+                data_url: Some(format!("data:image/jpeg;base64,{mini}")),
+                blurred: true,
+            }));
+        }
         let chat = self.own_chat(repo).await?;
         let e::Message::Message(message) =
-            call(f::get_message(chat, doc.message_id, self.client_id)).await?;
+            call(f::get_message(chat, doc.message_id, self.client_id())).await?;
         let e::MessageContent::MessageDocument(content) = message.content else {
             return Ok(None);
         };
@@ -48,10 +61,12 @@ impl TelegramService {
             .minithumbnail
             .filter(|mini| mini.data.len() <= 64 * 1024)
         {
+            repo.cache_minithumbnail(file_id, &mini.data)?;
             return Ok(Some(ThumbnailSource {
                 kind: "image".into(),
                 path: None,
                 data_url: Some(format!("data:image/jpeg;base64,{}", mini.data)),
+                blurred: true,
             }));
         }
         if let Some(thumb) = content
@@ -65,7 +80,7 @@ impl TelegramService {
                 0,
                 0,
                 true,
-                self.client_id,
+                self.client_id(),
             ))
             .await?;
             if file.local.is_downloading_completed {
@@ -81,6 +96,7 @@ impl TelegramService {
                         kind: "image".into(),
                         path: Some(target.to_string_lossy().into_owned()),
                         data_url: None,
+                        blurred: false,
                     }));
                 }
             }
@@ -100,6 +116,7 @@ impl TelegramService {
             kind: kind.into(),
             path: Some(ready.path),
             data_url: None,
+            blurred: false,
         }))
     }
 
@@ -134,7 +151,7 @@ impl TelegramService {
 
         let chat = self.own_chat(repo).await?;
         let e::Message::Message(message) =
-            call(f::get_message(chat, doc.message_id, self.client_id)).await?;
+            call(f::get_message(chat, doc.message_id, self.client_id())).await?;
         let e::MessageContent::MessageDocument(content) = message.content else {
             return Err("Este archivo no se puede previsualizar como contenido de Nuvio".into());
         };
@@ -149,12 +166,12 @@ impl TelegramService {
             0,
             prefix,
             false,
-            self.client_id,
+            self.client_id(),
         ))
         .await?;
         let prefix_deadline = Instant::now() + Duration::from_secs(30);
         while Instant::now() < prefix_deadline {
-            let e::File::File(file) = call(f::get_file(td_file_id, self.client_id)).await?;
+            let e::File::File(file) = call(f::get_file(td_file_id, self.client_id())).await?;
             if file.local.is_downloading_completed || file.local.downloaded_prefix_size >= prefix {
                 break;
             }
@@ -166,13 +183,13 @@ impl TelegramService {
             0,
             0,
             false,
-            self.client_id,
+            self.client_id(),
         ))
         .await?;
 
         let deadline = Instant::now() + Duration::from_secs(3600);
         while Instant::now() < deadline {
-            let e::File::File(file) = call(f::get_file(td_file_id, self.client_id)).await?;
+            let e::File::File(file) = call(f::get_file(td_file_id, self.client_id())).await?;
             if file.local.is_downloading_completed {
                 let source = PathBuf::from(file.local.path);
                 let from_cache = copy_media(&source, &cache_path, &doc.sha256, doc.size)?;

@@ -1,10 +1,10 @@
 import { useEffect, useRef, useState, type ReactNode } from "react";
 import { convertFileSrc, invoke } from "@tauri-apps/api/core";
-import { getDocument } from "pdfjs-dist";
+import { loadPdfJs } from "./pdf";
 import type { CloudFile } from "./types";
 
-type Source = { kind: "image" | "pdf" | "text"; path: string | null; dataUrl: string | null };
-type Preview = { image?: string; text?: string } | null;
+type Source = { kind: "image" | "pdf" | "text"; path: string | null; dataUrl: string | null; blurred?: boolean };
+type Preview = { image?: string; text?: string; blurred?: boolean } | null;
 const cache = new Map<string, Preview>();
 const pending = new Map<string, Promise<Preview>>();
 const queue: Array<() => Promise<void>> = [];
@@ -19,7 +19,7 @@ export function clearThumbnailCache() {
 }
 
 function drain() {
-  while (active < 2 && queue.length) {
+  while (active < 8 && queue.length) {
     active++;
     void queue.shift()!().finally(() => { active--; drain(); });
   }
@@ -30,6 +30,12 @@ async function renderThumbnail(id: string): Promise<Preview> {
   if (!source) return null;
   const url = source.dataUrl ?? (source.path ? convertFileSrc(source.path) : null);
   if (!url) return null;
+  // Telegram minithumbnails are already tiny progressive previews. Show them
+  // directly and let CSS blur/upscale them instead of decoding and redrawing a
+  // second bitmap first; this keeps large image libraries responsive.
+  if (source.kind === "image" && source.blurred && source.dataUrl) {
+    return { image: source.dataUrl, blurred: true };
+  }
   if (source.kind === "text") {
     const response = await fetch(url);
     if (!response.ok) throw new Error("No se pudo leer la miniatura");
@@ -39,7 +45,8 @@ async function renderThumbnail(id: string): Promise<Preview> {
   const context = canvas.getContext("2d");
   if (!context) return null;
   if (source.kind === "pdf") {
-    const task = getDocument({ url });
+    const pdfjs = await loadPdfJs();
+    const task = pdfjs.getDocument({ url });
     try {
       const pdf = await task.promise;
       const page = await pdf.getPage(1);
@@ -48,7 +55,7 @@ async function renderThumbnail(id: string): Promise<Preview> {
       canvas.width = Math.max(1, Math.floor(viewport.width));
       canvas.height = Math.max(1, Math.floor(viewport.height));
       await page.render({ canvas, canvasContext: context, viewport }).promise;
-      return { image: canvas.toDataURL("image/webp", 0.75) };
+      return { image: canvas.toDataURL("image/webp", 0.75), blurred: false };
     } finally { await task.destroy(); }
   }
   const response = await fetch(url);
@@ -59,17 +66,17 @@ async function renderThumbnail(id: string): Promise<Preview> {
     canvas.width = Math.max(1, Math.round(bitmap.width * scale));
     canvas.height = Math.max(1, Math.round(bitmap.height * scale));
     context.drawImage(bitmap, 0, 0, canvas.width, canvas.height);
-    return { image: canvas.toDataURL("image/webp", 0.75) };
+    return { image: canvas.toDataURL("image/webp", 0.75), blurred: Boolean(source.blurred) };
   } finally { bitmap.close(); }
 }
 
-function preload(key: string, id: string, isVisible: () => boolean): Promise<Preview> {
+function preload(key: string, id: string, isVisible: () => boolean, priority = false): Promise<Preview> {
   if (cache.has(key)) return Promise.resolve(cache.get(key)!);
   const existing = pending.get(key);
   if (existing) return existing;
   const epoch = generation;
   const result = new Promise<Preview>(resolve => {
-    queue.push(async () => {
+    const task = async () => {
       if (epoch !== generation || !isVisible()) { pending.delete(key); resolve(null); return; }
       let preview: Preview = null;
       try { preview = await renderThumbnail(id); } catch { /* Keep the file type icon on failure. */ }
@@ -79,7 +86,8 @@ function preload(key: string, id: string, isVisible: () => boolean): Promise<Pre
         pending.delete(key);
         resolve(preview);
       } else { resolve(null); }
-    });
+    };
+    if (priority) queue.unshift(task); else queue.push(task);
   });
   pending.set(key, result);
   drain();
@@ -98,7 +106,7 @@ function observeThumbnail(el: Element, cb: (intersecting: boolean) => void) {
           if (listener) listener(entry.isIntersecting);
         }
       },
-      { rootMargin: "250px" }
+      { rootMargin: "700px" }
     );
   }
   thumbnailListeners.set(el, cb);
@@ -109,7 +117,7 @@ function observeThumbnail(el: Element, cb: (intersecting: boolean) => void) {
   };
 }
 
-export function FileThumbnail({ file, children }: { file: CloudFile; children: ReactNode }) {
+export function FileThumbnail({ file, children, onOpen }: { file: CloudFile; children: ReactNode; onOpen?: () => void }) {
   const container = useRef<HTMLDivElement>(null);
   const [epoch, setEpoch] = useState(generation);
   const key = `${epoch}:${file.id}:${file.updatedAt}:${file.sizeBytes}`;
@@ -136,7 +144,7 @@ export function FileThumbnail({ file, children }: { file: CloudFile; children: R
     const unobserve = observeThumbnail(container.current, (intersecting) => {
       near = intersecting;
       if (near) {
-        void preload(key, file.id, () => alive && near).then((value) => {
+        void preload(key, file.id, () => alive && near, file.kind === "image").then((value) => {
           if (alive) setPreview(value);
         });
       }
@@ -147,8 +155,23 @@ export function FileThumbnail({ file, children }: { file: CloudFile; children: R
     };
   }, [key, file.id, file.trashed]);
 
-  return <div ref={container} className={`file-thumbnail ${preview ? "is-ready" : ""}`}>
-    {preview?.image ? <img src={preview.image} alt={`Miniatura de ${file.name}`} draggable={false} loading="lazy" />
+  const interactive = file.kind === "image" && Boolean(onOpen);
+  return <div
+    ref={container}
+    className={`file-thumbnail ${preview ? "is-ready" : ""} ${preview?.blurred ? "is-blurred" : ""} ${interactive ? "is-interactive" : ""}`}
+    role={interactive ? "button" : undefined}
+    tabIndex={interactive ? 0 : undefined}
+    aria-label={interactive ? `Abrir foto ${file.name}` : undefined}
+    onClick={interactive ? (event) => { event.stopPropagation(); onOpen?.(); } : undefined}
+    onKeyDown={interactive ? (event) => {
+      if (event.key === "Enter" || event.key === " ") {
+        event.preventDefault();
+        event.stopPropagation();
+        onOpen?.();
+      }
+    } : undefined}
+  >
+    {preview?.image ? <img src={preview.image} alt={`Miniatura de ${file.name}`} draggable={false} loading="eager" />
       : preview?.text ? <pre aria-label={`Miniatura de ${file.name}`}>{preview.text}</pre> : children}
   </div>;
 }

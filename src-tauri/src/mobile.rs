@@ -131,6 +131,24 @@ pub async fn stage_content_uri(uri: &str) -> Result<String, String> {
 }
 
 #[cfg(target_os = "android")]
+pub async fn delete_verified_document(uri: &str, sha256: &str, size: i64) -> Result<bool, String> {
+    #[derive(Deserialize)]
+    struct Response {
+        deleted: bool,
+    }
+    let result: Response = HANDLE
+        .get()
+        .ok_or("Android aún no está listo")?
+        .run_mobile_plugin_async(
+            "deleteVerifiedDocument",
+            serde_json::json!({"uri": uri, "sha256": sha256, "size": size}),
+        )
+        .await
+        .map_err(|e| e.to_string())?;
+    Ok(result.deleted)
+}
+
+#[cfg(target_os = "android")]
 pub async fn pick_upload_directory() -> Result<Option<crate::DirectoryUploadPlan>, String> {
     #[derive(Deserialize)]
     #[serde(rename_all = "camelCase")]

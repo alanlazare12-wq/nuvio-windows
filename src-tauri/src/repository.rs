@@ -23,10 +23,34 @@ pub struct TransferControl {
     pub cancel_requested: bool,
 }
 
+#[derive(Debug, Clone)]
+pub struct UploadSourceCleanup {
+    pub source_path: String,
+    pub size_bytes: i64,
+    pub sha256: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct UploadSourceCleanupCandidate {
+    pub transfer_id: String,
+    pub file_name: String,
+    pub source_path: String,
+    pub size_bytes: i64,
+}
+
 impl CatalogRepository {
     pub fn open(path: &Path) -> Result<Self, RepositoryError> {
         let connection = Connection::open(path)?;
         connection.pragma_update(None, "journal_mode", "WAL")?;
+        // The catalog is fully reconstructible from Telegram, so WAL + NORMAL gives
+        // much lower fsync latency while preserving transactional consistency across
+        // process/app crashes. Keep a larger page cache and mmap window for 30k-100k+
+        // libraries so batch upserts and recursive folder joins stay memory-resident.
+        connection.pragma_update(None, "synchronous", "NORMAL")?;
+        connection.pragma_update(None, "temp_store", "MEMORY")?;
+        connection.pragma_update(None, "cache_size", -65_536_i64)?;
+        connection.pragma_update(None, "mmap_size", 268_435_456_i64)?;
+        connection.pragma_update(None, "wal_autocheckpoint", 8_192_i64)?;
         connection.pragma_update(None, "foreign_keys", "ON")?;
         connection.busy_timeout(std::time::Duration::from_secs(5))?;
 
@@ -101,10 +125,14 @@ impl CatalogRepository {
             CREATE TABLE IF NOT EXISTS transfer_metadata (
                 transfer_id TEXT PRIMARY KEY NOT NULL,
                 local_path TEXT NOT NULL,
+                source_path TEXT NULL,
                 size_bytes INTEGER NOT NULL DEFAULT 0,
                 sha256 TEXT NOT NULL,
                 encrypted INTEGER NOT NULL DEFAULT 0,
                 remote_message_id TEXT NULL,
+                delete_source_after_upload INTEGER NOT NULL DEFAULT 0,
+                source_deleted INTEGER NOT NULL DEFAULT 0,
+                source_delete_error TEXT NULL,
                 error TEXT NULL,
                 created_at INTEGER NOT NULL,
                 FOREIGN KEY (transfer_id) REFERENCES transfers(id) ON DELETE CASCADE
@@ -131,6 +159,19 @@ impl CatalogRepository {
             );
             CREATE INDEX IF NOT EXISTS idx_transfer_runtime_retry ON transfer_runtime(next_retry_at);
 
+            CREATE TABLE IF NOT EXISTS uploaded_sources (
+                transfer_id TEXT PRIMARY KEY NOT NULL,
+                file_name TEXT NOT NULL,
+                source_path TEXT NOT NULL,
+                size_bytes INTEGER NOT NULL DEFAULT 0,
+                sha256 TEXT NOT NULL,
+                remote_message_id TEXT NOT NULL,
+                source_deleted INTEGER NOT NULL DEFAULT 0,
+                source_delete_error TEXT NULL,
+                created_at INTEGER NOT NULL DEFAULT (unixepoch())
+            );
+            CREATE INDEX IF NOT EXISTS idx_uploaded_sources_deleted ON uploaded_sources(source_deleted);
+
             CREATE TABLE IF NOT EXISTS app_meta (
                 key TEXT PRIMARY KEY NOT NULL,
                 value TEXT NOT NULL
@@ -149,6 +190,7 @@ impl CatalogRepository {
             INSERT OR IGNORE INTO app_settings VALUES ('cache_limit_bytes','2147483648');
             INSERT OR IGNORE INTO app_settings VALUES ('remember_session','0');
             INSERT OR IGNORE INTO app_settings VALUES ('conflict_policy','skip');
+            INSERT OR IGNORE INTO app_settings VALUES ('delete_original_after_upload','0');
             INSERT OR IGNORE INTO app_settings VALUES ('speed_limit_bps','');
 
             INSERT OR IGNORE INTO transfer_runtime (transfer_id,phase,total_bytes,updated_at)
@@ -164,6 +206,45 @@ impl CatalogRepository {
                    unixepoch()
             FROM transfers t
             LEFT JOIN transfer_metadata m ON m.transfer_id=t.id;
+            "#,
+        )?;
+        ensure_column(
+            &connection,
+            "transfer_metadata",
+            "source_path",
+            "source_path TEXT NULL",
+        )?;
+        ensure_column(
+            &connection,
+            "transfer_metadata",
+            "delete_source_after_upload",
+            "delete_source_after_upload INTEGER NOT NULL DEFAULT 0",
+        )?;
+        ensure_column(
+            &connection,
+            "transfer_metadata",
+            "source_deleted",
+            "source_deleted INTEGER NOT NULL DEFAULT 0",
+        )?;
+        ensure_column(
+            &connection,
+            "transfer_metadata",
+            "source_delete_error",
+            "source_delete_error TEXT NULL",
+        )?;
+        connection.execute_batch(
+            r#"
+            INSERT OR IGNORE INTO uploaded_sources(
+                transfer_id,file_name,source_path,size_bytes,sha256,remote_message_id,
+                source_deleted,source_delete_error,created_at
+            )
+            SELECT t.id,t.file_name,m.source_path,m.size_bytes,m.sha256,m.remote_message_id,
+                   COALESCE(m.source_deleted,0),m.source_delete_error,m.created_at
+            FROM transfers t
+            JOIN transfer_metadata m ON m.transfer_id=t.id
+            WHERE t.direction='upload' AND t.status='completed'
+              AND m.remote_message_id IS NOT NULL AND m.remote_message_id<>''
+              AND m.source_path IS NOT NULL AND m.source_path<>'' AND m.sha256<>'';
             "#,
         )?;
         Ok(())
@@ -229,6 +310,74 @@ impl CatalogRepository {
             files.push(row?);
         }
         Ok(files)
+    }
+
+    pub fn catalog_rowid_cursor(&self) -> Result<i64, RepositoryError> {
+        self.connection
+            .lock()
+            .expect("catalog mutex poisoned")
+            .query_row("SELECT COALESCE(MAX(rowid),0) FROM files", [], |row| {
+                row.get(0)
+            })
+            .map_err(Into::into)
+    }
+
+    pub fn sync_file_delta(
+        &self,
+        after_rowid: i64,
+    ) -> Result<(i64, Vec<CloudFile>), RepositoryError> {
+        let connection = self.connection.lock().expect("catalog mutex poisoned");
+        let cursor: i64 =
+            connection.query_row("SELECT COALESCE(MAX(rowid),0) FROM files", [], |row| {
+                row.get(0)
+            })?;
+        if cursor <= after_rowid {
+            return Ok((cursor, Vec::new()));
+        }
+        let mut statement = connection.prepare(
+            r#"WITH RECURSIVE folder_paths(id, path) AS (
+                   SELECT id, name FROM folders WHERE parent_id IS NULL
+                   UNION ALL
+                   SELECT child.id, parent.path || ' / ' || child.name
+                   FROM folders child JOIN folder_paths parent ON child.parent_id = parent.id
+               )
+               SELECT f.id, f.name, f.extension, f.kind, f.size_bytes, f.updated_at,
+                      f.favorite, f.trashed, COALESCE(folder_paths.path, 'Mi unidad'),
+                      fl.folder_id, f.tags_json, f.provider, f.telegram_message_id
+               FROM files f
+               LEFT JOIN file_locations fl ON fl.file_id = f.id
+               LEFT JOIN folder_paths ON folder_paths.id = fl.folder_id
+               WHERE f.rowid > ?1
+               ORDER BY f.rowid ASC"#,
+        )?;
+        let rows = statement.query_map([after_rowid], |row| {
+            let tags_json: String = row.get(10)?;
+            let tags = if tags_json.is_empty() || tags_json == "[]" {
+                Vec::new()
+            } else {
+                serde_json::from_str::<Vec<String>>(&tags_json).unwrap_or_default()
+            };
+            Ok(CloudFile {
+                id: row.get(0)?,
+                name: row.get(1)?,
+                extension: row.get(2)?,
+                kind: row.get(3)?,
+                size_bytes: row.get(4)?,
+                updated_at: row.get(5)?,
+                favorite: row.get::<_, i64>(6)? != 0,
+                trashed: row.get::<_, i64>(7)? != 0,
+                folder: row.get(8)?,
+                folder_id: row.get(9)?,
+                tags,
+                provider: row.get(11)?,
+                telegram_message_id: row.get(12)?,
+            })
+        })?;
+        let mut files = Vec::new();
+        for row in rows {
+            files.push(row?);
+        }
+        Ok((cursor, files))
     }
 
     pub fn list_folders(&self) -> Result<Vec<CloudFolder>, RepositoryError> {
@@ -412,7 +561,8 @@ impl CatalogRepository {
             r#"SELECT t.id,t.file_name,t.direction,t.progress,t.status,t.speed_label,
                       COALESCE(r.phase,t.status),COALESCE(r.processed_bytes,0),
                       COALESCE(r.total_bytes,m.size_bytes,0),COALESCE(r.speed_bps,0),r.eta_seconds,
-                      COALESCE(r.attempts,0),COALESCE(r.max_attempts,5),m.error,r.started_at,
+                      COALESCE(r.attempts,0),COALESCE(r.max_attempts,5),m.error,m.source_path,
+                      COALESCE(m.source_deleted,0),m.source_delete_error,m.remote_message_id,r.started_at,
                       COALESCE(r.updated_at,m.created_at,0)
                FROM transfers t
                LEFT JOIN transfer_metadata m ON m.transfer_id=t.id
@@ -421,7 +571,11 @@ impl CatalogRepository {
         )?;
         let rows = statement.query_map([], |row| {
             let raw_progress: i64 = row.get(3)?;
+            let direction: String = row.get(2)?;
             let status: String = row.get(4)?;
+            let source_path: Option<String> = row.get(14)?;
+            let source_deleted = row.get::<_, i64>(15)? != 0;
+            let remote_message_id: Option<String> = row.get(17)?;
             let active = matches!(
                 status.as_str(),
                 "waiting"
@@ -435,10 +589,17 @@ impl CatalogRepository {
                     | "retry_wait"
                     | "running"
             );
+            let source_delete_available = direction == "upload"
+                && status == "completed"
+                && !source_deleted
+                && source_path.as_deref().is_some_and(|path| !path.is_empty())
+                && remote_message_id
+                    .as_deref()
+                    .is_some_and(|id| !id.is_empty());
             Ok(TransferJob {
                 id: row.get(0)?,
                 file_name: row.get(1)?,
-                direction: row.get(2)?,
+                direction,
                 progress: raw_progress.clamp(0, 100) as u8,
                 status: status.clone(),
                 speed_label: row.get(5)?,
@@ -453,8 +614,11 @@ impl CatalogRepository {
                 can_pause: active && status != "retry_wait",
                 can_retry: matches!(status.as_str(), "failed" | "paused" | "cancelled"),
                 can_cancel: !matches!(status.as_str(), "completed" | "duplicate" | "cancelled"),
-                started_at: row.get(14)?,
-                updated_at: row.get(15)?,
+                source_delete_available,
+                source_deleted,
+                source_delete_error: row.get(16)?,
+                started_at: row.get(18)?,
+                updated_at: row.get(19)?,
             })
         })?;
 
@@ -467,12 +631,20 @@ impl CatalogRepository {
 
     pub fn queue_summary(&self, cache_bytes: i64) -> Result<QueueSummary, RepositoryError> {
         let all_jobs = self.list_transfers()?;
+        self.queue_summary_from_jobs(&all_jobs, cache_bytes)
+    }
+
+    pub(crate) fn queue_summary_from_jobs(
+        &self,
+        all_jobs: &[TransferJob],
+        cache_bytes: i64,
+    ) -> Result<QueueSummary, RepositoryError> {
         let completed = all_jobs
             .iter()
             .filter(|job| matches!(job.status.as_str(), "completed" | "duplicate"))
             .count();
         let jobs: Vec<_> = all_jobs
-            .into_iter()
+            .iter()
             .filter(|job| !matches!(job.status.as_str(), "completed" | "duplicate" | "cancelled"))
             .collect();
         let settings = self.settings()?;
@@ -572,6 +744,9 @@ impl CatalogRepository {
         let conflict = get("conflict_policy")?
             .filter(|v| v == "skip" || v == "rename")
             .unwrap_or(defaults.conflict_policy);
+        let delete_original_after_upload = get("delete_original_after_upload")?
+            .map(|v| v == "1")
+            .unwrap_or(defaults.delete_original_after_upload);
         let speed_limit_bps = get("speed_limit_bps")?
             .and_then(|v| {
                 if v.is_empty() {
@@ -588,6 +763,7 @@ impl CatalogRepository {
             cache_limit_bytes: cache,
             remember_session: remember,
             conflict_policy: conflict,
+            delete_original_after_upload,
             speed_limit_bps,
         })
     }
@@ -600,6 +776,7 @@ impl CatalogRepository {
             "cache_limit_bytes",
             "remember_session",
             "conflict_policy",
+            "delete_original_after_upload",
             "speed_limit_bps",
         ];
         if !ALLOWED.contains(&key) {
@@ -633,6 +810,109 @@ impl CatalogRepository {
         Ok(count > 0)
     }
 
+    pub fn upload_source_cleanup(
+        &self,
+        id: &str,
+        require_opt_in: bool,
+    ) -> Result<Option<UploadSourceCleanup>, RepositoryError> {
+        let connection = self.connection.lock().expect("catalog mutex poisoned");
+        let current = connection
+            .query_row(
+                "SELECT m.source_path,m.size_bytes,m.sha256
+                 FROM transfer_metadata m JOIN transfers t ON t.id=m.transfer_id
+                 WHERE t.id=?1 AND t.direction='upload' AND t.status='completed'
+                   AND m.remote_message_id IS NOT NULL AND m.remote_message_id<>''
+                   AND m.source_path IS NOT NULL AND m.source_path<>'' AND m.source_deleted=0
+                   AND m.sha256<>'' AND (?2=0 OR m.delete_source_after_upload=1)",
+                params![id, if require_opt_in { 1 } else { 0 }],
+                |row| {
+                    Ok(UploadSourceCleanup {
+                        source_path: row.get(0)?,
+                        size_bytes: row.get(1)?,
+                        sha256: row.get(2)?,
+                    })
+                },
+            )
+            .optional()?;
+        if current.is_some() || require_opt_in {
+            return Ok(current);
+        }
+        connection
+            .query_row(
+                "SELECT source_path,size_bytes,sha256 FROM uploaded_sources
+                 WHERE transfer_id=?1 AND source_deleted=0 AND source_path<>'' AND sha256<>''",
+                [id],
+                |row| {
+                    Ok(UploadSourceCleanup {
+                        source_path: row.get(0)?,
+                        size_bytes: row.get(1)?,
+                        sha256: row.get(2)?,
+                    })
+                },
+            )
+            .optional()
+            .map_err(Into::into)
+    }
+
+    pub fn upload_source_cleanup_candidates(
+        &self,
+    ) -> Result<Vec<UploadSourceCleanupCandidate>, RepositoryError> {
+        let connection = self.connection.lock().expect("catalog mutex poisoned");
+        let mut statement = connection.prepare(
+            "SELECT transfer_id,file_name,source_path,size_bytes
+             FROM uploaded_sources
+             WHERE source_deleted=0 AND source_path<>'' AND sha256<>''
+             ORDER BY created_at DESC, transfer_id DESC",
+        )?;
+        let rows = statement.query_map([], |row| {
+            Ok(UploadSourceCleanupCandidate {
+                transfer_id: row.get(0)?,
+                file_name: row.get(1)?,
+                source_path: row.get(2)?,
+                size_bytes: row.get(3)?,
+            })
+        })?;
+        let mut candidates = Vec::new();
+        for row in rows {
+            candidates.push(row?);
+        }
+        Ok(candidates)
+    }
+
+    pub fn mark_upload_source_deleted(&self, id: &str) -> Result<(), RepositoryError> {
+        let mut connection = self.connection.lock().expect("catalog mutex poisoned");
+        let transaction = connection.transaction()?;
+        transaction.execute(
+            "UPDATE transfer_metadata SET source_deleted=1,source_delete_error=NULL WHERE transfer_id=?1",
+            [id],
+        )?;
+        transaction.execute(
+            "UPDATE uploaded_sources SET source_deleted=1,source_delete_error=NULL WHERE transfer_id=?1",
+            [id],
+        )?;
+        transaction.commit()?;
+        Ok(())
+    }
+
+    pub fn mark_upload_source_delete_error(
+        &self,
+        id: &str,
+        error: &str,
+    ) -> Result<(), RepositoryError> {
+        let mut connection = self.connection.lock().expect("catalog mutex poisoned");
+        let transaction = connection.transaction()?;
+        transaction.execute(
+            "UPDATE transfer_metadata SET source_delete_error=?1 WHERE transfer_id=?2",
+            params![error, id],
+        )?;
+        transaction.execute(
+            "UPDATE uploaded_sources SET source_delete_error=?1 WHERE transfer_id=?2",
+            params![error, id],
+        )?;
+        transaction.commit()?;
+        Ok(())
+    }
+
     #[allow(clippy::too_many_arguments)]
     #[cfg(test)]
     pub fn enqueue_transfer(
@@ -646,7 +926,16 @@ impl CatalogRepository {
         status: &str,
     ) -> Result<(), RepositoryError> {
         self.enqueue_transfer_with_folder(
-            id, file_name, local_path, size_bytes, sha256, encrypted, status, None,
+            id,
+            file_name,
+            local_path,
+            Some(local_path),
+            size_bytes,
+            sha256,
+            encrypted,
+            status,
+            None,
+            false,
         )
     }
 
@@ -656,11 +945,13 @@ impl CatalogRepository {
         id: &str,
         file_name: &str,
         local_path: &str,
+        source_path: Option<&str>,
         size_bytes: i64,
         sha256: &str,
         encrypted: bool,
         status: &str,
         folder_id: Option<&str>,
+        delete_source_after_upload: bool,
     ) -> Result<(), RepositoryError> {
         let mut connection = self.connection.lock().expect("catalog mutex poisoned");
         let transaction = connection.transaction()?;
@@ -670,8 +961,8 @@ impl CatalogRepository {
             params![id, file_name, status],
         )?;
         transaction.execute(
-            "INSERT INTO transfer_metadata (transfer_id,local_path,size_bytes,sha256,encrypted,created_at) VALUES (?1,?2,?3,?4,?5,unixepoch())",
-            params![id, local_path, size_bytes, sha256, if encrypted { 1 } else { 0 }],
+            "INSERT INTO transfer_metadata (transfer_id,local_path,source_path,size_bytes,sha256,encrypted,delete_source_after_upload,created_at) VALUES (?1,?2,?3,?4,?5,?6,?7,unixepoch())",
+            params![id, local_path, source_path, size_bytes, sha256, if encrypted { 1 } else { 0 }, if delete_source_after_upload { 1 } else { 0 }],
         )?;
         transaction.execute(
             "INSERT INTO transfer_runtime (transfer_id,phase,total_bytes,updated_at) VALUES (?1,?2,?3,unixepoch())",
@@ -696,23 +987,28 @@ impl CatalogRepository {
         self.enqueue_transfer(id, file_name, source_path, size_bytes, "", false, "waiting")
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn create_upload_placeholder_in_folder(
         &self,
         id: &str,
         file_name: &str,
-        source_path: &str,
+        prepared_source_path: &str,
+        original_source_path: Option<&str>,
         size_bytes: i64,
         folder_id: Option<&str>,
+        delete_source_after_upload: bool,
     ) -> Result<(), RepositoryError> {
         self.enqueue_transfer_with_folder(
             id,
             file_name,
-            source_path,
+            prepared_source_path,
+            original_source_path,
             size_bytes,
             "",
             false,
             "waiting",
             folder_id,
+            delete_source_after_upload,
         )
     }
 
@@ -836,6 +1132,29 @@ impl CatalogRepository {
         )?;
         transaction.execute("UPDATE transfer_metadata SET remote_message_id=COALESCE(?1,remote_message_id),error=?2 WHERE transfer_id=?3", params![remote_message_id,error,id])?;
         transaction.execute("UPDATE transfer_runtime SET phase=?1,speed_bps=CASE WHEN ?1 IN ('completed','failed','paused','cancelled','duplicate') THEN 0 ELSE speed_bps END,eta_seconds=CASE WHEN ?1 IN ('completed','failed','paused','cancelled','duplicate') THEN NULL ELSE eta_seconds END,updated_at=unixepoch(),completed_at=CASE WHEN ?1='completed' THEN unixepoch() ELSE completed_at END WHERE transfer_id=?2", params![status,id])?;
+        if status == "completed" {
+            transaction.execute(
+                "INSERT INTO uploaded_sources(
+                    transfer_id,file_name,source_path,size_bytes,sha256,remote_message_id,
+                    source_deleted,source_delete_error,created_at
+                 )
+                 SELECT t.id,t.file_name,m.source_path,m.size_bytes,m.sha256,m.remote_message_id,
+                        COALESCE(m.source_deleted,0),m.source_delete_error,m.created_at
+                 FROM transfers t JOIN transfer_metadata m ON m.transfer_id=t.id
+                 WHERE t.id=?1 AND t.direction='upload'
+                   AND m.remote_message_id IS NOT NULL AND m.remote_message_id<>''
+                   AND m.source_path IS NOT NULL AND m.source_path<>'' AND m.sha256<>''
+                 ON CONFLICT(transfer_id) DO UPDATE SET
+                    file_name=excluded.file_name,
+                    source_path=excluded.source_path,
+                    size_bytes=excluded.size_bytes,
+                    sha256=excluded.sha256,
+                    remote_message_id=excluded.remote_message_id,
+                    source_deleted=MAX(uploaded_sources.source_deleted,excluded.source_deleted),
+                    source_delete_error=CASE WHEN uploaded_sources.source_deleted=1 THEN NULL ELSE excluded.source_delete_error END",
+                [id],
+            )?;
+        }
         transaction.commit()?;
         Ok(())
     }
@@ -991,11 +1310,38 @@ impl CatalogRepository {
     }
 
     pub fn clear_transfer_history(&self) -> Result<usize, RepositoryError> {
-        let connection = self.connection.lock().expect("catalog mutex poisoned");
-        let changed = connection.execute(
+        let mut connection = self.connection.lock().expect("catalog mutex poisoned");
+        let transaction = connection.transaction()?;
+        // Preserve the verified local-source metadata before transfer rows cascade away.
+        // This defensive backfill keeps manual cleanup working even if an older or
+        // interrupted completion path failed to populate uploaded_sources earlier.
+        transaction.execute(
+            "INSERT INTO uploaded_sources(
+                transfer_id,file_name,source_path,size_bytes,sha256,remote_message_id,
+                source_deleted,source_delete_error,created_at
+             )
+             SELECT t.id,t.file_name,m.source_path,m.size_bytes,m.sha256,m.remote_message_id,
+                    COALESCE(m.source_deleted,0),m.source_delete_error,m.created_at
+             FROM transfers t
+             JOIN transfer_metadata m ON m.transfer_id=t.id
+             WHERE t.direction='upload' AND t.status='completed'
+               AND m.remote_message_id IS NOT NULL AND m.remote_message_id<>''
+               AND m.source_path IS NOT NULL AND m.source_path<>'' AND m.sha256<>''
+             ON CONFLICT(transfer_id) DO UPDATE SET
+                file_name=excluded.file_name,
+                source_path=excluded.source_path,
+                size_bytes=excluded.size_bytes,
+                sha256=excluded.sha256,
+                remote_message_id=excluded.remote_message_id,
+                source_deleted=MAX(uploaded_sources.source_deleted,excluded.source_deleted),
+                source_delete_error=CASE WHEN uploaded_sources.source_deleted=1 THEN NULL ELSE excluded.source_delete_error END",
+            [],
+        )?;
+        let changed = transaction.execute(
             "DELETE FROM transfers WHERE status IN ('completed','duplicate','cancelled')",
             [],
         )?;
+        transaction.commit()?;
         Ok(changed)
     }
 
@@ -1069,6 +1415,23 @@ pub(crate) fn ensure_folder_parent(
     Ok(())
 }
 
+fn ensure_column(
+    connection: &Connection,
+    table: &str,
+    column: &str,
+    definition: &str,
+) -> Result<(), RepositoryError> {
+    let mut statement = connection.prepare(&format!("PRAGMA table_info({table})"))?;
+    let columns = statement.query_map([], |row| row.get::<_, String>(1))?;
+    for existing in columns {
+        if existing? == column {
+            return Ok(());
+        }
+    }
+    connection.execute(&format!("ALTER TABLE {table} ADD COLUMN {definition}"), [])?;
+    Ok(())
+}
+
 fn ensure_unique_folder_name(
     connection: &Connection,
     name: &str,
@@ -1099,6 +1462,138 @@ fn ensure_unique_folder_name(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn verified_upload_source_cleanup_is_opt_in_and_persistent() {
+        let root = tempfile::tempdir().unwrap();
+        let repo = CatalogRepository::open(&root.path().join("db")).unwrap();
+        assert!(!repo.settings().unwrap().delete_original_after_upload);
+        repo.set_setting("delete_original_after_upload", "1")
+            .unwrap();
+        assert!(repo.settings().unwrap().delete_original_after_upload);
+
+        repo.create_upload_placeholder_in_folder(
+            "cleanup",
+            "photo.jpg",
+            "prepared.jpg",
+            Some("original.jpg"),
+            3,
+            None,
+            true,
+        )
+        .unwrap();
+        repo.finish_preparation("cleanup", "prepared.jpg", "abc", 3, false)
+            .unwrap();
+        repo.update_transfer_state(
+            "cleanup",
+            "completed",
+            100,
+            "Guardado en Telegram",
+            Some("42"),
+            None,
+        )
+        .unwrap();
+        let candidate = repo
+            .upload_source_cleanup("cleanup", true)
+            .unwrap()
+            .unwrap();
+        assert_eq!(candidate.source_path, "original.jpg");
+        assert_eq!(candidate.size_bytes, 3);
+        assert_eq!(candidate.sha256, "abc");
+        repo.mark_upload_source_deleted("cleanup").unwrap();
+        assert!(repo
+            .upload_source_cleanup("cleanup", false)
+            .unwrap()
+            .is_none());
+        let transfer = repo.list_transfers().unwrap().remove(0);
+        assert!(transfer.source_deleted);
+        assert!(!transfer.source_delete_available);
+    }
+
+    #[test]
+    fn manual_cleanup_candidates_ignore_auto_delete_opt_in() {
+        let root = tempfile::tempdir().unwrap();
+        let repo = CatalogRepository::open(&root.path().join("db")).unwrap();
+        repo.create_upload_placeholder_in_folder(
+            "manual-cleanup",
+            "photo.jpg",
+            "prepared.jpg",
+            Some("original.jpg"),
+            99,
+            None,
+            false,
+        )
+        .unwrap();
+        repo.finish_preparation("manual-cleanup", "prepared.jpg", "abc", 99, false)
+            .unwrap();
+        repo.update_transfer_state(
+            "manual-cleanup",
+            "completed",
+            100,
+            "Guardado en Telegram",
+            Some("99"),
+            None,
+        )
+        .unwrap();
+        assert!(repo
+            .upload_source_cleanup("manual-cleanup", true)
+            .unwrap()
+            .is_none());
+        let candidates = repo.upload_source_cleanup_candidates().unwrap();
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].transfer_id, "manual-cleanup");
+        assert_eq!(candidates[0].file_name, "photo.jpg");
+        assert_eq!(candidates[0].source_path, "original.jpg");
+        assert_eq!(candidates[0].size_bytes, 99);
+
+        // Simulate an older/interrupted completion path that did not persist the
+        // durable cleanup ledger. Clearing history must backfill it first.
+        {
+            let connection = repo.connection.lock().unwrap();
+            connection
+                .execute(
+                    "DELETE FROM uploaded_sources WHERE transfer_id='manual-cleanup'",
+                    [],
+                )
+                .unwrap();
+        }
+        assert!(repo.upload_source_cleanup_candidates().unwrap().is_empty());
+
+        assert_eq!(repo.clear_transfer_history().unwrap(), 1);
+        assert!(repo.list_transfers().unwrap().is_empty());
+        let retained = repo.upload_source_cleanup_candidates().unwrap();
+        assert_eq!(retained.len(), 1);
+        assert!(repo
+            .upload_source_cleanup("manual-cleanup", false)
+            .unwrap()
+            .is_some());
+    }
+
+    #[test]
+    fn sync_delta_returns_only_rows_added_after_cursor() {
+        let root = tempfile::tempdir().unwrap();
+        let repo = CatalogRepository::open(&root.path().join("db")).unwrap();
+        {
+            let connection = repo.connection.lock().unwrap();
+            connection.execute(
+                "INSERT INTO files(id,name,extension,kind,size_bytes,updated_at) VALUES('old','old','txt','text',1,'2026-01-01T00:00:00Z')",
+                [],
+            ).unwrap();
+        }
+        let cursor = repo.catalog_rowid_cursor().unwrap();
+        {
+            let connection = repo.connection.lock().unwrap();
+            connection.execute(
+                "INSERT INTO files(id,name,extension,kind,size_bytes,updated_at) VALUES('new','new','jpg','image',2,'2026-01-02T00:00:00Z')",
+                [],
+            ).unwrap();
+        }
+        let (next, files) = repo.sync_file_delta(cursor).unwrap();
+        assert!(next > cursor);
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0].id, "new");
+        assert!(repo.sync_file_delta(next).unwrap().1.is_empty());
+    }
 
     #[test]
     fn parallel_preparations_only_queue_one_copy_of_the_same_hash() {
@@ -1143,10 +1638,16 @@ mod tests {
             )
             .unwrap();
         }
-        assert_eq!(repo.list_transfers().unwrap().len(), 301);
+        let jobs = repo.list_transfers().unwrap();
+        assert_eq!(jobs.len(), 301);
         let summary = repo.queue_summary(0).unwrap();
+        let snapshot_summary = repo.queue_summary_from_jobs(&jobs, 0).unwrap();
         assert_eq!(summary.pending, 301);
         assert_eq!(summary.total_bytes, 3010);
+        assert_eq!(snapshot_summary.pending, summary.pending);
+        assert_eq!(snapshot_summary.total, summary.total);
+        assert_eq!(snapshot_summary.total_bytes, summary.total_bytes);
+        assert_eq!(snapshot_summary.processed_bytes, summary.processed_bytes);
     }
 
     #[test]
@@ -1209,8 +1710,10 @@ mod tests {
             "upload",
             "photo.jpg",
             "source",
+            Some("source"),
             3,
             Some("folder-a"),
+            false,
         )
         .unwrap();
         assert!(!repo.folder_is_empty("folder-a").unwrap());
@@ -1223,8 +1726,10 @@ mod tests {
                 "invalid",
                 "photo.jpg",
                 "source",
+                Some("source"),
                 3,
-                Some("missing")
+                Some("missing"),
+                false
             )
             .is_err());
         assert_eq!(repo.list_transfers().unwrap().len(), 1);

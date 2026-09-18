@@ -1,7 +1,7 @@
 {
   "name": "nuviodrive-v1",
   "private": true,
-  "version": "1.2.0",
+  "version": "1.2.4",
   "type": "module",
   "scripts": {
     "dev": "vite",
@@ -19,7 +19,8 @@
     "android:setup": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/package-android.ps1",
     "android:dev": "node scripts/tauri-android.mjs dev",
     "android:build": "node scripts/tauri-android.mjs build --debug --apk --target aarch64",
-    "android:release": "node scripts/tauri-android.mjs build --apk --target aarch64"
+    "android:release": "node scripts/tauri-android.mjs build --apk --target aarch64",
+    "qa:auth": "node scripts/qa-auth.mjs"
   },
   "dependencies": {
     "@tauri-apps/api": "^2",
@@ -27,18 +28,19 @@
     "@tauri-apps/plugin-fs": "^2.5.2",
     "@tauri-apps/plugin-notification": "^2.4.0",
     "@tauri-apps/plugin-opener": "^2",
-    "lucide-react": "^0.544.0",
+    "lucide-react": "^1.46.0",
     "pdfjs-dist": "^6.3.289",
-    "react": "^19.1.0",
-    "react-dom": "^19.1.0"
+    "react": "^19.3.0",
+    "react-dom": "^19.3.0"
   },
   "devDependencies": {
     "@tauri-apps/cli": "^2",
-    "@types/react": "^19.1.8",
-    "@types/react-dom": "^19.1.6",
+    "@types/react": "^19.3.0",
+    "@types/react-dom": "^19.3.0",
     "@vitejs/plugin-react": "^6.0.2",
-    "typescript": "~6.0.3",
-    "vite": "^8.0.16"
+    "playwright": "^1.63.0",
+    "typescript": "~7.0.2",
+    "vite": "^8.3.0"
   },
   "packageManager": "pnpm@11.19.0"
 }

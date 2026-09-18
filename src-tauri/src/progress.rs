@@ -70,11 +70,25 @@ mod tests {
     }
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum SyncPhase {
+    #[default]
+    Idle,
+    Starting,
+    Scanning,
+    Folders,
+    Files,
+    Applying,
+    Complete,
+    Error,
+}
+
 #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SyncProgress {
     pub active: bool,
-    pub phase: String,
+    pub phase: SyncPhase,
     pub scanned: usize,
     pub total: Option<usize>,
     pub percent: Option<u8>,
@@ -91,7 +105,7 @@ impl<'a> SyncRun<'a> {
     pub fn new(state: &'a std::sync::Mutex<SyncProgress>) -> Self {
         *state.lock().expect("sync progress") = SyncProgress {
             active: true,
-            phase: "scanning".into(),
+            phase: SyncPhase::Scanning,
             ..Default::default()
         };
         Self {
@@ -100,8 +114,17 @@ impl<'a> SyncRun<'a> {
             finished: false,
         }
     }
+    pub fn phase(&self, phase: SyncPhase) {
+        let mut state = self.state.lock().expect("sync progress");
+        state.phase = phase;
+        state.eta_seconds = None;
+        if phase == SyncPhase::Folders {
+            state.percent = Some(3);
+        }
+    }
     pub fn scanned(&self, scanned: usize, total: Option<usize>) {
         let mut state = self.state.lock().expect("sync progress");
+        state.phase = SyncPhase::Files;
         state.scanned = scanned;
         state.total = total;
         state.percent = total
@@ -114,14 +137,18 @@ impl<'a> SyncRun<'a> {
     }
     pub fn applying(&self, processed: usize, total: usize) {
         let mut state = self.state.lock().expect("sync progress");
-        state.phase = "applying".into();
+        state.phase = SyncPhase::Applying;
         state.percent = Some(90 + (processed.saturating_mul(9) / total.max(1)).min(9) as u8);
         state.eta_seconds = None;
     }
     pub fn finish(&mut self, error: Option<String>) {
         let mut state = self.state.lock().expect("sync progress");
         state.active = false;
-        state.phase = if error.is_some() { "error" } else { "complete" }.into();
+        state.phase = if error.is_some() {
+            SyncPhase::Error
+        } else {
+            SyncPhase::Complete
+        };
         if error.is_none() {
             state.percent = Some(100);
             state.eta_seconds = Some(0);
@@ -141,6 +168,23 @@ impl Drop for SyncRun<'_> {
 #[cfg(test)]
 mod sync_tests {
     use super::*;
+    #[test]
+    fn folders_phase_precedes_file_progress() {
+        let state = std::sync::Mutex::new(SyncProgress::default());
+        let run = SyncRun::new(&state);
+        run.phase(SyncPhase::Folders);
+        {
+            let snapshot = state.lock().unwrap();
+            assert_eq!(snapshot.phase, SyncPhase::Folders);
+            assert_eq!(snapshot.percent, Some(3));
+            assert_eq!(snapshot.scanned, 0);
+        }
+        run.scanned(25, Some(100));
+        let snapshot = state.lock().unwrap();
+        assert_eq!(snapshot.phase, SyncPhase::Files);
+        assert_eq!(snapshot.scanned, 25);
+    }
+
     #[test]
     fn progress_completes_only_after_success() {
         let state = std::sync::Mutex::new(SyncProgress::default());
@@ -163,7 +207,7 @@ mod sync_tests {
         }
         let state = state.lock().unwrap();
         assert!(!state.active);
-        assert_eq!(state.phase, "error");
+        assert_eq!(state.phase, SyncPhase::Error);
         assert!(state.error.is_some());
     }
 }

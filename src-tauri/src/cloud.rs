@@ -22,6 +22,8 @@ pub struct RemoteDocument {
     pub date: i32,
     pub sha256: String,
     pub folder_id: Option<String>,
+    #[serde(default)]
+    pub minithumbnail: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -72,12 +74,344 @@ struct FileMoveEvent {
     folder_id: Option<String>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct FileTrashEvent {
+    v: u8,
+    message_ids: Vec<i64>,
+    trashed: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct FileDeleteEvent {
+    v: u8,
+    message_ids: Vec<i64>,
+}
+
+struct HistoryScanState {
+    folders: std::collections::HashMap<String, FolderEvent>,
+    moves: std::collections::HashMap<i64, Option<String>>,
+    trash_states: std::collections::HashMap<i64, bool>,
+    deleted_message_ids: std::collections::HashSet<i64>,
+    scanned: usize,
+    total_documents: usize,
+    newest: i64,
+}
+
+#[derive(Debug, Default)]
+struct FastSearchOutcome {
+    fetched: usize,
+    total_hint: i32,
+    oldest_message_id: Option<i64>,
+    exhausted: bool,
+    stalled: bool,
+}
+
 #[cfg(any(test, target_os = "android"))]
 #[derive(Serialize, Deserialize)]
 struct AndroidDestination {
     tree: String,
     name: String,
     policy: String,
+}
+
+impl CatalogRepository {
+    fn sync_checkpoint(&self, chat: i64) -> Result<Option<i64>, String> {
+        let connection = self.connection.lock().map_err(|e| e.to_string())?;
+        let value: Option<String> = connection
+            .query_row(
+                "SELECT value FROM app_meta WHERE key=?1",
+                [format!("catalog_sync_v1:{chat}")],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|e| e.to_string())?;
+        value
+            .map(|v| v.parse::<i64>().map_err(|e| e.to_string()))
+            .transpose()
+    }
+
+    fn save_sync_checkpoint(&self, chat: i64, message: i64) -> Result<(), String> {
+        self.connection.lock().map_err(|e| e.to_string())?.execute(
+            "INSERT INTO app_meta(key,value) VALUES (?1,?2) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+            params![format!("catalog_sync_v1:{chat}"), message.to_string()],
+        ).map_err(|e| e.to_string())?;
+        Ok(())
+    }
+
+    fn sync_stream_checkpoint(
+        &self,
+        chat: i64,
+        stream: &str,
+        fallback: Option<i64>,
+    ) -> Result<Option<i64>, String> {
+        let connection = self.connection.lock().map_err(|e| e.to_string())?;
+        let key = format!("catalog_sync_v2:{chat}:{stream}");
+        let value: Option<String> = connection
+            .query_row("SELECT value FROM app_meta WHERE key=?1", [&key], |row| {
+                row.get(0)
+            })
+            .optional()
+            .map_err(|e| e.to_string())?;
+        value
+            .map(|v| v.parse::<i64>().map_err(|e| e.to_string()))
+            .transpose()
+            .map(|stored| stored.or(fallback))
+    }
+
+    fn save_sync_stream_checkpoint(
+        &self,
+        chat: i64,
+        stream: &str,
+        message: i64,
+    ) -> Result<(), String> {
+        self.connection
+            .lock()
+            .map_err(|e| e.to_string())?
+            .execute(
+                "INSERT INTO app_meta(key,value) VALUES (?1,?2) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                params![format!("catalog_sync_v2:{chat}:{stream}"), message.to_string()],
+            )
+            .map_err(|e| e.to_string())?;
+        Ok(())
+    }
+
+    fn fast_search_backfill_done(&self, chat: i64) -> Result<bool, String> {
+        let connection = self.connection.lock().map_err(|e| e.to_string())?;
+        let value: Option<String> = connection
+            .query_row(
+                "SELECT value FROM app_meta WHERE key=?1",
+                [format!("catalog_fast_search_v4:{chat}")],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|e| e.to_string())?;
+        Ok(value.as_deref() == Some("1"))
+    }
+
+    fn mark_fast_search_backfill_done(&self, chat: i64) -> Result<(), String> {
+        self.connection
+            .lock()
+            .map_err(|e| e.to_string())?
+            .execute(
+                "INSERT INTO app_meta(key,value) VALUES (?1,'1') ON CONFLICT(key) DO UPDATE SET value='1'",
+                [format!("catalog_fast_search_v4:{chat}")],
+            )
+            .map_err(|e| e.to_string())?;
+        Ok(())
+    }
+
+    fn catalog_remote_count(&self) -> Result<usize, String> {
+        let connection = self.connection.lock().map_err(|e| e.to_string())?;
+        let count: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM files WHERE provider='telegram' AND telegram_message_id IS NOT NULL",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(|e| e.to_string())?;
+        Ok(count.max(0) as usize)
+    }
+
+    fn history_backfill_done(&self, chat: i64) -> Result<bool, String> {
+        let connection = self.connection.lock().map_err(|e| e.to_string())?;
+        let value: Option<String> = connection
+            .query_row(
+                "SELECT value FROM app_meta WHERE key=?1",
+                [format!("catalog_history_backfill_v3:{chat}")],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|e| e.to_string())?;
+        Ok(value.as_deref() == Some("1"))
+    }
+
+    fn mark_history_backfill_done(&self, chat: i64) -> Result<(), String> {
+        self.connection
+            .lock()
+            .map_err(|e| e.to_string())?
+            .execute(
+                "INSERT INTO app_meta(key,value) VALUES (?1,'1') ON CONFLICT(key) DO UPDATE SET value='1'",
+                [format!("catalog_history_backfill_v3:{chat}")],
+            )
+            .map_err(|e| e.to_string())?;
+        Ok(())
+    }
+
+    fn catalog_oldest_message_id(&self) -> Result<Option<i64>, String> {
+        let connection = self.connection.lock().map_err(|e| e.to_string())?;
+        let raw: Option<String> = connection
+            .query_row(
+                "SELECT telegram_message_id FROM files
+                 WHERE provider='telegram' AND telegram_message_id IS NOT NULL
+                 ORDER BY CAST(telegram_message_id AS INTEGER) ASC LIMIT 1",
+                [],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|e| e.to_string())?;
+        raw.map(|value| {
+            value
+                .parse::<i64>()
+                .map_err(|_| "El catálogo contiene un identificador remoto inválido".to_string())
+        })
+        .transpose()
+    }
+
+    pub fn catalog_bootstrap_required_locally(&self) -> Result<bool, String> {
+        let connection = self.connection.lock().map_err(|e| e.to_string())?;
+        let existing: i64 = connection
+            .query_row(
+                "SELECT EXISTS(
+                    SELECT 1 FROM app_meta
+                    WHERE (key LIKE 'catalog_initial_sync_v1:%' AND value='1')
+                       OR key LIKE 'catalog_sync_v1:%'
+                )",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(|e| e.to_string())?;
+        Ok(existing == 0)
+    }
+
+    fn initial_catalog_sync_needed(&self, chat: i64) -> Result<bool, String> {
+        let connection = self.connection.lock().map_err(|e| e.to_string())?;
+        let key = format!("catalog_initial_sync_v1:{chat}");
+        let done: Option<String> = connection
+            .query_row("SELECT value FROM app_meta WHERE key=?1", [&key], |row| {
+                row.get(0)
+            })
+            .optional()
+            .map_err(|e| e.to_string())?;
+        if done.as_deref() == Some("1") {
+            return Ok(false);
+        }
+        drop(connection);
+
+        // Existing installations already have a chat-scoped catalog checkpoint.
+        // Treat that as a completed bootstrap so upgrading never triggers a full
+        // automatic rescan just because this marker is new.
+        if self.sync_checkpoint(chat)?.is_some() {
+            self.mark_initial_catalog_sync_done(chat)?;
+            return Ok(false);
+        }
+        Ok(true)
+    }
+
+    fn mark_initial_catalog_sync_done(&self, chat: i64) -> Result<(), String> {
+        self.connection
+            .lock()
+            .map_err(|e| e.to_string())?
+            .execute(
+                "INSERT INTO app_meta(key,value) VALUES (?1,'1') ON CONFLICT(key) DO UPDATE SET value='1'",
+                [format!("catalog_initial_sync_v1:{chat}")],
+            )
+            .map_err(|e| e.to_string())?;
+        Ok(())
+    }
+
+    fn should_verify_deleted(&self, chat: i64, interval_seconds: i64) -> Result<bool, String> {
+        let connection = self.connection.lock().map_err(|e| e.to_string())?;
+        let now: i64 = connection
+            .query_row("SELECT unixepoch()", [], |row| row.get(0))
+            .map_err(|e| e.to_string())?;
+        let key = format!("catalog_delete_verify_v2:{chat}");
+        let previous: Option<String> = connection
+            .query_row("SELECT value FROM app_meta WHERE key=?1", [&key], |row| {
+                row.get(0)
+            })
+            .optional()
+            .map_err(|e| e.to_string())?;
+        let Some(previous) = previous else {
+            // The new persistent delete-event protocol covers Nuvio-to-Nuvio deletes.
+            // Seed the timer on upgrade instead of forcing thousands of getMessages
+            // calls during the user's first fast sync. Direct Telegram deletions are
+            // still caught by the periodic deep verification later.
+            connection
+                .execute(
+                    "INSERT INTO app_meta(key,value) VALUES (?1,?2)",
+                    params![key, now.to_string()],
+                )
+                .map_err(|e| e.to_string())?;
+            return Ok(false);
+        };
+        let previous = previous.parse::<i64>().unwrap_or(0);
+        Ok(now.saturating_sub(previous) >= interval_seconds.max(60))
+    }
+
+    fn mark_deleted_verified(&self, chat: i64) -> Result<(), String> {
+        let connection = self.connection.lock().map_err(|e| e.to_string())?;
+        let now: i64 = connection
+            .query_row("SELECT unixepoch()", [], |row| row.get(0))
+            .map_err(|e| e.to_string())?;
+        connection
+            .execute(
+                "INSERT INTO app_meta(key,value) VALUES (?1,?2) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                params![format!("catalog_delete_verify_v2:{chat}"), now.to_string()],
+            )
+            .map_err(|e| e.to_string())?;
+        Ok(())
+    }
+
+    fn trash_backfill_done(&self, chat: i64) -> Result<bool, String> {
+        let connection = self.connection.lock().map_err(|e| e.to_string())?;
+        let found: Option<String> = connection
+            .query_row(
+                "SELECT value FROM app_meta WHERE key=?1",
+                [format!("trash_sync_backfill_v1:{chat}")],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|e| e.to_string())?;
+        Ok(found.as_deref() == Some("1"))
+    }
+
+    fn mark_trash_backfill_done(&self, chat: i64) -> Result<(), String> {
+        self.connection.lock().map_err(|e| e.to_string())?.execute(
+            "INSERT INTO app_meta(key,value) VALUES (?1,'1') ON CONFLICT(key) DO UPDATE SET value='1'",
+            [format!("trash_sync_backfill_v1:{chat}")],
+        ).map_err(|e| e.to_string())?;
+        Ok(())
+    }
+
+    fn trashed_remote_message_ids(&self) -> Result<Vec<i64>, String> {
+        let connection = self.connection.lock().map_err(|e| e.to_string())?;
+        let mut statement = connection
+            .prepare(
+                "SELECT telegram_message_id FROM files WHERE provider='telegram' AND trashed=1 AND telegram_message_id IS NOT NULL ORDER BY rowid",
+            )
+            .map_err(|e| e.to_string())?;
+        let rows = statement
+            .query_map([], |row| row.get::<_, String>(0))
+            .map_err(|e| e.to_string())?;
+        let mut ids = Vec::new();
+        for row in rows {
+            let raw = row.map_err(|e| e.to_string())?;
+            ids.push(raw.parse::<i64>().map_err(|_| {
+                "El catálogo contiene un identificador remoto inválido".to_string()
+            })?);
+        }
+        Ok(ids)
+    }
+
+    fn catalog_message_ids(&self) -> Result<Vec<i64>, String> {
+        let connection = self.connection.lock().map_err(|e| e.to_string())?;
+        let mut statement = connection
+            .prepare(
+                "SELECT telegram_message_id FROM files WHERE provider='telegram' AND telegram_message_id IS NOT NULL ORDER BY rowid",
+            )
+            .map_err(|e| e.to_string())?;
+        let rows = statement
+            .query_map([], |row| row.get::<_, String>(0))
+            .map_err(|e| e.to_string())?;
+        let mut ids = Vec::new();
+        for row in rows {
+            let raw = row.map_err(|e| e.to_string())?;
+            ids.push(raw.parse::<i64>().map_err(|_| {
+                "El catálogo contiene un identificador remoto inválido".to_string()
+            })?);
+        }
+        Ok(ids)
+    }
 }
 
 #[cfg(any(test, target_os = "android"))]
@@ -178,19 +512,27 @@ impl CatalogRepository {
         let tx = connection.transaction().map_err(|e| e.to_string())?;
 
         if !moves.is_empty() {
+            let valid_folders: std::collections::HashSet<String> = {
+                let mut folders = tx
+                    .prepare("SELECT id FROM folders WHERE trashed=0")
+                    .map_err(|e| e.to_string())?;
+                let rows = folders
+                    .query_map([], |row| row.get::<_, String>(0))
+                    .map_err(|e| e.to_string())?;
+                let mut ids = std::collections::HashSet::new();
+                for row in rows {
+                    ids.insert(row.map_err(|e| e.to_string())?);
+                }
+                ids
+            };
             let mut stmt = tx
                 .prepare("UPDATE file_locations SET folder_id=?1 WHERE file_id=?2")
                 .map_err(|e| e.to_string())?;
             for (&message_id, target_folder) in moves {
-                let file_id = format!("tg-{}", message_id);
-                let valid_folder = target_folder.as_deref().filter(|fid| {
-                    tx.query_row(
-                        "SELECT 1 FROM folders WHERE id=?1 AND trashed=0",
-                        [fid],
-                        |_| Ok(()),
-                    )
-                    .is_ok()
-                });
+                let file_id = format!("tg-{message_id}");
+                let valid_folder = target_folder
+                    .as_deref()
+                    .filter(|fid| valid_folders.contains(*fid));
                 let _ = stmt.execute(params![valid_folder, file_id]);
             }
         }
@@ -203,6 +545,28 @@ impl CatalogRepository {
         )
         .map_err(|e| e.to_string())?;
 
+        tx.commit().map_err(|e| e.to_string())?;
+        Ok(())
+    }
+
+    pub fn reconcile_trash_states(
+        &self,
+        trash_states: &std::collections::HashMap<i64, bool>,
+    ) -> Result<(), String> {
+        if trash_states.is_empty() {
+            return Ok(());
+        }
+        let mut connection = self.connection.lock().map_err(|e| e.to_string())?;
+        let tx = connection.transaction().map_err(|e| e.to_string())?;
+        let mut stmt = tx
+            .prepare("UPDATE files SET trashed=?1 WHERE id=?2")
+            .map_err(|e| e.to_string())?;
+        for (&message_id, &trashed) in trash_states {
+            let file_id = format!("tg-{message_id}");
+            stmt.execute(params![if trashed { 1 } else { 0 }, file_id])
+                .map_err(|e| e.to_string())?;
+        }
+        drop(stmt);
         tx.commit().map_err(|e| e.to_string())?;
         Ok(())
     }
@@ -319,66 +683,163 @@ impl CatalogRepository {
         serde_json::from_str(&json).map_err(|e| e.to_string())
     }
 
+    pub fn cache_minithumbnail(&self, id: &str, data: &str) -> Result<(), String> {
+        if data.is_empty() || data.len() > 64 * 1024 {
+            return Ok(());
+        }
+        let mut c = self.connection.lock().map_err(|e| e.to_string())?;
+        let tx = c.transaction().map_err(|e| e.to_string())?;
+        let current: Option<String> = tx
+            .query_row(
+                "SELECT document FROM remote_documents WHERE id=?1",
+                [id],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|e| e.to_string())?;
+        if let Some(raw) = current {
+            let mut doc: RemoteDocument = serde_json::from_str(&raw).map_err(|e| e.to_string())?;
+            if doc.minithumbnail.as_deref() != Some(data) {
+                doc.minithumbnail = Some(data.to_string());
+                tx.execute(
+                    "UPDATE remote_documents SET document=?1 WHERE id=?2",
+                    params![serde_json::to_string(&doc).map_err(|e| e.to_string())?, id],
+                )
+                .map_err(|e| e.to_string())?;
+            }
+        }
+        tx.commit().map_err(|e| e.to_string())?;
+        Ok(())
+    }
+
     pub fn record_remote(&self, doc: &RemoteDocument) -> Result<(), RepositoryError> {
         self.record_remote_batch(std::slice::from_ref(doc))
     }
 
     fn record_remote_batch(&self, documents: &[RemoteDocument]) -> Result<(), RepositoryError> {
+        if documents.is_empty() {
+            return Ok(());
+        }
         let mut c = self.connection.lock().expect("catalog");
         let tx = c.transaction()?;
-        for doc in documents {
-            let id = format!("tg-{}", doc.message_id);
-            let path = Path::new(&doc.name);
-            let ext = path
-                .extension()
-                .and_then(|x| x.to_str())
-                .unwrap_or("")
-                .to_lowercase();
-            let name = path
-                .file_stem()
-                .and_then(|x| x.to_str())
-                .unwrap_or(&doc.name);
-            let kind = classify_extension(&ext);
-            tx.execute(
-            "INSERT INTO files (id,name,extension,kind,size_bytes,updated_at,folder,provider,telegram_message_id)
-             VALUES (?1,?2,?3,?4,?5,strftime('%Y-%m-%dT%H:%M:%SZ',?6,'unixepoch'),'Mensajes guardados','telegram',?7)
-             ON CONFLICT(id) DO UPDATE SET name=excluded.name,extension=excluded.extension,kind=excluded.kind,size_bytes=excluded.size_bytes,updated_at=excluded.updated_at",
-            params![id,name,ext,kind,doc.size,doc.date,doc.message_id.to_string()],
-        )?;
-            tx.execute(
-            "INSERT INTO file_locations(file_id,folder_id) VALUES (?1,CASE WHEN EXISTS(SELECT 1 FROM folders WHERE id=?2 AND trashed=0) THEN ?2 ELSE NULL END)
-             ON CONFLICT(file_id) DO UPDATE SET folder_id=COALESCE(excluded.folder_id, file_locations.folder_id)",
-            params![id, doc.folder_id],
-        )?;
-            tx.execute(
-                "INSERT OR REPLACE INTO remote_documents VALUES (?1,?2)",
-                params![id, serde_json::to_string(doc)?],
-            )?;
-            if !doc.transfer.is_empty() {
-                tx.execute(
-                "UPDATE transfers SET status='completed',progress=100,speed_label='Guardado en Telegram' WHERE id=?1 AND direction='upload'",
-                [&doc.transfer],
-            )?;
-                tx.execute(
-                    "UPDATE transfer_metadata SET remote_message_id=?1,error=NULL WHERE transfer_id=?2",
-                    params![doc.message_id.to_string(), doc.transfer],
+        {
+            // Most documents discovered during sync were uploaded on another device or
+            // belong to transfer history that has already been cleared locally. Resolve
+            // only the transfer ids present in this <=100-item page, then skip five
+            // guaranteed-no-op UPDATE/DELETE statements for every other remote row.
+            let candidate_transfers: std::collections::HashSet<&str> = documents
+                .iter()
+                .filter_map(|doc| (!doc.transfer.is_empty()).then_some(doc.transfer.as_str()))
+                .collect();
+            let mut local_transfer_ids = std::collections::HashSet::new();
+            if !candidate_transfers.is_empty() {
+                let placeholders = std::iter::repeat_n("?", candidate_transfers.len())
+                    .collect::<Vec<_>>()
+                    .join(",");
+                let sql = format!(
+                    "SELECT id FROM transfers WHERE direction='upload' AND id IN ({placeholders})"
+                );
+                let mut statement = tx.prepare(&sql)?;
+                let rows = statement.query_map(
+                    rusqlite::params_from_iter(candidate_transfers.iter().copied()),
+                    |row| row.get::<_, String>(0),
                 )?;
-                tx.execute(
-                "UPDATE transfer_runtime SET phase='completed',processed_bytes=total_bytes,speed_bps=0,eta_seconds=0,updated_at=unixepoch(),completed_at=unixepoch() WHERE transfer_id=?1",
-                [&doc.transfer],
+                for row in rows {
+                    local_transfer_ids.insert(row?);
+                }
+            }
+            let active_folder_ids: std::collections::HashSet<String> = {
+                let mut statement = tx.prepare_cached("SELECT id FROM folders WHERE trashed=0")?;
+                let rows = statement.query_map([], |row| row.get::<_, String>(0))?;
+                let mut ids = std::collections::HashSet::new();
+                for row in rows {
+                    ids.insert(row?);
+                }
+                ids
+            };
+
+            // Prepare once per batch instead of reparsing SQL statements for every
+            // file. This matters on initial libraries with tens of thousands of docs.
+            let mut file_stmt = tx.prepare_cached(
+                "INSERT INTO files (id,name,extension,kind,size_bytes,updated_at,folder,provider,telegram_message_id)
+                 VALUES (?1,?2,?3,?4,?5,strftime('%Y-%m-%dT%H:%M:%SZ',?6,'unixepoch'),'Mensajes guardados','telegram',?7)
+                 ON CONFLICT(id) DO UPDATE SET name=excluded.name,extension=excluded.extension,kind=excluded.kind,size_bytes=excluded.size_bytes,updated_at=excluded.updated_at",
             )?;
-                tx.execute("DELETE FROM transfer_pending WHERE id=?1", [&doc.transfer])?;
+            let mut location_stmt = tx.prepare_cached(
+                "INSERT INTO file_locations(file_id,folder_id) VALUES (?1,?2)
+                 ON CONFLICT(file_id) DO UPDATE SET folder_id=COALESCE(excluded.folder_id, file_locations.folder_id)",
+            )?;
+            let mut remote_stmt =
+                tx.prepare_cached("INSERT OR REPLACE INTO remote_documents VALUES (?1,?2)")?;
+            let mut transfer_stmt = tx.prepare_cached(
+                "UPDATE transfers SET status='completed',progress=100,speed_label='Guardado en Telegram' WHERE id=?1 AND direction='upload'",
+            )?;
+            let mut metadata_stmt = tx.prepare_cached(
+                "UPDATE transfer_metadata SET remote_message_id=?1,error=NULL WHERE transfer_id=?2",
+            )?;
+            let mut runtime_stmt = tx.prepare_cached(
+                "UPDATE transfer_runtime SET phase='completed',processed_bytes=total_bytes,speed_bps=0,eta_seconds=0,updated_at=unixepoch(),completed_at=unixepoch() WHERE transfer_id=?1",
+            )?;
+            let mut cleanup_ledger_stmt = tx.prepare_cached(
+                "INSERT INTO uploaded_sources(
+                    transfer_id,file_name,source_path,size_bytes,sha256,remote_message_id,
+                    source_deleted,source_delete_error,created_at
+                 )
+                 SELECT t.id,t.file_name,m.source_path,m.size_bytes,m.sha256,?1,
+                        COALESCE(m.source_deleted,0),m.source_delete_error,m.created_at
+                 FROM transfers t JOIN transfer_metadata m ON m.transfer_id=t.id
+                 WHERE t.id=?2 AND t.direction='upload'
+                   AND m.source_path IS NOT NULL AND m.source_path<>'' AND m.sha256<>''
+                 ON CONFLICT(transfer_id) DO UPDATE SET
+                    file_name=excluded.file_name,
+                    source_path=excluded.source_path,
+                    size_bytes=excluded.size_bytes,
+                    sha256=excluded.sha256,
+                    remote_message_id=excluded.remote_message_id,
+                    source_deleted=MAX(uploaded_sources.source_deleted,excluded.source_deleted),
+                    source_delete_error=CASE WHEN uploaded_sources.source_deleted=1 THEN NULL ELSE excluded.source_delete_error END",
+            )?;
+            let mut pending_stmt = tx.prepare_cached("DELETE FROM transfer_pending WHERE id=?1")?;
+
+            for doc in documents {
+                let id = format!("tg-{}", doc.message_id);
+                let path = Path::new(&doc.name);
+                let ext = path
+                    .extension()
+                    .and_then(|x| x.to_str())
+                    .unwrap_or("")
+                    .to_lowercase();
+                let name = path
+                    .file_stem()
+                    .and_then(|x| x.to_str())
+                    .unwrap_or(&doc.name);
+                let kind = classify_extension(&ext);
+                file_stmt.execute(params![
+                    id,
+                    name,
+                    ext,
+                    kind,
+                    doc.size,
+                    doc.date,
+                    doc.message_id.to_string()
+                ])?;
+                let valid_folder = doc
+                    .folder_id
+                    .as_deref()
+                    .filter(|folder| active_folder_ids.contains(*folder));
+                location_stmt.execute(params![id, valid_folder])?;
+                remote_stmt.execute(params![id, serde_json::to_string(doc)?])?;
+                if !doc.transfer.is_empty() && local_transfer_ids.contains(&doc.transfer) {
+                    transfer_stmt.execute([&doc.transfer])?;
+                    metadata_stmt.execute(params![doc.message_id.to_string(), doc.transfer])?;
+                    runtime_stmt.execute([&doc.transfer])?;
+                    cleanup_ledger_stmt
+                        .execute(params![doc.message_id.to_string(), doc.transfer])?;
+                    pending_stmt.execute([&doc.transfer])?;
+                }
             }
         }
         tx.commit()?;
-        Ok(())
-    }
-
-    pub fn trash(&self, id: &str, trashed: bool) -> Result<(), RepositoryError> {
-        self.connection.lock().expect("catalog").execute(
-            "UPDATE files SET trashed=?1 WHERE id=?2",
-            params![trashed, id],
-        )?;
         Ok(())
     }
 
@@ -562,7 +1023,7 @@ fn download_target_taken(c: &rusqlite::Connection, path: &Path) -> Result<bool, 
     Ok(false)
 }
 
-fn classify_extension(ext: &str) -> &'static str {
+pub(crate) fn classify_extension(ext: &str) -> &'static str {
     match ext {
         "jpg" | "jpeg" | "png" | "webp" | "gif" | "heic" | "heif" | "bmp" | "tif" | "tiff"
         | "svg" | "avif" | "ico" | "raw" | "dng" | "cr2" | "nef" | "arw" => "image",
@@ -651,6 +1112,11 @@ fn document(message: &t::Message) -> Option<RemoteDocument> {
         date: message.date,
         sha256: caption.sha256,
         folder_id: caption.folder_id,
+        minithumbnail: content
+            .document
+            .minithumbnail
+            .as_ref()
+            .map(|mini| mini.data.clone()),
     })
 }
 
@@ -688,15 +1154,53 @@ fn file_move_event(message: &t::Message) -> Option<FileMoveEvent> {
     Some(event)
 }
 
+fn parse_file_trash_text(text: &str) -> Option<FileTrashEvent> {
+    let payload = text.strip_prefix("#NuvioTrash1 ")?;
+    let event: FileTrashEvent = serde_json::from_str(payload).ok()?;
+    if event.v != 1 || event.message_ids.is_empty() || event.message_ids.len() > 100 {
+        return None;
+    }
+    Some(event)
+}
+
+fn file_trash_event(message: &t::Message) -> Option<FileTrashEvent> {
+    if message.sending_state.is_some() {
+        return None;
+    }
+    let e::MessageContent::MessageText(content) = &message.content else {
+        return None;
+    };
+    parse_file_trash_text(&content.text.text)
+}
+
+fn parse_file_delete_text(text: &str) -> Option<FileDeleteEvent> {
+    let payload = text.strip_prefix("#NuvioDelete1 ")?;
+    let event: FileDeleteEvent = serde_json::from_str(payload).ok()?;
+    if event.v != 1 || event.message_ids.is_empty() || event.message_ids.len() > 100 {
+        return None;
+    }
+    Some(event)
+}
+
+fn file_delete_event(message: &t::Message) -> Option<FileDeleteEvent> {
+    if message.sending_state.is_some() {
+        return None;
+    }
+    let e::MessageContent::MessageText(content) = &message.content else {
+        return None;
+    };
+    parse_file_delete_text(&content.text.text)
+}
+
 impl TelegramService {
     pub async fn own_chat(&self, repo: &CatalogRepository) -> Result<i64, String> {
         if !self.refresh().await?.connected {
             return Err("Conecta tu cuenta de Telegram primero".into());
         }
-        let e::User::User(me) = call(f::get_me(self.client_id)).await?;
+        let e::User::User(me) = call(f::get_me(self.client_id())).await?;
         repo.bind_account(me.id)?;
         let e::Chat::Chat(chat) =
-            call(f::create_private_chat(me.id, false, self.client_id)).await?;
+            call(f::create_private_chat(me.id, false, self.client_id())).await?;
         Ok(chat.id)
     }
 
@@ -715,7 +1219,7 @@ impl TelegramService {
             None,
             None,
             content,
-            self.client_id,
+            self.client_id(),
         ))
         .await?;
         if message.sending_state.is_none() {
@@ -848,17 +1352,522 @@ impl TelegramService {
         Ok(changed)
     }
 
+    pub async fn set_files_trashed_synced(
+        &self,
+        repo: &CatalogRepository,
+        ids: &[String],
+        trashed: bool,
+    ) -> Result<usize, String> {
+        if ids.is_empty() {
+            return Ok(0);
+        }
+        if ids.len() > 500 {
+            return Err("Selecciona como máximo 500 archivos por operación".into());
+        }
+        let chat = self.own_chat(repo).await?;
+        let mut changed = 0usize;
+        for chunk in ids.chunks(100) {
+            let mut message_ids = Vec::with_capacity(chunk.len());
+            for id in chunk {
+                message_ids.push(repo.remote(id)?.message_id);
+            }
+            let event = FileTrashEvent {
+                v: 1,
+                message_ids,
+                trashed,
+            };
+            self.send_metadata_text(
+                chat,
+                format!(
+                    "#NuvioTrash1 {}",
+                    serde_json::to_string(&event).map_err(|e| e.to_string())?
+                ),
+            )
+            .await?;
+            changed += repo.trash_many(chunk, trashed).map_err(|e| e.to_string())?;
+        }
+        Ok(changed)
+    }
+
+    async fn folder_events_since(
+        &self,
+        chat: i64,
+        checkpoint: Option<i64>,
+    ) -> Result<(std::collections::HashMap<String, FolderEvent>, i64), String> {
+        let mut events = std::collections::HashMap::new();
+        let mut newest = checkpoint.unwrap_or(0);
+        let mut from_message_id = 0;
+        loop {
+            let e::FoundChatMessages::FoundChatMessages(page) = call(f::search_chat_messages(
+                chat,
+                None,
+                "#NuvioFolder1".to_string(),
+                None,
+                from_message_id,
+                0,
+                100,
+                None,
+                self.client_id(),
+            ))
+            .await?;
+            let next_from_message_id = page.next_from_message_id;
+            let mut reached_checkpoint = false;
+            for message in page.messages {
+                if checkpoint.is_some_and(|saved| message.id <= saved) {
+                    reached_checkpoint = true;
+                    break;
+                }
+                newest = newest.max(message.id);
+                if let Some(event) = folder_event(&message) {
+                    events.entry(event.id.clone()).or_insert(event);
+                }
+            }
+            if reached_checkpoint
+                || next_from_message_id == 0
+                || next_from_message_id == from_message_id
+            {
+                break;
+            }
+            from_message_id = next_from_message_id;
+        }
+        Ok((events, newest))
+    }
+
+    async fn file_move_events_since(
+        &self,
+        chat: i64,
+        checkpoint: Option<i64>,
+    ) -> Result<(std::collections::HashMap<i64, Option<String>>, i64), String> {
+        let mut moves = std::collections::HashMap::new();
+        let mut newest = checkpoint.unwrap_or(0);
+        let mut from_message_id = 0;
+        loop {
+            let e::FoundChatMessages::FoundChatMessages(page) = call(f::search_chat_messages(
+                chat,
+                None,
+                "#NuvioMove1".to_string(),
+                None,
+                from_message_id,
+                0,
+                100,
+                None,
+                self.client_id(),
+            ))
+            .await?;
+            let next_from_message_id = page.next_from_message_id;
+            let mut reached_checkpoint = false;
+            for message in page.messages {
+                if checkpoint.is_some_and(|saved| message.id <= saved) {
+                    reached_checkpoint = true;
+                    break;
+                }
+                newest = newest.max(message.id);
+                if let Some(event) = file_move_event(&message) {
+                    for id in event.message_ids {
+                        moves.entry(id).or_insert_with(|| event.folder_id.clone());
+                    }
+                }
+            }
+            if reached_checkpoint
+                || next_from_message_id == 0
+                || next_from_message_id == from_message_id
+            {
+                break;
+            }
+            from_message_id = next_from_message_id;
+        }
+        Ok((moves, newest))
+    }
+
+    async fn file_trash_events_since(
+        &self,
+        chat: i64,
+        checkpoint: Option<i64>,
+    ) -> Result<(std::collections::HashMap<i64, bool>, i64), String> {
+        let mut states = std::collections::HashMap::new();
+        let mut newest = checkpoint.unwrap_or(0);
+        let mut from_message_id = 0;
+        loop {
+            let e::FoundChatMessages::FoundChatMessages(page) = call(f::search_chat_messages(
+                chat,
+                None,
+                "#NuvioTrash1".to_string(),
+                None,
+                from_message_id,
+                0,
+                100,
+                None,
+                self.client_id(),
+            ))
+            .await?;
+            let next_from_message_id = page.next_from_message_id;
+            let mut reached_checkpoint = false;
+            for message in page.messages {
+                if checkpoint.is_some_and(|saved| message.id <= saved) {
+                    reached_checkpoint = true;
+                    break;
+                }
+                newest = newest.max(message.id);
+                if let Some(event) = file_trash_event(&message) {
+                    for id in event.message_ids {
+                        states.entry(id).or_insert(event.trashed);
+                    }
+                }
+            }
+            if reached_checkpoint
+                || next_from_message_id == 0
+                || next_from_message_id == from_message_id
+            {
+                break;
+            }
+            from_message_id = next_from_message_id;
+        }
+        Ok((states, newest))
+    }
+
+    async fn file_delete_events_since(
+        &self,
+        chat: i64,
+        checkpoint: Option<i64>,
+    ) -> Result<(std::collections::HashSet<i64>, i64), String> {
+        let mut deleted = std::collections::HashSet::new();
+        let mut newest = checkpoint.unwrap_or(0);
+        let mut from_message_id = 0;
+        loop {
+            let e::FoundChatMessages::FoundChatMessages(page) = call(f::search_chat_messages(
+                chat,
+                None,
+                "#NuvioDelete1".to_string(),
+                None,
+                from_message_id,
+                0,
+                100,
+                None,
+                self.client_id(),
+            ))
+            .await?;
+            let next_from_message_id = page.next_from_message_id;
+            let mut reached_checkpoint = false;
+            for message in page.messages {
+                if checkpoint.is_some_and(|saved| message.id <= saved) {
+                    reached_checkpoint = true;
+                    break;
+                }
+                newest = newest.max(message.id);
+                if let Some(event) = file_delete_event(&message) {
+                    deleted.extend(event.message_ids);
+                }
+            }
+            if reached_checkpoint
+                || next_from_message_id == 0
+                || next_from_message_id == from_message_id
+            {
+                break;
+            }
+            from_message_id = next_from_message_id;
+        }
+        Ok((deleted, newest))
+    }
+
+    async fn scan_documents_fast(
+        &self,
+        repo: &CatalogRepository,
+        progress: &crate::progress::SyncRun<'_>,
+        chat: i64,
+        state: &mut HistoryScanState,
+    ) -> Result<FastSearchOutcome, String> {
+        let mut from_message_id = 0;
+        let mut pages = 0usize;
+        let mut outcome = FastSearchOutcome {
+            total_hint: -1,
+            ..FastSearchOutcome::default()
+        };
+        // Publish every received Telegram page immediately. This keeps the UI flowing
+        // even if the next network request stalls, while WAL/NORMAL keeps the 100-row
+        // SQLite transactions cheap enough for large catalogs.
+        let mut pending_documents = Vec::with_capacity(100);
+        let mut pending_trash_states = std::collections::HashMap::new();
+
+        loop {
+            let e::FoundChatMessages::FoundChatMessages(page) = call(f::search_chat_messages(
+                chat,
+                None,
+                "#Nuvio1".to_string(),
+                None,
+                from_message_id,
+                0,
+                100,
+                None,
+                self.client_id(),
+            ))
+            .await?;
+
+            outcome.total_hint = outcome.total_hint.max(page.total_count);
+            let next_from_message_id = page.next_from_message_id;
+
+            for message in page.messages {
+                let Some(mut doc) = document(&message) else {
+                    continue;
+                };
+                outcome.fetched += 1;
+                outcome.oldest_message_id = Some(
+                    outcome
+                        .oldest_message_id
+                        .map_or(doc.message_id, |oldest| oldest.min(doc.message_id)),
+                );
+                state.newest = state.newest.max(doc.message_id);
+                state.scanned += 1;
+
+                if state.deleted_message_ids.contains(&doc.message_id) {
+                    continue;
+                }
+                if let Some(folder) = state.moves.get(&doc.message_id) {
+                    doc.folder_id = folder.clone();
+                } else if doc.folder_id.is_some() {
+                    state.moves.insert(doc.message_id, doc.folder_id.clone());
+                }
+                if let Some(&trashed) = state.trash_states.get(&doc.message_id) {
+                    pending_trash_states.insert(doc.message_id, trashed);
+                }
+                pending_documents.push(doc);
+            }
+
+            if !pending_documents.is_empty() {
+                state.total_documents += pending_documents.len();
+                repo.record_remote_batch(&pending_documents)
+                    .map_err(|e| e.to_string())?;
+                if !pending_trash_states.is_empty() {
+                    repo.reconcile_trash_states(&pending_trash_states)?;
+                }
+                pending_documents.clear();
+                pending_trash_states.clear();
+            }
+
+            progress.scanned(state.scanned, None);
+            pages += 1;
+            if pages == 1 || pages.is_multiple_of(10) {
+                Self::publish_sync_notification(
+                    true,
+                    crate::progress::SyncPhase::Files,
+                    state.scanned,
+                    None,
+                    None,
+                    None,
+                );
+            }
+
+            if next_from_message_id == 0 {
+                outcome.exhausted = true;
+                break;
+            }
+            if next_from_message_id == from_message_id {
+                outcome.stalled = true;
+                break;
+            }
+            from_message_id = next_from_message_id;
+            tokio::task::yield_now().await;
+        }
+
+        if !pending_documents.is_empty() {
+            state.total_documents += pending_documents.len();
+            repo.record_remote_batch(&pending_documents)
+                .map_err(|e| e.to_string())?;
+            if !pending_trash_states.is_empty() {
+                repo.reconcile_trash_states(&pending_trash_states)?;
+            }
+        }
+        Ok(outcome)
+    }
+
+    async fn scan_history_range(
+        &self,
+        repo: &CatalogRepository,
+        progress: &crate::progress::SyncRun<'_>,
+        chat: i64,
+        start_cursor: i64,
+        stop_at: Option<i64>,
+        state: &mut HistoryScanState,
+    ) -> Result<(), String> {
+        let mut cursor = start_cursor;
+        let mut pages = 0usize;
+        // History pages can contain non-Nuvio metadata, but any Nuvio documents that
+        // arrive are committed before requesting the next page so already-received
+        // data is never hidden behind a slow Telegram response.
+        let mut pending_documents = Vec::with_capacity(100);
+        let mut pending_trash_states = std::collections::HashMap::new();
+        loop {
+            let e::Messages::Messages(page) = call(f::get_chat_history(
+                chat,
+                cursor,
+                0,
+                100,
+                false,
+                self.client_id(),
+            ))
+            .await?;
+            let mut last = cursor;
+            let mut reached_checkpoint = false;
+            let mut folders_changed = false;
+
+            for msg in page.messages.into_iter().flatten() {
+                if msg.id == cursor {
+                    continue;
+                }
+                if stop_at.is_some_and(|saved| msg.id <= saved) {
+                    reached_checkpoint = true;
+                    break;
+                }
+                last = msg.id;
+                state.newest = state.newest.max(msg.id);
+
+                if let Some(event) = folder_event(&msg) {
+                    if let std::collections::hash_map::Entry::Vacant(entry) =
+                        state.folders.entry(event.id.clone())
+                    {
+                        entry.insert(event);
+                        folders_changed = true;
+                    }
+                } else if let Some(event) = file_move_event(&msg) {
+                    for id in event.message_ids {
+                        state
+                            .moves
+                            .entry(id)
+                            .or_insert_with(|| event.folder_id.clone());
+                    }
+                } else if let Some(event) = file_trash_event(&msg) {
+                    for id in event.message_ids {
+                        state.trash_states.entry(id).or_insert(event.trashed);
+                    }
+                } else if let Some(event) = file_delete_event(&msg) {
+                    state.deleted_message_ids.extend(event.message_ids);
+                } else if let Some(mut doc) = document(&msg) {
+                    state.scanned += 1;
+                    if state.deleted_message_ids.contains(&doc.message_id) {
+                        continue;
+                    }
+                    if let Some(folder) = state.moves.get(&doc.message_id) {
+                        doc.folder_id = folder.clone();
+                    } else if doc.folder_id.is_some() {
+                        // Preserve the upload-time folder as the fallback location. A
+                        // newer #NuvioMove1 event always wins because it was inserted
+                        // into `moves` first while scanning newest-to-oldest.
+                        state.moves.insert(doc.message_id, doc.folder_id.clone());
+                    }
+                    if let Some(&trashed) = state.trash_states.get(&doc.message_id) {
+                        pending_trash_states.insert(doc.message_id, trashed);
+                    }
+                    pending_documents.push(doc);
+                }
+            }
+
+            if folders_changed {
+                repo.apply_folder_snapshot(state.folders.values().cloned().collect())?;
+            }
+            if !pending_documents.is_empty() {
+                state.total_documents += pending_documents.len();
+                repo.record_remote_batch(&pending_documents)
+                    .map_err(|e| e.to_string())?;
+                if !pending_trash_states.is_empty() {
+                    repo.reconcile_trash_states(&pending_trash_states)?;
+                }
+                pending_documents.clear();
+                pending_trash_states.clear();
+            }
+
+            progress.scanned(state.scanned, None);
+            pages += 1;
+            // System notifications cross the Android bridge. Throttle them to one
+            // update per ~500 discovered Nuvio files; the in-app progress state still
+            // updates every page without this IPC overhead.
+            if pages == 1 || pages.is_multiple_of(5) {
+                Self::publish_sync_notification(
+                    true,
+                    crate::progress::SyncPhase::Files,
+                    state.scanned,
+                    None,
+                    None,
+                    None,
+                );
+            }
+            if reached_checkpoint || last == cursor {
+                break;
+            }
+            cursor = last;
+            tokio::task::yield_now().await;
+        }
+        Ok(())
+    }
+
     pub async fn sync_catalog(&self, repo: &CatalogRepository) -> Result<usize, String> {
+        self.sync_catalog_checked(repo, false).await
+    }
+
+    pub async fn bootstrap_catalog_if_needed(
+        &self,
+        repo: &CatalogRepository,
+    ) -> Result<bool, String> {
+        let chat = self.own_chat(repo).await?;
+        if !repo.initial_catalog_sync_needed(chat)? {
+            return Ok(false);
+        }
+        self.sync_catalog(repo).await?;
+        Ok(true)
+    }
+
+    fn publish_sync_notification(
+        active: bool,
+        phase: crate::progress::SyncPhase,
+        scanned: usize,
+        total: Option<usize>,
+        percent: Option<u8>,
+        error: Option<&str>,
+    ) {
+        let _ = crate::mobile::update_sync_notification(&serde_json::json!({
+            "active": active,
+            "phase": phase,
+            "scanned": scanned,
+            "total": total,
+            "percent": percent,
+            "error": error,
+        }));
+    }
+
+    pub async fn sync_catalog_checked(
+        &self,
+        repo: &CatalogRepository,
+        verify_deleted: bool,
+    ) -> Result<usize, String> {
         let _gate = self.catalog_sync_gate.lock().await;
         let mut progress = crate::progress::SyncRun::new(&self.sync_progress);
-        let result = self.sync_catalog_inner(repo, &progress).await;
+        Self::publish_sync_notification(
+            true,
+            crate::progress::SyncPhase::Starting,
+            0,
+            None,
+            Some(0),
+            None,
+        );
+        let result = self
+            .sync_catalog_inner(repo, &progress, verify_deleted)
+            .await;
         progress.finish(result.as_ref().err().cloned());
-        if let Err(ref err) = result {
-            let _ = crate::mobile::update_sync_notification(&serde_json::json!({
-                "active": false,
-                "error": err,
-                "phase": "error"
-            }));
+        match result.as_ref() {
+            Ok(_) => Self::publish_sync_notification(
+                false,
+                crate::progress::SyncPhase::Complete,
+                0,
+                None,
+                Some(100),
+                None,
+            ),
+            Err(err) => Self::publish_sync_notification(
+                false,
+                crate::progress::SyncPhase::Error,
+                0,
+                None,
+                None,
+                Some(err),
+            ),
         }
         result
     }
@@ -867,198 +1876,199 @@ impl TelegramService {
         &self,
         repo: &CatalogRepository,
         progress: &crate::progress::SyncRun<'_>,
+        verify_deleted: bool,
     ) -> Result<usize, String> {
         let chat = self.own_chat(repo).await?;
-        let total = match tokio::time::timeout(
-            Duration::from_secs(5),
-            call(f::get_chat_message_count(
-                chat,
-                None,
-                e::SearchMessagesFilter::Empty,
-                false,
-                self.client_id,
-            )),
-        )
-        .await
-        {
-            Ok(Ok(e::Count::Count(count))) => usize::try_from(count.count).ok(),
-            _ => None,
+        let checkpoint = repo.sync_checkpoint(chat)?;
+        let document_checkpoint = repo.sync_stream_checkpoint(chat, "documents", checkpoint)?;
+        let history_backfill_needed = !repo.history_backfill_done(chat)?;
+        let fast_search_backfill_needed = !repo.fast_search_backfill_done(chat)?;
+        let existing_remote_count = if fast_search_backfill_needed {
+            repo.catalog_remote_count()?
+        } else {
+            0
         };
-        let mut scanned = 0;
-        progress.scanned(scanned, total);
-        let _ = crate::mobile::update_sync_notification(&serde_json::json!({
-            "active": true,
-            "scanned": scanned,
-            "total": total,
-            "percent": null,
-            "phase": "scanning"
-        }));
-        let mut latest_folder_events = std::collections::HashMap::<String, FolderEvent>::new();
-        let mut latest_moves = std::collections::HashMap::<i64, Option<String>>::new();
+        let oldest_known_message = if history_backfill_needed || fast_search_backfill_needed {
+            repo.catalog_oldest_message_id()?
+        } else {
+            None
+        };
+        let folder_checkpoint = repo.sync_stream_checkpoint(chat, "folders", checkpoint)?;
+        let move_checkpoint = repo.sync_stream_checkpoint(chat, "moves", checkpoint)?;
+        let trash_checkpoint = repo.sync_stream_checkpoint(chat, "trash", checkpoint)?;
+        let delete_checkpoint = repo.sync_stream_checkpoint(chat, "deletes", checkpoint)?;
 
-        // 1. CARGAR CARPETAS Y MOVIMIENTOS PRIMERO
-        let _ = crate::mobile::update_sync_notification(&serde_json::json!({
-            "active": true,
-            "scanned": 0,
-            "total": total,
-            "percent": 5,
-            "phase": "folders"
-        }));
-
-        let mut from_msg = 0;
-        while let Ok(e::FoundChatMessages::FoundChatMessages(page)) = call(f::search_chat_messages(
-            chat,
-            None,
-            "#NuvioFolder1".to_string(),
-            None,
-            from_msg,
+        // Folders, moves, trash and permanent-delete metadata are independent searches.
+        // Give every stream its own checkpoint so delayed Telegram search indexing in
+        // one stream can never cause another stream to skip a message permanently.
+        progress.phase(crate::progress::SyncPhase::Folders);
+        Self::publish_sync_notification(
+            true,
+            crate::progress::SyncPhase::Folders,
             0,
-            100,
             None,
-            self.client_id,
-        )).await {
-            let mut last_id = from_msg;
-            let mut found = false;
-            for msg in page.messages {
-                if msg.id == from_msg { continue; }
-                found = true;
-                last_id = msg.id;
-                if let Some(event) = folder_event(&msg) {
-                    latest_folder_events.entry(event.id.clone()).or_insert(event);
+            Some(3),
+            None,
+        );
+        let (
+            (folders, folder_newest),
+            (moves, move_newest),
+            (trash_states, trash_newest),
+            (deleted_message_ids, delete_newest),
+        ) = tokio::try_join!(
+            self.folder_events_since(chat, folder_checkpoint),
+            self.file_move_events_since(chat, move_checkpoint),
+            self.file_trash_events_since(chat, trash_checkpoint),
+            self.file_delete_events_since(chat, delete_checkpoint),
+        )?;
+        let mut state = HistoryScanState {
+            folders,
+            moves,
+            trash_states,
+            deleted_message_ids,
+            scanned: 0,
+            total_documents: 0,
+            newest: document_checkpoint.unwrap_or(0),
+        };
+        if !state.folders.is_empty() {
+            repo.apply_folder_snapshot(state.folders.values().cloned().collect())?;
+        }
+
+        // Fast path for first/bootstrap repair: search only Nuvio captions and follow
+        // TDLib's official next_from_message_id cursor. Older builds incorrectly used
+        // the last returned message as the cursor and could stop at exactly 10k.
+        // Keep history pagination as an automatic integrity fallback if TDLib reports
+        // a suspiciously incomplete search.
+        if fast_search_backfill_needed {
+            let fast = self
+                .scan_documents_fast(repo, progress, chat, &mut state)
+                .await?;
+            let hinted_total = fast.total_hint.max(0) as usize;
+            let approximate_gap = hinted_total.saturating_sub(fast.fetched);
+            let same_oldest_as_catalog =
+                oldest_known_message.is_some() && fast.oldest_message_id == oldest_known_message;
+            let suspicious_truncation = fast.stalled
+                || !fast.exhausted
+                || approximate_gap > 500
+                || (existing_remote_count == 10_000
+                    && fast.fetched <= 10_000
+                    && same_oldest_as_catalog);
+
+            // Search indexing can lag for very recent cross-device uploads. A short
+            // history head scan up to the saved document checkpoint catches those
+            // without turning normal sync into a full-history traversal.
+            if document_checkpoint.is_some() {
+                self.scan_history_range(repo, progress, chat, 0, document_checkpoint, &mut state)
+                    .await?;
+            }
+
+            if suspicious_truncation {
+                if let Some(oldest) = fast.oldest_message_id.or(oldest_known_message) {
+                    self.scan_history_range(repo, progress, chat, oldest, None, &mut state)
+                        .await?;
+                } else {
+                    self.scan_history_range(repo, progress, chat, 0, None, &mut state)
+                        .await?;
                 }
             }
-            if !found || last_id == from_msg { break; }
-            from_msg = last_id;
+        } else {
+            // After the one-time fast backfill, correctness wins over search-index
+            // freshness: incremental sync walks only the tiny history range newer than
+            // the saved checkpoint and therefore catches unindexed messages too.
+            self.scan_history_range(repo, progress, chat, 0, document_checkpoint, &mut state)
+                .await?;
         }
 
-        from_msg = 0;
-        while let Ok(e::FoundChatMessages::FoundChatMessages(page)) = call(f::search_chat_messages(
-            chat,
-            None,
-            "#NuvioMove1".to_string(),
-            None,
-            from_msg,
-            0,
-            100,
-            None,
-            self.client_id,
-        )).await {
-            let mut last_id = from_msg;
-            let mut found = false;
-            for msg in page.messages {
-                if msg.id == from_msg { continue; }
-                found = true;
-                last_id = msg.id;
-                if let Some(event) = file_move_event(&msg) {
-                    for id in event.message_ids {
-                        latest_moves.entry(id).or_insert_with(|| event.folder_id.clone());
-                    }
-                }
-            }
-            if !found || last_id == from_msg { break; }
-            from_msg = last_id;
-        }
-
-        if !latest_folder_events.is_empty() {
-            let _ = repo.apply_folder_snapshot(latest_folder_events.values().cloned().collect());
-        }
-
-        let mut cursor = 0;
-        let mut total_documents = 0usize;
-        let mut pending_documents = Vec::new();
-        let mut last_flush = Instant::now();
-
-        // 2. SINCRONIZAR ARCHIVOS E IMÁGENES EN SUS CARPETAS CORRESPONDIENTES
-        loop {
-            let e::Messages::Messages(page) = call(f::get_chat_history(
-                chat,
-                cursor,
-                0,
-                100,
-                false,
-                self.client_id,
-            ))
-            .await?;
-            let mut last = cursor;
-            let mut found = false;
-            let mut has_new_folders = false;
-            for msg in page.messages.into_iter().flatten() {
-                if msg.id == cursor {
-                    continue;
-                }
-                found = true;
-                scanned += 1;
-                last = msg.id;
-                if let Some(event) = folder_event(&msg) {
-                    let is_new = match latest_folder_events.entry(event.id.clone()) {
-                        std::collections::hash_map::Entry::Vacant(v) => {
-                            v.insert(event);
-                            true
+        let mut missing: Vec<String> = state
+            .deleted_message_ids
+            .iter()
+            .map(|id| format!("tg-{id}"))
+            .collect();
+        if verify_deleted && repo.should_verify_deleted(chat, 24 * 60 * 60)? {
+            // Deep verification is now a periodic safety net for messages deleted
+            // directly in Telegram. Nuvio-to-Nuvio deletes use #NuvioDelete1 and do
+            // not require probing every known message on each manual sync.
+            let known = repo.catalog_message_ids()?;
+            for batch in known.chunks(100) {
+                let e::Messages::Messages(page) =
+                    call(f::get_messages(chat, batch.to_vec(), self.client_id())).await?;
+                let returned: Vec<_> = page
+                    .messages
+                    .iter()
+                    .map(|msg| msg.as_ref().map(|m| m.id))
+                    .collect();
+                missing.extend(confirmed_missing(batch, &returned)?);
+                for message in page.messages.into_iter().flatten() {
+                    if let e::MessageContent::MessageDocument(content) = &message.content {
+                        if let Some(mini) = content.document.minithumbnail.as_ref() {
+                            let _ =
+                                repo.cache_minithumbnail(&format!("tg-{}", message.id), &mini.data);
                         }
-                        std::collections::hash_map::Entry::Occupied(_) => false,
-                    };
-                    if is_new {
-                        has_new_folders = true;
                     }
-                } else if let Some(event) = file_move_event(&msg) {
-                    for message_id in event.message_ids {
-                        latest_moves
-                            .entry(message_id)
-                            .or_insert_with(|| event.folder_id.clone());
-                    }
-                } else if let Some(doc) = document(&msg) {
-                    let mut doc_to_save = doc.clone();
-                    if let Some(moved) = latest_moves.get(&doc.message_id) {
-                        doc_to_save.folder_id = moved.clone();
-                    }
-                    pending_documents.push(doc_to_save);
-                    total_documents += 1;
                 }
             }
-            if has_new_folders {
-                let _ = repo.apply_folder_snapshot(latest_folder_events.values().cloned().collect());
+            repo.mark_deleted_verified(chat)?;
+        }
+        missing.sort_unstable();
+        missing.dedup();
+
+        progress.applying(0, state.total_documents.max(1));
+        Self::publish_sync_notification(
+            true,
+            crate::progress::SyncPhase::Applying,
+            state.scanned,
+            None,
+            Some(90),
+            None,
+        );
+        repo.reconcile_moves_and_orphans(&state.moves)?;
+        repo.reconcile_trash_states(&state.trash_states)?;
+        repo.remove_catalog_files(&missing)
+            .map_err(|e| e.to_string())?;
+
+        // v1.2.2 and older stored Papelera only in the local SQLite catalog. On the
+        // first sync after upgrading, publish only legacy `trashed=true` states so
+        // an existing Windows/Android mismatch heals without a non-trashed device
+        // overwriting a deletion made on the other device. Any newer remote restore
+        // event has already been applied above and therefore suppresses this backfill.
+        if !repo.trash_backfill_done(chat)? {
+            let legacy_trashed = repo.trashed_remote_message_ids()?;
+            for chunk in legacy_trashed.chunks(100) {
+                let event = FileTrashEvent {
+                    v: 1,
+                    message_ids: chunk.to_vec(),
+                    trashed: true,
+                };
+                self.send_metadata_text(
+                    chat,
+                    format!(
+                        "#NuvioTrash1 {}",
+                        serde_json::to_string(&event).map_err(|e| e.to_string())?
+                    ),
+                )
+                .await?;
             }
-            if pending_documents.len() >= 150 || (last_flush.elapsed() >= Duration::from_millis(1200) && !pending_documents.is_empty()) {
-                let _ = repo.record_remote_batch(&pending_documents);
-                pending_documents.clear();
-                last_flush = Instant::now();
-            }
-            progress.scanned(scanned, total);
-            let percent = total.filter(|n| *n > 0).map(|n| ((scanned as f64 / n as f64 * 90.0) as u8).min(89));
-            let _ = crate::mobile::update_sync_notification(&serde_json::json!({
-                "active": true,
-                "scanned": scanned,
-                "total": total,
-                "percent": percent,
-                "phase": "files"
-            }));
-            if !found || last == cursor {
-                break;
-            }
-            cursor = last;
-            tokio::time::sleep(Duration::from_millis(60)).await;
+            repo.mark_trash_backfill_done(chat)?;
         }
 
-        if !pending_documents.is_empty() {
-            let _ = repo.record_remote_batch(&pending_documents);
-            pending_documents.clear();
+        // Advance checkpoints only after every request and local reconciliation
+        // succeeded. Metadata streams are independent from document search so a
+        // delayed Telegram index in one stream cannot hide another stream's events.
+        repo.save_sync_checkpoint(chat, state.newest)?;
+        repo.save_sync_stream_checkpoint(chat, "documents", state.newest)?;
+        repo.save_sync_stream_checkpoint(chat, "folders", folder_newest)?;
+        repo.save_sync_stream_checkpoint(chat, "moves", move_newest)?;
+        repo.save_sync_stream_checkpoint(chat, "trash", trash_newest)?;
+        repo.save_sync_stream_checkpoint(chat, "deletes", delete_newest)?;
+        if history_backfill_needed {
+            repo.mark_history_backfill_done(chat)?;
         }
-
-        progress.applying(0, total_documents.max(1));
-        repo.apply_folder_snapshot(latest_folder_events.into_values().collect())?;
-
-        // Reconciliación atómica instantánea (1 ms) para movimientos y carpetas huérfanas
-        repo.reconcile_moves_and_orphans(&latest_moves)?;
-
-        progress.applying(total_documents, total_documents.max(1));
-        let _ = crate::mobile::update_sync_notification(&serde_json::json!({
-            "active": false,
-            "scanned": scanned,
-            "total": total,
-            "percent": 100,
-            "phase": "complete"
-        }));
-        Ok(total_documents)
+        if fast_search_backfill_needed {
+            repo.mark_fast_search_backfill_done(chat)?;
+        }
+        repo.mark_initial_catalog_sync_done(chat)?;
+        progress.applying(state.total_documents, state.total_documents.max(1));
+        Ok(state.total_documents)
     }
 
     pub async fn delete_files_permanently(
@@ -1097,9 +2107,31 @@ impl TelegramService {
             message_ids.push(repo.remote(id)?.message_id);
         }
         let chat = self.own_chat(repo).await?;
-        call(f::delete_messages(chat, message_ids, true, self.client_id)).await?;
-        repo.remove_catalog_files(&unique_ids)
-            .map_err(|e| e.to_string())
+        call(f::delete_messages(
+            chat,
+            message_ids.clone(),
+            true,
+            self.client_id(),
+        ))
+        .await?;
+
+        // Persist the cross-device tombstone before forgetting the local row. If the
+        // metadata send fails, keep the trashed local entry so the user can retry
+        // instead of silently creating a Windows/Android catalog divergence.
+        let event = FileDeleteEvent { v: 1, message_ids };
+        self.send_metadata_text(
+            chat,
+            format!(
+                "#NuvioDelete1 {}",
+                serde_json::to_string(&event).map_err(|e| e.to_string())?
+            ),
+        )
+        .await?;
+
+        let removed = repo
+            .remove_catalog_files(&unique_ids)
+            .map_err(|e| e.to_string())?;
+        Ok(removed)
     }
 
     pub async fn run_upload(&self, repo: &CatalogRepository, job: &WorkItem) -> Result<(), String> {
@@ -1165,7 +2197,7 @@ impl TelegramService {
                 None,
                 None,
                 content,
-                self.client_id,
+                self.client_id(),
             ))
             .await;
             let e::Message::Message(message) = match send_result {
@@ -1196,7 +2228,7 @@ impl TelegramService {
                         chat,
                         vec![pending],
                         true,
-                        self.client_id,
+                        self.client_id(),
                     ))
                     .await;
                 }
@@ -1229,7 +2261,7 @@ impl TelegramService {
                 }
             }
 
-            match call(f::get_message(chat, pending, self.client_id)).await {
+            match call(f::get_message(chat, pending, self.client_id())).await {
                 Ok(e::Message::Message(message)) => {
                     if let Some(doc) = document(&message) {
                         repo.record_remote(&doc).map_err(|e| e.to_string())?;
@@ -1241,7 +2273,7 @@ impl TelegramService {
                     }
                     if let e::MessageContent::MessageDocument(content) = message.content {
                         if let Ok(e::File::File(file)) =
-                            call(f::get_file(content.document.document.id, self.client_id)).await
+                            call(f::get_file(content.document.document.id, self.client_id())).await
                         {
                             repo.set_td_file_id(&job.id, file.id)
                                 .map_err(|e| e.to_string())?;
@@ -1298,21 +2330,21 @@ impl TelegramService {
         let chat = self.own_chat(repo).await?;
         let message_id = job.pending.ok_or("Falta la referencia de Telegram")?;
         let e::Message::Message(message) =
-            call(f::get_message(chat, message_id, self.client_id)).await?;
+            call(f::get_message(chat, message_id, self.client_id())).await?;
         let e::MessageContent::MessageDocument(content) = message.content else {
             return Err("El mensaje ya no contiene el archivo".into());
         };
         let file_id = content.document.document.id;
         repo.set_td_file_id(&job.id, file_id)
             .map_err(|e| e.to_string())?;
-        call(f::download_file(file_id, 16, 0, 0, false, self.client_id)).await?;
+        call(f::download_file(file_id, 16, 0, 0, false, self.client_id())).await?;
         let deadline = Instant::now() + Duration::from_secs(3600);
         let mut estimator = SpeedEstimator::new(0);
 
         while Instant::now() < deadline {
             let control = repo.transfer_control(&job.id).map_err(|e| e.to_string())?;
             if control.pause_requested || control.cancel_requested {
-                let _ = call(f::cancel_download_file(file_id, false, self.client_id)).await;
+                let _ = call(f::cancel_download_file(file_id, false, self.client_id())).await;
                 if control.cancel_requested {
                     repo.mark_cancelled(&job.id).map_err(|e| e.to_string())?;
                 } else {
@@ -1321,7 +2353,7 @@ impl TelegramService {
                 return Ok(());
             }
 
-            let e::File::File(file) = call(f::get_file(file_id, self.client_id)).await?;
+            let e::File::File(file) = call(f::get_file(file_id, self.client_id())).await?;
             if file.local.is_downloading_completed {
                 repo.update_runtime(
                     &job.id,
@@ -1423,9 +2455,349 @@ pub fn verified_copy(
     Ok(())
 }
 
+fn confirmed_missing(expected: &[i64], returned: &[Option<i64>]) -> Result<Vec<String>, String> {
+    if expected.len() != returned.len() {
+        return Err(
+            "Telegram devolvió una comprobación incompleta; se conservaron los archivos.".into(),
+        );
+    }
+    let mut missing = Vec::new();
+    for (id, actual) in expected.iter().zip(returned) {
+        match actual {
+            None => missing.push(format!("tg-{id}")),
+            Some(actual) if actual == id => {}
+            Some(_) => {
+                return Err(
+                    "Telegram devolvió mensajes inesperados; se conservaron los archivos.".into(),
+                )
+            }
+        }
+    }
+    Ok(missing)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn startup_bootstrap_runs_only_for_a_fresh_catalog() {
+        let fresh = tempfile::tempdir().unwrap();
+        let fresh_repo = CatalogRepository::open(&fresh.path().join("db")).unwrap();
+        fresh_repo.init_cloud().unwrap();
+        assert!(fresh_repo.catalog_bootstrap_required_locally().unwrap());
+
+        fresh_repo.save_sync_checkpoint(42, 100).unwrap();
+        assert!(!fresh_repo.catalog_bootstrap_required_locally().unwrap());
+
+        let marked = tempfile::tempdir().unwrap();
+        let marked_repo = CatalogRepository::open(&marked.path().join("db")).unwrap();
+        marked_repo.init_cloud().unwrap();
+        marked_repo.mark_initial_catalog_sync_done(77).unwrap();
+        assert!(!marked_repo.catalog_bootstrap_required_locally().unwrap());
+    }
+
+    #[test]
+    fn sync_checkpoint_survives_restart_and_is_scoped_to_chat() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("db");
+        {
+            let repo = CatalogRepository::open(&path).unwrap();
+            repo.init_cloud().unwrap();
+            assert_eq!(repo.sync_checkpoint(1).unwrap(), None);
+            repo.save_sync_checkpoint(1, 50).unwrap();
+            assert_eq!(
+                repo.sync_stream_checkpoint(1, "folders", Some(50)).unwrap(),
+                Some(50)
+            );
+            repo.save_sync_stream_checkpoint(1, "folders", 44).unwrap();
+            repo.record_remote(&test_document(100, "local-upload.txt"))
+                .unwrap();
+            assert_eq!(repo.sync_checkpoint(1).unwrap(), Some(50));
+            assert_eq!(
+                repo.sync_stream_checkpoint(1, "folders", Some(50)).unwrap(),
+                Some(44)
+            );
+        }
+        let repo = CatalogRepository::open(&path).unwrap();
+        assert_eq!(repo.sync_checkpoint(1).unwrap(), Some(50));
+        assert_eq!(repo.sync_checkpoint(2).unwrap(), None);
+        assert_eq!(
+            repo.sync_stream_checkpoint(1, "folders", Some(50)).unwrap(),
+            Some(44)
+        );
+        assert_eq!(
+            repo.sync_stream_checkpoint(1, "moves", Some(50)).unwrap(),
+            Some(50)
+        );
+        assert_eq!(
+            repo.sync_stream_checkpoint(2, "folders", None).unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn history_backfill_marker_and_oldest_message_are_chat_scoped() {
+        let root = tempfile::tempdir().unwrap();
+        let repo = CatalogRepository::open(&root.path().join("db")).unwrap();
+        repo.init_cloud().unwrap();
+        assert!(!repo.history_backfill_done(1).unwrap());
+        assert_eq!(repo.catalog_oldest_message_id().unwrap(), None);
+
+        repo.record_remote(&test_document(20_000, "newer.txt"))
+            .unwrap();
+        repo.record_remote(&test_document(10_001, "oldest-known.txt"))
+            .unwrap();
+        assert_eq!(repo.catalog_oldest_message_id().unwrap(), Some(10_001));
+
+        repo.mark_history_backfill_done(1).unwrap();
+        assert!(repo.history_backfill_done(1).unwrap());
+        assert!(!repo.history_backfill_done(2).unwrap());
+    }
+
+    #[test]
+    fn catalog_has_no_ten_thousand_file_ceiling() {
+        let root = tempfile::tempdir().unwrap();
+        let repo = CatalogRepository::open(&root.path().join("db")).unwrap();
+        repo.init_cloud().unwrap();
+        const TOTAL: i64 = 30_123;
+        for first in (1..=TOTAL).step_by(100) {
+            let last = (first + 99).min(TOTAL);
+            let mut batch = Vec::with_capacity((last - first + 1) as usize);
+            for message_id in first..=last {
+                let mut doc = test_document(message_id, &format!("file-{message_id}.bin"));
+                doc.transfer.clear();
+                batch.push(doc);
+            }
+            repo.record_remote_batch(&batch).unwrap();
+        }
+        assert_eq!(repo.list_files().unwrap().len(), TOTAL as usize);
+        assert_eq!(repo.catalog_message_ids().unwrap().len(), TOTAL as usize);
+        assert_eq!(repo.sync_file_delta(0).unwrap().1.len(), TOTAL as usize);
+        assert_eq!(repo.catalog_oldest_message_id().unwrap(), Some(1));
+    }
+
+    #[test]
+    fn deletion_verification_rejects_partial_or_unrelated_results() {
+        assert!(confirmed_missing(&[1, 2], &[None]).is_err());
+        assert!(confirmed_missing(&[1, 2], &[None, Some(3)]).is_err());
+        assert_eq!(
+            confirmed_missing(&[1, 2], &[None, Some(2)]).unwrap(),
+            vec!["tg-1"]
+        );
+    }
+
+    #[test]
+    fn permanent_delete_metadata_is_compact_and_parseable() {
+        let encoded = format!(
+            "#NuvioDelete1 {}",
+            serde_json::to_string(&FileDeleteEvent {
+                v: 1,
+                message_ids: vec![41, 42, 43],
+            })
+            .unwrap()
+        );
+        let parsed = parse_file_delete_text(&encoded).expect("valid delete event");
+        assert_eq!(parsed.message_ids, vec![41, 42, 43]);
+        assert!(parse_file_delete_text("#NuvioDelete1 {\"v\":2,\"message_ids\":[1]}").is_none());
+    }
+
+    #[test]
+    fn deep_delete_verification_is_periodic_instead_of_every_sync() {
+        let root = tempfile::tempdir().unwrap();
+        let repo = CatalogRepository::open(&root.path().join("db")).unwrap();
+        repo.init_cloud().unwrap();
+        assert!(!repo.should_verify_deleted(7, 86_400).unwrap());
+        repo.connection
+            .lock()
+            .unwrap()
+            .execute(
+                "UPDATE app_meta SET value='0' WHERE key='catalog_delete_verify_v2:7'",
+                [],
+            )
+            .unwrap();
+        assert!(repo.should_verify_deleted(7, 86_400).unwrap());
+        repo.mark_deleted_verified(7).unwrap();
+        assert!(!repo.should_verify_deleted(7, 86_400).unwrap());
+    }
+
+    #[test]
+    fn trash_metadata_reconciles_between_device_catalogs() {
+        let root_a = tempfile::tempdir().unwrap();
+        let root_b = tempfile::tempdir().unwrap();
+        let repo_a = CatalogRepository::open(&root_a.path().join("db")).unwrap();
+        let repo_b = CatalogRepository::open(&root_b.path().join("db")).unwrap();
+        repo_a.init_cloud().unwrap();
+        repo_b.init_cloud().unwrap();
+        let doc = test_document(42, "shared.txt");
+        repo_a.record_remote(&doc).unwrap();
+        repo_b.record_remote(&doc).unwrap();
+
+        let encoded = format!(
+            "#NuvioTrash1 {}",
+            serde_json::to_string(&FileTrashEvent {
+                v: 1,
+                message_ids: vec![42],
+                trashed: true,
+            })
+            .unwrap()
+        );
+        let event = parse_file_trash_text(&encoded).expect("valid trash event");
+        let states = event
+            .message_ids
+            .into_iter()
+            .map(|id| (id, event.trashed))
+            .collect();
+        repo_b.reconcile_trash_states(&states).unwrap();
+        assert!(repo_b.list_files().unwrap()[0].trashed);
+        assert!(!repo_a.list_files().unwrap()[0].trashed);
+
+        let mut restored = std::collections::HashMap::new();
+        restored.insert(42, false);
+        repo_b.reconcile_trash_states(&restored).unwrap();
+        assert!(!repo_b.list_files().unwrap()[0].trashed);
+    }
+
+    #[test]
+    fn legacy_trash_backfill_is_one_time_and_remote_restore_wins_first() {
+        let root = tempfile::tempdir().unwrap();
+        let repo = CatalogRepository::open(&root.path().join("db")).unwrap();
+        repo.init_cloud().unwrap();
+        repo.record_remote(&test_document(42, "legacy-trash.txt"))
+            .unwrap();
+        repo.record_remote(&test_document(43, "visible.txt"))
+            .unwrap();
+        repo.trash_many(&["tg-42".into()], true).unwrap();
+
+        assert!(!repo.trash_backfill_done(99).unwrap());
+        assert_eq!(repo.trashed_remote_message_ids().unwrap(), vec![42]);
+
+        let mut restored = std::collections::HashMap::new();
+        restored.insert(42, false);
+        repo.reconcile_trash_states(&restored).unwrap();
+        assert!(repo.trashed_remote_message_ids().unwrap().is_empty());
+
+        repo.mark_trash_backfill_done(99).unwrap();
+        assert!(repo.trash_backfill_done(99).unwrap());
+        assert!(!repo.trash_backfill_done(100).unwrap());
+    }
+
+    #[test]
+    fn remote_minithumbnail_cache_is_backward_compatible() {
+        let legacy = serde_json::json!({
+            "transfer": "transfer-9",
+            "message_id": 9,
+            "name": "photo.jpg",
+            "size": 3,
+            "date": 1,
+            "sha256": "a".repeat(64),
+            "folder_id": null
+        });
+        let decoded: RemoteDocument = serde_json::from_value(legacy).unwrap();
+        assert!(decoded.minithumbnail.is_none());
+
+        let root = tempfile::tempdir().unwrap();
+        let repo = CatalogRepository::open(&root.path().join("db")).unwrap();
+        repo.init_cloud().unwrap();
+        repo.record_remote(&decoded).unwrap();
+        repo.cache_minithumbnail("tg-9", "tiny-base64-preview")
+            .unwrap();
+        assert_eq!(
+            repo.remote("tg-9").unwrap().minithumbnail.as_deref(),
+            Some("tiny-base64-preview")
+        );
+    }
+
+    #[test]
+    fn folders_can_be_committed_before_progressive_file_publication() {
+        let root = tempfile::tempdir().unwrap();
+        let repo = CatalogRepository::open(&root.path().join("db")).unwrap();
+        repo.init_cloud().unwrap();
+        repo.apply_folder_snapshot(vec![FolderEvent {
+            v: 1,
+            id: "folder-first".into(),
+            name: "Fotos".into(),
+            parent_id: None,
+            trashed: false,
+        }])
+        .unwrap();
+
+        assert!(repo.list_files().unwrap().is_empty());
+        assert_eq!(repo.list_folders().unwrap().len(), 1);
+
+        let mut doc = test_document(601, "photo.jpg");
+        doc.folder_id = Some("folder-first".into());
+        repo.record_remote_batch(&[doc]).unwrap();
+        let files = repo.list_files().unwrap();
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0].folder_id.as_deref(), Some("folder-first"));
+        assert_eq!(files[0].folder, "Fotos");
+    }
+
+    #[test]
+    fn progressive_catalog_pages_are_visible_before_final_reconciliation() {
+        let root = tempfile::tempdir().unwrap();
+        let repo = CatalogRepository::open(&root.path().join("db")).unwrap();
+        repo.init_cloud().unwrap();
+
+        let mut first_page = test_document(501, "newest.txt");
+        first_page.folder_id = Some("folder-later".into());
+        repo.record_remote_batch(&[first_page.clone()]).unwrap();
+
+        let live = repo.list_files().unwrap();
+        assert_eq!(live.len(), 1);
+        assert_eq!(live[0].id, "tg-501");
+        assert!(
+            live[0].folder_id.is_none(),
+            "unknown folders fall back safely to root during the live scan"
+        );
+
+        repo.record_remote_batch(&[test_document(500, "older.txt")])
+            .unwrap();
+        assert_eq!(
+            repo.list_files().unwrap().len(),
+            2,
+            "a second page is visible before sync completion"
+        );
+
+        repo.apply_folder_snapshot(vec![FolderEvent {
+            v: 1,
+            id: "folder-later".into(),
+            name: "Sincronizada".into(),
+            parent_id: None,
+            trashed: false,
+        }])
+        .unwrap();
+        repo.record_remote_batch(&[first_page]).unwrap();
+
+        let reconciled = repo
+            .list_files()
+            .unwrap()
+            .into_iter()
+            .find(|file| file.id == "tg-501")
+            .unwrap();
+        assert_eq!(reconciled.folder_id.as_deref(), Some("folder-later"));
+        assert_eq!(reconciled.folder, "Sincronizada");
+    }
+
+    #[test]
+    fn deletion_verification_uses_visible_catalog_ids_even_without_remote_cache_row() {
+        let root = tempfile::tempdir().unwrap();
+        let repo = CatalogRepository::open(&root.path().join("db")).unwrap();
+        repo.init_cloud().unwrap();
+        repo.record_remote(&test_document(77, "deleted-elsewhere.txt"))
+            .unwrap();
+        repo.connection
+            .lock()
+            .unwrap()
+            .execute("DELETE FROM remote_documents WHERE id='tg-77'", [])
+            .unwrap();
+
+        assert_eq!(repo.catalog_message_ids().unwrap(), vec![77]);
+        let missing = confirmed_missing(&[77], &[None]).unwrap();
+        assert_eq!(repo.remove_catalog_files(&missing).unwrap(), 1);
+        assert!(repo.list_files().unwrap().is_empty());
+    }
 
     fn test_document(message_id: i64, name: &str) -> RemoteDocument {
         RemoteDocument {
@@ -1436,6 +2808,7 @@ mod tests {
             date: 1,
             sha256: "a".repeat(64),
             folder_id: None,
+            minithumbnail: None,
         }
     }
 
@@ -1506,7 +2879,7 @@ mod tests {
         let mut doc = test_document(1, "before.txt");
         repo.record_remote(&doc).unwrap();
         repo.set_favorite("tg-1", true).unwrap();
-        repo.trash("tg-1", true).unwrap();
+        repo.trash_many(&["tg-1".into()], true).unwrap();
         doc.name = "after.mp3".into();
         doc.date = 2;
         repo.record_remote(&doc).unwrap();
@@ -1660,6 +3033,7 @@ mod tests {
             date: 1,
             sha256: "a".repeat(64),
             folder_id: None,
+            minithumbnail: None,
         };
         repo.record_remote(&doc).unwrap();
         let file = repo.list_files().unwrap().remove(0);
@@ -1696,6 +3070,7 @@ mod tests {
             date: 1,
             sha256: "a".repeat(64),
             folder_id: None,
+            minithumbnail: None,
         };
         repo.record_remote(&doc).unwrap();
         fs::write(temp.path().join("a.txt"), b"old").unwrap();

@@ -81,6 +81,9 @@ export type TransferJob = {
   canPause: boolean;
   canRetry: boolean;
   canCancel: boolean;
+  sourceDeleteAvailable?: boolean;
+  sourceDeleted?: boolean;
+  sourceDeleteError?: string | null;
   startedAt?: number | null;
   updatedAt: number;
 };
@@ -106,10 +109,37 @@ export type AppSettings = {
   cacheLimitBytes: number;
   rememberSession: boolean;
   conflictPolicy: "skip" | "rename";
+  deleteOriginalAfterUpload: boolean;
   speedLimitBps?: number | null;
 };
 
-export type SyncProgress = { active: boolean; phase: string; scanned: number; total?: number | null; percent?: number | null; etaSeconds?: number | null; error?: string | null };
+export type SyncPhase =
+  | "idle"
+  | "starting"
+  | "scanning"
+  | "folders"
+  | "files"
+  | "applying"
+  | "complete"
+  | "error";
+
+export type SyncProgress = {
+  active: boolean;
+  phase: SyncPhase;
+  scanned: number;
+  total?: number | null;
+  percent?: number | null;
+  etaSeconds?: number | null;
+  error?: string | null;
+};
+export type SyncDelta = {
+  cursor: number;
+  syncProgress: SyncProgress;
+  files: CloudFile[];
+  folders?: CloudFolder[] | null;
+};
+export type UploadedImageCleanupSummary = { count: number; bytes: number };
+export type UploadedImageCleanupResult = { deleted: number; releasedBytes: number; skipped: number; failed: number };
 export type DashboardData = {
   syncProgress?: SyncProgress;
   files: CloudFile[];
@@ -152,6 +182,9 @@ export type TelegramAuthSnapshot = {
   qrLink?: string | null;
   qrSvg?: string | null;
   isPremium: boolean;
+  timeout?: number | null;
+  codeType?: string | null;
+  nextCodeType?: string | null;
 };
 
 export type PreparedUpload = {
@@ -209,4 +242,34 @@ export type DroppedPathInfo = {
   path: string;
   isDir: boolean;
   name: string;
+};
+
+export type UploadAdvisoryInput = {
+  path: string;
+  name?: string;
+  sizeBytes?: number;
+};
+
+export type UploadRecommendation = "direct" | "compress" | "splitVolumes";
+export type UploadPreparationDecision = "direct" | "archive" | "cancel";
+
+export type UploadAdvisoryFile = {
+  name: string;
+  sizeBytes: number;
+  exceedsTelegramLimit: boolean;
+};
+
+export type UploadAdvisory = {
+  recommendation: UploadRecommendation;
+  shouldPrompt: boolean;
+  fileCount: number;
+  imageCount: number;
+  totalBytes: number;
+  unknownSizeCount: number;
+  oversizedCount: number;
+  telegramOversizedCount: number;
+  telegramLimitBytes: number;
+  largestFileBytes: number;
+  oversizedFiles: UploadAdvisoryFile[];
+  reasonCodes: string[];
 };

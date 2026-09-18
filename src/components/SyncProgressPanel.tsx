@@ -12,12 +12,18 @@ export function SyncProgressPanel({ syncProgress, syncBusy, onDismiss }: SyncPro
 
   const active = Boolean(syncProgress?.active);
   const phase = syncProgress?.phase;
+  const isFolders = phase === "folders";
+  const isFiles = phase === "files";
   const isApplying = phase === "applying";
   const isComplete = phase === "complete";
   const hasError = Boolean(syncProgress?.error);
 
   const title = active
-    ? isApplying
+    ? isFolders
+      ? "Cargando carpetas…"
+      : isFiles
+      ? "Sincronizando archivos…"
+      : isApplying
       ? "Actualizando catálogo…"
       : "Sincronizando con Telegram…"
     : syncBusy
@@ -39,15 +45,17 @@ export function SyncProgressPanel({ syncProgress, syncBusy, onDismiss }: SyncPro
   const detailLabel =
     syncProgress?.error ||
     (active
-      ? `${syncProgress?.scanned ?? 0} mensajes revisados${
-          syncProgress?.etaSeconds != null
-            ? ` · Quedan aproximadamente ${
-                syncProgress.etaSeconds < 60
-                  ? `${syncProgress.etaSeconds} s`
-                  : `${Math.ceil(syncProgress.etaSeconds / 60)} min`
-              }`
-            : ""
-        }`
+      ? isFolders
+        ? "Preparando estructura de carpetas antes de mostrar archivos…"
+        : `${syncProgress?.scanned ?? 0} mensajes revisados${
+            syncProgress?.etaSeconds != null
+              ? ` · Quedan aproximadamente ${
+                  syncProgress.etaSeconds < 60
+                    ? `${syncProgress.etaSeconds} s`
+                    : `${Math.ceil(syncProgress.etaSeconds / 60)} min`
+                }`
+              : ""
+          }`
       : syncBusy
       ? "Consultando Telegram…"
       : "Catálogo actualizado");
