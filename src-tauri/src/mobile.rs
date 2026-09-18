@@ -115,19 +115,23 @@ pub async fn pick_upload_files() -> Result<Vec<String>, String> {
     Ok(result.paths)
 }
 
+#[derive(Debug, Clone, serde::Deserialize)]
+#[cfg_attr(not(target_os = "android"), allow(dead_code))]
+#[serde(rename_all = "camelCase")]
+pub struct StagedContent {
+    pub path: String,
+    pub size_bytes: i64,
+    pub sha256: String,
+}
+
 #[cfg(target_os = "android")]
-pub async fn stage_content_uri(uri: &str) -> Result<String, String> {
-    #[derive(Deserialize)]
-    struct Response {
-        path: String,
-    }
-    let result: Response = HANDLE
+pub async fn stage_content_uri(uri: &str) -> Result<StagedContent, String> {
+    HANDLE
         .get()
         .ok_or("Android aún no está listo")?
         .run_mobile_plugin_async("stageContentUri", serde_json::json!({"uri": uri}))
         .await
-        .map_err(|e| e.to_string())?;
-    Ok(result.path)
+        .map_err(|e| e.to_string())
 }
 
 #[cfg(target_os = "android")]
@@ -170,10 +174,14 @@ pub async fn pick_upload_directory() -> Result<Option<crate::DirectoryUploadPlan
         return Ok(None);
     }
 
+    let folders = result.folders.unwrap_or_default();
+    let files = result.files.unwrap_or_default();
+    crate::validate_directory_upload_limits(files.len(), folders.len(), 0)?;
+
     Ok(Some(crate::DirectoryUploadPlan {
         root_name: result.root_name.unwrap_or_else(|| "Carpeta".to_string()),
-        folders: result.folders.unwrap_or_default(),
-        files: result.files.unwrap_or_default(),
+        folders,
+        files,
         total_bytes: result.total_bytes.unwrap_or(0),
     }))
 }
@@ -192,7 +200,7 @@ pub async fn pick_upload_directory() -> Result<Option<crate::DirectoryUploadPlan
 
 #[allow(dead_code)]
 #[cfg(not(target_os = "android"))]
-pub async fn stage_content_uri(_uri: &str) -> Result<String, String> {
+pub async fn stage_content_uri(_uri: &str) -> Result<StagedContent, String> {
     Err("Los URI de Android sólo están soportados en Android".into())
 }
 

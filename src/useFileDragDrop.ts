@@ -157,15 +157,6 @@ export function useFileDragDrop({
       onRequireConnection();
       return;
     }
-    const alreadyThere = ids.every((id) => {
-      const file = dashboard.files.find((item) => item.id === id);
-      return (file?.folderId ?? null) === targetFolderId;
-    });
-    if (alreadyThere) {
-      clearFileDrag();
-      setNotice("Los archivos ya están en esa ubicación.");
-      return;
-    }
     const destination = targetFolderId
       ? dashboard.folders.find((folder) => folder.id === targetFolderId)?.name ?? "la carpeta"
       : "Mi unidad";

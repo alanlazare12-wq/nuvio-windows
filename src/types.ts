@@ -32,6 +32,14 @@ export type CloudFile = {
   telegramMessageId?: string | null;
 };
 
+export type CatalogPage = {
+  files: CloudFile[];
+  total: number;
+  offset: number;
+  limit: number;
+  hasMore: boolean;
+};
+
 export type CloudFolder = {
   id: string;
   name: string;
@@ -136,19 +144,19 @@ export type SyncDelta = {
   cursor: number;
   syncProgress: SyncProgress;
   files: CloudFile[];
+  removedIds: string[];
   folders?: CloudFolder[] | null;
 };
 export type UploadedImageCleanupSummary = { count: number; bytes: number };
 export type UploadedImageCleanupResult = { deleted: number; releasedBytes: number; skipped: number; failed: number };
-export type DashboardData = {
+export type DashboardStatus = {
   syncProgress?: SyncProgress;
-  files: CloudFile[];
-  folders: CloudFolder[];
   transfers: TransferJob[];
-  transferHistory: TransferJob[];
+  transferHistory?: TransferJob[] | null;
   totalBytes: number;
   fileCount: number;
   favoriteCount: number;
+  trashCount: number;
   recentCount: number;
   telegramConnected: boolean;
   telegramAccountLabel?: string | null;
@@ -156,6 +164,13 @@ export type DashboardData = {
   queueSummary: QueueSummary;
   settings: AppSettings;
   isPremium?: boolean;
+  catalogCursor: number;
+  historyCursor: number;
+};
+export type DashboardData = Omit<DashboardStatus, "transferHistory"> & {
+  files: CloudFile[];
+  folders: CloudFolder[];
+  transferHistory: TransferJob[];
 };
 
 export type TelegramAuthStage =

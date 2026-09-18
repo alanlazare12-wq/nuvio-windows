@@ -1,13 +1,14 @@
 {
   "name": "nuviodrive-v1",
   "private": true,
-  "version": "1.2.4",
+  "version": "1.2.5",
   "type": "module",
   "scripts": {
     "dev": "vite",
     "build": "tsc && vite build",
     "check": "tsc --noEmit",
     "qa:rust": "cargo test --manifest-path src-tauri/Cargo.toml --lib",
+    "qa:perf": "cargo test --release --manifest-path src-tauri/Cargo.toml --lib catalog_performance_budget_250k -- --ignored --nocapture",
     "qa:ui": "node scripts/qa-ui.mjs",
     "lint:rust": "cargo clippy --manifest-path src-tauri/Cargo.toml --all-targets -- -D warnings",
     "preview": "vite preview",

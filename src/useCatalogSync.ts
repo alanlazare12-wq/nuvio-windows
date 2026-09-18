@@ -7,7 +7,7 @@ import {
 } from "react";
 import { loadSyncDelta, syncFiles } from "./bridge/dashboard";
 import { readableError } from "./bridge/shared";
-import type { CloudFile, DashboardData } from "./types";
+import type { DashboardData } from "./types";
 
 type UseCatalogSyncOptions = {
   dashboard: DashboardData | null;
@@ -15,28 +15,6 @@ type UseCatalogSyncOptions = {
   refreshDashboard: () => Promise<DashboardData | undefined>;
   setNotice: Dispatch<SetStateAction<string | null>>;
 };
-
-function mergeRecentFiles(current: CloudFile[], added: CloudFile[]): CloudFile[] {
-  if (!added.length) return current;
-
-  const incoming = [...added].sort(
-    (a, b) => (Date.parse(b.updatedAt) || 0) - (Date.parse(a.updatedAt) || 0),
-  );
-  const merged: CloudFile[] = new Array(current.length + incoming.length);
-  let left = 0;
-  let right = 0;
-  let out = 0;
-
-  while (left < current.length && right < incoming.length) {
-    const currentTime = Date.parse(current[left].updatedAt) || 0;
-    const incomingTime = Date.parse(incoming[right].updatedAt) || 0;
-    merged[out++] = currentTime >= incomingTime ? current[left++] : incoming[right++];
-  }
-  while (left < current.length) merged[out++] = current[left++];
-  while (right < incoming.length) merged[out++] = incoming[right++];
-
-  return merged;
-}
 
 export function useCatalogSync({
   dashboard,
@@ -94,36 +72,12 @@ export function useCatalogSync({
 
     const applyDelta = (delta: Awaited<ReturnType<typeof loadSyncDelta>>) => {
       if (!mountedRef.current) return;
-      setDashboard((current) => {
-        if (!current) return current;
-        if (!delta.files.length) {
-          return {
-            ...current,
-            syncProgress: delta.syncProgress,
-            folders: delta.folders ?? current.folders,
-          };
-        }
-
-        const activeAdded = delta.files.filter((file) => !file.trashed);
-        const addedBytes = activeAdded.reduce((sum, file) => sum + file.sizeBytes, 0);
-        const addedFavorites = activeAdded.reduce(
-          (sum, file) => sum + (file.favorite ? 1 : 0),
-          0,
-        );
-        const nextFiles = mergeRecentFiles(current.files, delta.files);
-        const nextFileCount = current.fileCount + activeAdded.length;
-
-        return {
-          ...current,
-          syncProgress: delta.syncProgress,
-          files: nextFiles,
-          folders: delta.folders ?? current.folders,
-          totalBytes: current.totalBytes + addedBytes,
-          fileCount: nextFileCount,
-          favoriteCount: current.favoriteCount + addedFavorites,
-          recentCount: nextFileCount,
-        };
-      });
+      setDashboard((current) => current ? {
+        ...current,
+        syncProgress: delta.syncProgress,
+        folders: delta.folders ?? current.folders,
+        catalogCursor: delta.cursor,
+      } : current);
     };
 
     try {

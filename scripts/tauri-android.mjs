@@ -465,8 +465,11 @@ function modernizeAndroidProject() {
     .replace(/com\.android\.tools\.build:gradle:[^"\r\n]+/g, "com.android.tools.build:gradle:8.11.1");
   writeFileSync(buildSrcBuild, buildSrc, "utf8");
 
-  // Gradle 9 removed Project.exec. Tauri 2.11.5 still generates BuildTask with
-  // that API, so migrate the generated task to the supported injected service.
+  // Tauri 2.11.5 generates a task that uses Project.exec and Task.project
+  // during execution. Project.exec is removed in Gradle 9 and Task.project is
+  // incompatible with the configuration cache / scheduled for removal in Gradle 10.
+  // Use injected Gradle services and the task logger instead, keeping the generated
+  // Android project forward-compatible without maintaining a fork of Tauri.
   let buildTaskSource = readFileSync(buildTask, "utf8");
   if (!buildTaskSource.includes("org.gradle.process.ExecOperations")) {
     buildTaskSource = buildTaskSource.replace(
@@ -474,12 +477,26 @@ function modernizeAndroidProject() {
       "import org.gradle.api.tasks.TaskAction\r\nimport org.gradle.process.ExecOperations\r\nimport javax.inject.Inject\r\n",
     );
   }
+  if (!buildTaskSource.includes("org.gradle.api.file.ProjectLayout")) {
+    buildTaskSource = buildTaskSource.replace(
+      "import org.gradle.api.DefaultTask\r\n",
+      "import org.gradle.api.DefaultTask\r\nimport org.gradle.api.file.ProjectLayout\r\n",
+    );
+  }
+  buildTaskSource = buildTaskSource.replace(
+    "open class BuildTask : DefaultTask() {",
+    "abstract class BuildTask : DefaultTask() {\r\n    @get:Inject\r\n    abstract val execOperations: ExecOperations",
+  );
+  if (!buildTaskSource.includes("abstract val projectLayout: ProjectLayout")) {
+    buildTaskSource = buildTaskSource.replace(
+      "abstract val execOperations: ExecOperations\r\n",
+      "abstract val execOperations: ExecOperations\r\n    @get:Inject\r\n    abstract val projectLayout: ProjectLayout\r\n",
+    );
+  }
   buildTaskSource = buildTaskSource
-    .replace(
-      "open class BuildTask : DefaultTask() {",
-      "abstract class BuildTask : DefaultTask() {\r\n    @get:Inject\r\n    abstract val execOperations: ExecOperations",
-    )
-    .replace("project.exec {", "execOperations.exec {");
+    .replace("project.exec {", "execOperations.exec {")
+    .replace("File(project.projectDir, rootDirRel)", "File(projectLayout.projectDirectory.asFile, rootDirRel)")
+    .replaceAll("project.logger", "logger");
   writeFileSync(buildTask, buildTaskSource, "utf8");
 
   if (existsSync(tauriBuild)) {

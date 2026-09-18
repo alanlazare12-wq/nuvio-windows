@@ -216,6 +216,98 @@ impl TransferService {
         })
     }
 
+    #[cfg(any(target_os = "android", test))]
+    #[allow(clippy::too_many_arguments)]
+    pub fn adopt_preverified_upload_in_folder(
+        repository: &CatalogRepository,
+        path: &str,
+        original_source_path: &str,
+        size_bytes: i64,
+        sha256: &str,
+        staging_dir: &Path,
+        folder_id: Option<&str>,
+        delete_source_after_upload: bool,
+    ) -> Result<PreparedUpload, String> {
+        if size_bytes <= 0 {
+            return Err("Telegram no permite subir archivos vacíos".to_string());
+        }
+        if sha256.len() != 64 || !sha256.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+            return Err("Android devolvió una huella SHA-256 inválida".to_string());
+        }
+
+        let source_path = normalize_path(path)?;
+        let metadata = fs::metadata(&source_path).map_err(|error| error.to_string())?;
+        if !metadata.is_file() || metadata.len() != size_bytes as u64 {
+            return Err(
+                "El archivo preparado por Android no coincide con su tamaño verificado".into(),
+            );
+        }
+        let file_name = source_path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .ok_or_else(|| "No se pudo determinar el nombre del archivo".to_string())?
+            .to_string();
+
+        let transfer_id = new_transfer_id();
+        let directory = staging_dir.join(&transfer_id);
+        fs::create_dir_all(&directory).map_err(|error| error.to_string())?;
+        let snapshot = directory.join(&file_name);
+
+        fs::rename(&source_path, &snapshot).map_err(|error| {
+            let _ = fs::remove_dir(&directory);
+            format!("No se pudo adoptar el archivo Android en la caché privada: {error}")
+        })?;
+
+        if let Err(error) = repository.create_upload_placeholder_in_folder(
+            &transfer_id,
+            &file_name,
+            &snapshot.to_string_lossy(),
+            Some(original_source_path),
+            size_bytes,
+            folder_id,
+            delete_source_after_upload,
+        ) {
+            let _ = fs::rename(&snapshot, &source_path);
+            let _ = fs::remove_dir(&directory);
+            return Err(error.to_string());
+        }
+
+        let duplicate = match repository.finish_preparation(
+            &transfer_id,
+            &snapshot.to_string_lossy(),
+            sha256,
+            size_bytes,
+            false,
+        ) {
+            Ok(value) => value,
+            Err(error) => {
+                let error = error.to_string();
+                mark_preparation_failure(
+                    repository,
+                    &transfer_id,
+                    size_bytes,
+                    "Error al registrar archivo Android",
+                    &error,
+                );
+                return Err(error);
+            }
+        };
+        if duplicate {
+            let _ = fs::remove_file(&snapshot);
+        }
+
+        Ok(PreparedUpload {
+            transfer_id,
+            file_name,
+            local_path: snapshot.to_string_lossy().into_owned(),
+            size_bytes,
+            sha256: sha256.to_ascii_lowercase(),
+            duplicate,
+            encrypted: false,
+            status: if duplicate { "duplicate" } else { "ready" }.to_string(),
+        })
+    }
+
     pub fn resume_preparation(
         repository: &CatalogRepository,
         transfer_id: &str,
@@ -757,6 +849,84 @@ mod tests {
         assert!(duplicate.duplicate);
         assert_eq!(duplicate.status, "duplicate");
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn freshly_prepared_staging_gets_one_shot_verification_token() {
+        let root = tempfile::tempdir().unwrap();
+        let source = root.path().join("source.bin");
+        fs::write(&source, vec![7_u8; 1024 * 1024]).unwrap();
+        let repository = CatalogRepository::open(&root.path().join("catalog.db")).unwrap();
+        let staging = root.path().join("staging");
+
+        let prepared = TransferService::prepare_upload(
+            &repository,
+            source.to_str().unwrap(),
+            false,
+            None,
+            &staging,
+        )
+        .unwrap();
+
+        assert!(repository.take_verified_staging(
+            &prepared.transfer_id,
+            &prepared.local_path,
+            prepared.size_bytes,
+        ));
+        assert!(!repository.take_verified_staging(
+            &prepared.transfer_id,
+            &prepared.local_path,
+            prepared.size_bytes,
+        ));
+    }
+
+    #[test]
+    fn preverified_android_staging_is_adopted_without_second_copy() {
+        let root = tempfile::tempdir().unwrap();
+        let incoming_dir = root.path().join("android-stage");
+        fs::create_dir_all(&incoming_dir).unwrap();
+        let incoming = incoming_dir.join("foto.jpg");
+        let content = vec![3_u8; 512 * 1024];
+        fs::write(&incoming, &content).unwrap();
+        let sha256 = crate::crypto::sha256_file(&incoming).unwrap();
+
+        let repository = CatalogRepository::open(&root.path().join("catalog.db")).unwrap();
+        let staging = root.path().join("staging");
+        let prepared = TransferService::adopt_preverified_upload_in_folder(
+            &repository,
+            incoming.to_str().unwrap(),
+            "content://com.example/foto.jpg",
+            content.len() as i64,
+            &sha256,
+            &staging,
+            None,
+            true,
+        )
+        .unwrap();
+
+        assert!(!incoming.exists());
+        let adopted = PathBuf::from(&prepared.local_path);
+        assert!(adopted.exists());
+        assert!(adopted.starts_with(&staging));
+        assert_eq!(fs::read(&adopted).unwrap(), content);
+        assert_eq!(prepared.sha256, sha256);
+        assert!(repository.take_verified_staging(
+            &prepared.transfer_id,
+            &prepared.local_path,
+            prepared.size_bytes,
+        ));
+
+        let source_path: String = repository
+            .connection
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT source_path FROM transfer_metadata WHERE transfer_id=?1",
+                [&prepared.transfer_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(source_path, "content://com.example/foto.jpg");
     }
 
     #[test]

@@ -70,7 +70,7 @@ export function useTrashActions({
   };
 
   const handleEmptyTrash = async () => {
-    const trashCount = dashboard?.files.filter((file) => file.trashed).length ?? 0;
+    const trashCount = dashboard?.trashCount ?? 0;
     if (!trashCount) return;
     if (!dashboard?.telegramConnected) {
       onRequireConnection();

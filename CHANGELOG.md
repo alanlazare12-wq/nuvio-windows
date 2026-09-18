@@ -2,6 +2,48 @@
 
 > Archivo de continuidad del proyecto. A partir del ciclo 1.2.3-dev se actualiza durante el desarrollo cada vez que se incorpora o corrige una funcionalidad relevante, antes de dar el trabajo por terminado. Cada entrada conserva decisiones técnicas, QA y pendientes para poder retomar el proyecto sin depender del historial del chat.
 
+## 1.2.5 — 2026-09-18 — Catálogo incremental, sincronización realtime y rendimiento masivo
+
+### Arquitectura y sincronización
+
+- SQLite ahora usa un writer único y conexiones reader independientes bajo WAL para evitar que dashboard, búsqueda y deltas compitan innecesariamente con escrituras del sync.
+- Sustituido el cursor incremental basado en `rowid` por `catalog_changes(seq)` con triggers para inserts, updates, moves, trash y deletes; los cambios sobre filas existentes ya no dependen de un refresh completo final.
+- El heartbeat del dashboard dejó de transportar el catálogo completo: usa `DashboardStatus`, `catalogCursor` e `historyCursor`, y sólo invalida páginas cuando realmente cambia el catálogo.
+- `list_folders()` pasó de subconsultas correlacionadas por carpeta a agregaciones por `GROUP BY`; settings se leen en una sola consulta y la cola usa agregados SQL.
+- Worker de transferencias migrado a `Notify` + limitadores dinámicos; concurrencia de preparación/subida/descarga cambia en vivo y el worker duerme hasta el próximo retry real en vez de consultar SQLite cada pocos cientos de milisegundos.
+- TDLib ahora publica `UpdateNewMessage`, `UpdateDeleteMessages` y `UpdateFile` hacia colas internas acotadas. `cloud.rs` continúa siendo dueño de interpretar/aplicar mensajes y las descargas esperan `UpdateFile` con fallback seguro.
+- Añadido `nuvio-catalog-v2`: snapshot remoto comprimido y verificado por SHA-256/checkpoints para que un dispositivo nuevo pueda reconstruir el catálogo y continuar incrementalmente sin recorrer toda la historia de Telegram.
+- Añadida paginación SQL del catálogo, FTS5, orden natural `NUVIO_NATURAL` y virtualización manual de grid/lista para mantener acotados IPC, memoria y DOM con bibliotecas grandes.
+
+### Media, transferencias y Android
+
+- Miniaturas visibles se agrupan en batches locales de hasta 32 IDs; las minithumbnails ya conocidas se resuelven desde SQLite en un único IPC y sólo los faltantes hacen fallback individual.
+- La cache multimedia tiene índice persistente/LRU y evita revalidaciones físicas completas cuando el archivo cacheado ya fue verificado.
+- La telemetría frecuente de transferencias vive en memoria y se persiste de forma throttled, manteniendo checkpoints inmediatos en cambios de fase/estado/error/finalización.
+- Copias verificadas de escritorio calculan SHA-256 durante la misma pasada de escritura, eliminando una reread completa del temporal.
+- Android conserva copy+hash en una pasada al staging de `content://`; al publicar descargas SAF se eliminó el hash redundante del source y se conserva la verificación fuerte sobre los bytes realmente persistidos en el destino.
+- El generador Android moderniza el `BuildTask` de Tauri usando `ExecOperations` y `ProjectLayout`, evitando APIs Gradle retiradas/obsoletas.
+
+### QA y rendimiento
+
+- Graphify final reconstruido sobre la arquitectura resultante: 1,292 nodos / 3,761 relaciones.
+- Suite Rust completa: 100/100 tests aprobados; benchmark de rendimiento queda ignorado por defecto y se ejecuta explícitamente con `qa:perf`.
+- Benchmark release escalado a 10k/30k/100k/250k archivos. En 250k: primera página ~416 ms, FTS ~1.274 s, stats ~329 ms, carpetas ~462 ms y delta de una fila ~123 ms en el host QA.
+- `cargo clippy --all-targets -- -D warnings`, `pnpm check`, build Vite de producción, `git diff --check`, QA UI completa y QA de autenticación: aprobados.
+- Android ARM64: compilación Kotlin y release Rust aprobadas; pipeline valida firma APK v2/v3, RSA-3072, ARM64, `libtdjson.so`, páginas ELF de 16 KB, `targetSdkVersion 36` y `POST_NOTIFICATIONS`.
+- Windows x64: build release + NSIS offline con 15 DLL x64 de TDLib/OpenSSL/zlib/VC++ aprobados. Authenticode sigue `NotSigned`, igual que releases previas; no se declara firma de editor.
+- Versión promovida de 1.2.4 a 1.2.5 en package/Cargo/Tauri para no publicar una build funcionalmente distinta reutilizando el número/hash histórico de 1.2.4.
+
+### Artefactos 1.2.5
+
+- Windows x64 final: `release/Windows/Nuvio-Setup-Windows11-x64.exe`, 231,842,609 bytes, SHA-256 `64A14BD2E7DED2455B3747BAA4A35F23DACE5A806670E24FF45B424103CC6C54`.
+- Windows NSIS interno: `Nuvio_1.2.5_x64-setup.exe`; incluye WebView2 offline y las 15 DLL x64 verificadas de TDLib/OpenSSL/zlib/VC++.
+- Windows Authenticode: `NotSigned`, igual que 1.2.4; no se declara firma de editor.
+- Android ARM64 final: `release/Android/Nuvio-Android-aarch64.apk`, 59,162,954 bytes, SHA-256 `463E440BDA148B71D727FDF51A806546A5A73D2194D552D66CDD4C61417D5285`.
+- Android manifiesto final: `versionName=1.2.5`, `versionCode=1002005`, `minSdk=26`, `targetSdk=36`.
+- APK verificado con Signature Scheme v2/v3; certificado `CN=Nuvio, O=Nuvio, C=MX`, RSA-3072, fingerprint SHA-256 `330be739ff835d1c2c1b58d057312eadb8b475286954c63cfc2bd819476872ba`.
+- `libnuviodrive_v1_lib.so` y `libtdjson.so` verificados como AArch64 y con segmentos LOAD alineados a `0x4000` (16 KB).
+
 ## 1.2.4 — 2026-09-17 — Respaldos por volúmenes ZIP y release final
 
 ### Autenticación Telegram 2026 — métodos ampliados y future-auth

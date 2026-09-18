@@ -5,11 +5,69 @@ import type { CloudFile } from "./types";
 
 type Source = { kind: "image" | "pdf" | "text"; path: string | null; dataUrl: string | null; blurred?: boolean };
 type Preview = { image?: string; text?: string; blurred?: boolean } | null;
+type BatchSource = { id: string; source: Source | null };
+type SourceWaiter = { resolve: (source: Source | null) => void; reject: (error: unknown) => void };
 const cache = new Map<string, Preview>();
 const pending = new Map<string, Promise<Preview>>();
 const queue: Array<() => Promise<void>> = [];
 let active = 0;
 let generation = 0;
+
+const sourceWaiters = new Map<string, SourceWaiter[]>();
+let sourceBatchTimer: number | null = null;
+
+function scheduleSourceBatch() {
+  if (sourceBatchTimer != null) return;
+  sourceBatchTimer = window.setTimeout(() => { void flushSourceBatch(); }, 0);
+}
+
+async function resolveIndividually(id: string): Promise<Source | null> {
+  return invoke<Source | null>("prepare_thumbnail", { id });
+}
+
+async function flushSourceBatch() {
+  sourceBatchTimer = null;
+  const ids = [...sourceWaiters.keys()].slice(0, 32);
+  if (!ids.length) return;
+
+  const waiters = new Map<string, SourceWaiter[]>();
+  for (const id of ids) {
+    waiters.set(id, sourceWaiters.get(id) ?? []);
+    sourceWaiters.delete(id);
+  }
+
+  let batch = new Map<string, Source | null>();
+  try {
+    const items = await invoke<BatchSource[]>("prepare_thumbnail_batch", { ids });
+    batch = new Map(items.map((item) => [item.id, item.source]));
+  } catch {
+    // Older/partially upgraded backends still work through the individual command.
+  }
+
+  await Promise.all(ids.map(async (id) => {
+    let source = batch.get(id) ?? null;
+    if (!source) {
+      try {
+        source = await resolveIndividually(id);
+      } catch (error) {
+        for (const waiter of waiters.get(id) ?? []) waiter.reject(error);
+        return;
+      }
+    }
+    for (const waiter of waiters.get(id) ?? []) waiter.resolve(source);
+  }));
+
+  if (sourceWaiters.size) scheduleSourceBatch();
+}
+
+function requestThumbnailSource(id: string): Promise<Source | null> {
+  return new Promise((resolve, reject) => {
+    const waiters = sourceWaiters.get(id) ?? [];
+    waiters.push({ resolve, reject });
+    sourceWaiters.set(id, waiters);
+    scheduleSourceBatch();
+  });
+}
 
 export function clearThumbnailCache() {
   generation++;
@@ -26,7 +84,7 @@ function drain() {
 }
 
 async function renderThumbnail(id: string): Promise<Preview> {
-  const source = await invoke<Source | null>("prepare_thumbnail", { id });
+  const source = await requestThumbnailSource(id);
   if (!source) return null;
   const url = source.dataUrl ?? (source.path ? convertFileSrc(source.path) : null);
   if (!url) return null;

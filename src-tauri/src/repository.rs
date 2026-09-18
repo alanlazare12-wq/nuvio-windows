@@ -1,9 +1,13 @@
+use std::collections::HashMap;
+use std::fs;
 use std::path::Path;
-use std::sync::Mutex;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Mutex, MutexGuard};
+use std::time::{Duration, Instant, SystemTime};
 
-use rusqlite::{params, Connection, OptionalExtension};
+use rusqlite::{params, types::Value, Connection, OptionalExtension};
 
-use crate::domain::{AppSettings, CloudFile, CloudFolder, QueueSummary, TransferJob};
+use crate::domain::{AppSettings, CatalogPage, CloudFile, CloudFolder, QueueSummary, TransferJob};
 
 #[derive(Debug, thiserror::Error)]
 pub enum RepositoryError {
@@ -14,7 +18,38 @@ pub enum RepositoryError {
 }
 
 pub struct CatalogRepository {
+    /// Single writer connection. All catalog mutations remain serialized here.
     pub(crate) connection: Mutex<Connection>,
+    /// Independent WAL readers keep dashboard/catalog queries from blocking the writer.
+    readers: Vec<Mutex<Connection>>,
+    next_reader: AtomicUsize,
+    /// Latest high-frequency transfer telemetry. Durable SQLite checkpoints are
+    /// intentionally coalesced; control/status transitions are still persisted immediately.
+    live_runtime: Mutex<HashMap<String, LiveTransferRuntime>>,
+    /// One-shot trust tokens for private staging files verified in this process.
+    /// Tokens never survive a restart, so crash recovery still re-hashes before upload.
+    verified_staging: Mutex<HashMap<String, VerifiedStaging>>,
+}
+
+#[derive(Debug, Clone)]
+struct VerifiedStaging {
+    path: String,
+    size_bytes: i64,
+    modified: Option<SystemTime>,
+}
+
+#[derive(Debug, Clone)]
+struct LiveTransferRuntime {
+    status: String,
+    phase: String,
+    progress: u8,
+    processed_bytes: i64,
+    total_bytes: i64,
+    speed_bps: i64,
+    eta_seconds: Option<i64>,
+    speed_label: String,
+    error: Option<String>,
+    last_persisted: Instant,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -38,28 +73,86 @@ pub struct UploadSourceCleanupCandidate {
     pub size_bytes: i64,
 }
 
+#[derive(Debug, Clone)]
+pub struct CatalogDelta {
+    pub cursor: i64,
+    pub files: Vec<CloudFile>,
+    pub removed_ids: Vec<String>,
+    pub folders_changed: bool,
+}
+
+#[derive(Debug, Clone)]
+pub struct CatalogPageQuery {
+    pub section: String,
+    pub folder_id: Option<String>,
+    pub kind: Option<String>,
+    pub search: String,
+    pub tag: Option<String>,
+    pub sort: String,
+    pub offset: usize,
+    pub limit: usize,
+}
+
+#[derive(Debug, Clone)]
+pub struct MediaCacheEntry {
+    pub path: String,
+    pub size_bytes: i64,
+    pub sha256: String,
+    pub modified_ns: i64,
+    pub verified: bool,
+}
+
 impl CatalogRepository {
     pub fn open(path: &Path) -> Result<Self, RepositoryError> {
         let connection = Connection::open(path)?;
-        connection.pragma_update(None, "journal_mode", "WAL")?;
-        // The catalog is fully reconstructible from Telegram, so WAL + NORMAL gives
-        // much lower fsync latency while preserving transactional consistency across
-        // process/app crashes. Keep a larger page cache and mmap window for 30k-100k+
-        // libraries so batch upserts and recursive folder joins stay memory-resident.
-        connection.pragma_update(None, "synchronous", "NORMAL")?;
-        connection.pragma_update(None, "temp_store", "MEMORY")?;
-        connection.pragma_update(None, "cache_size", -65_536_i64)?;
-        connection.pragma_update(None, "mmap_size", 268_435_456_i64)?;
-        connection.pragma_update(None, "wal_autocheckpoint", 8_192_i64)?;
-        connection.pragma_update(None, "foreign_keys", "ON")?;
-        connection.busy_timeout(std::time::Duration::from_secs(5))?;
+        configure_connection(&connection, false)?;
 
-        let repository = Self {
+        let mut repository = Self {
             connection: Mutex::new(connection),
+            readers: Vec::new(),
+            next_reader: AtomicUsize::new(0),
+            live_runtime: Mutex::new(HashMap::new()),
+            verified_staging: Mutex::new(HashMap::new()),
         };
         repository.migrate()?;
         repository.remove_demo()?;
+
+        // WAL only provides reader/writer concurrency when callers don't funnel every
+        // operation through the same Connection. Keep a tiny read pool: enough to
+        // isolate dashboard, sync-delta and metadata reads without creating excessive
+        // SQLite handles on Android.
+        let reader_count = if cfg!(target_os = "android") { 2 } else { 3 };
+        repository.readers.reserve(reader_count);
+        for _ in 0..reader_count {
+            let reader = Connection::open(path)?;
+            configure_connection(&reader, true)?;
+            repository.readers.push(Mutex::new(reader));
+        }
+
+        repository
+            .connection
+            .lock()
+            .expect("catalog mutex poisoned")
+            .execute_batch("PRAGMA optimize=0x10002;")?;
         Ok(repository)
+    }
+
+    fn reader(&self) -> MutexGuard<'_, Connection> {
+        if self.readers.is_empty() {
+            return self.connection.lock().expect("catalog mutex poisoned");
+        }
+        let index = self.next_reader.fetch_add(1, Ordering::Relaxed) % self.readers.len();
+        self.readers[index]
+            .lock()
+            .expect("catalog reader mutex poisoned")
+    }
+
+    pub fn optimize(&self) -> Result<(), RepositoryError> {
+        self.connection
+            .lock()
+            .expect("catalog mutex poisoned")
+            .execute_batch("PRAGMA optimize;")?;
+        Ok(())
     }
 
     fn migrate(&self) -> Result<(), RepositoryError> {
@@ -85,6 +178,20 @@ impl CatalogRepository {
             CREATE INDEX IF NOT EXISTS idx_files_kind ON files(kind);
             CREATE INDEX IF NOT EXISTS idx_files_favorite ON files(favorite);
             CREATE INDEX IF NOT EXISTS idx_files_trashed ON files(trashed);
+            CREATE INDEX IF NOT EXISTS idx_files_provider_message_numeric
+                ON files(provider, CAST(telegram_message_id AS INTEGER));
+            CREATE INDEX IF NOT EXISTS idx_files_active_updated
+                ON files(trashed, updated_at DESC, id);
+            CREATE INDEX IF NOT EXISTS idx_files_active_favorite
+                ON files(trashed, favorite, updated_at DESC, id);
+            CREATE INDEX IF NOT EXISTS idx_files_active_kind_updated
+                ON files(trashed, kind, updated_at DESC, id);
+            CREATE INDEX IF NOT EXISTS idx_files_active_size
+                ON files(trashed, size_bytes DESC, id);
+            CREATE INDEX IF NOT EXISTS idx_files_active_name
+                ON files(trashed, name COLLATE NOCASE, id);
+            CREATE INDEX IF NOT EXISTS idx_files_active_name_natural
+                ON files(trashed, name COLLATE NUVIO_NATURAL, id);
 
             CREATE TABLE IF NOT EXISTS folders (
                 id TEXT PRIMARY KEY NOT NULL,
@@ -121,6 +228,8 @@ impl CatalogRepository {
                 status TEXT NOT NULL,
                 speed_label TEXT NOT NULL DEFAULT ''
             );
+            CREATE INDEX IF NOT EXISTS idx_transfers_status ON transfers(status);
+            CREATE INDEX IF NOT EXISTS idx_transfers_direction_status ON transfers(direction,status);
 
             CREATE TABLE IF NOT EXISTS transfer_metadata (
                 transfer_id TEXT PRIMARY KEY NOT NULL,
@@ -159,6 +268,52 @@ impl CatalogRepository {
             );
             CREATE INDEX IF NOT EXISTS idx_transfer_runtime_retry ON transfer_runtime(next_retry_at);
 
+            CREATE TABLE IF NOT EXISTS transfer_history_changes (
+                seq INTEGER PRIMARY KEY AUTOINCREMENT,
+                transfer_id TEXT NOT NULL,
+                changed_at INTEGER NOT NULL DEFAULT (unixepoch())
+            );
+            CREATE TRIGGER IF NOT EXISTS trg_transfer_history_insert
+            AFTER INSERT ON transfers
+            WHEN NEW.status IN ('completed','duplicate','cancelled')
+            BEGIN
+                INSERT INTO transfer_history_changes(transfer_id) VALUES (NEW.id);
+            END;
+            CREATE TRIGGER IF NOT EXISTS trg_transfer_history_status
+            AFTER UPDATE OF status ON transfers
+            WHEN OLD.status IS NOT NEW.status
+              AND (OLD.status IN ('completed','duplicate','cancelled')
+                   OR NEW.status IN ('completed','duplicate','cancelled'))
+            BEGIN
+                INSERT INTO transfer_history_changes(transfer_id) VALUES (NEW.id);
+            END;
+            CREATE TRIGGER IF NOT EXISTS trg_transfer_history_delete
+            AFTER DELETE ON transfers
+            WHEN OLD.status IN ('completed','duplicate','cancelled')
+            BEGIN
+                INSERT INTO transfer_history_changes(transfer_id) VALUES (OLD.id);
+            END;
+            CREATE TRIGGER IF NOT EXISTS trg_transfer_history_metadata
+            AFTER UPDATE ON transfer_metadata
+            WHEN EXISTS (
+                SELECT 1 FROM transfers t
+                WHERE t.id=NEW.transfer_id
+                  AND t.status IN ('completed','duplicate','cancelled')
+            )
+            BEGIN
+                INSERT INTO transfer_history_changes(transfer_id) VALUES (NEW.transfer_id);
+            END;
+            CREATE TRIGGER IF NOT EXISTS trg_transfer_history_runtime
+            AFTER UPDATE ON transfer_runtime
+            WHEN EXISTS (
+                SELECT 1 FROM transfers t
+                WHERE t.id=NEW.transfer_id
+                  AND t.status IN ('completed','duplicate','cancelled')
+            )
+            BEGIN
+                INSERT INTO transfer_history_changes(transfer_id) VALUES (NEW.transfer_id);
+            END;
+
             CREATE TABLE IF NOT EXISTS uploaded_sources (
                 transfer_id TEXT PRIMARY KEY NOT NULL,
                 file_name TEXT NOT NULL,
@@ -192,6 +347,97 @@ impl CatalogRepository {
             INSERT OR IGNORE INTO app_settings VALUES ('conflict_policy','skip');
             INSERT OR IGNORE INTO app_settings VALUES ('delete_original_after_upload','0');
             INSERT OR IGNORE INTO app_settings VALUES ('speed_limit_bps','');
+
+            CREATE TABLE IF NOT EXISTS media_cache_entries (
+                path TEXT PRIMARY KEY NOT NULL,
+                file_id TEXT NULL,
+                size_bytes INTEGER NOT NULL DEFAULT 0,
+                sha256 TEXT NOT NULL DEFAULT '',
+                modified_ns INTEGER NOT NULL DEFAULT 0,
+                verified INTEGER NOT NULL DEFAULT 0,
+                last_access INTEGER NOT NULL DEFAULT (unixepoch())
+            );
+            CREATE INDEX IF NOT EXISTS idx_media_cache_file_id
+                ON media_cache_entries(file_id);
+            CREATE INDEX IF NOT EXISTS idx_media_cache_lru
+                ON media_cache_entries(last_access, path);
+
+            CREATE TABLE IF NOT EXISTS catalog_changes (
+                seq INTEGER PRIMARY KEY AUTOINCREMENT,
+                entity TEXT NOT NULL CHECK(entity IN ('file','folder')),
+                entity_id TEXT NOT NULL,
+                operation TEXT NOT NULL CHECK(operation IN ('upsert','delete')),
+                changed_at INTEGER NOT NULL DEFAULT (unixepoch())
+            );
+            CREATE INDEX IF NOT EXISTS idx_catalog_changes_seq_entity
+                ON catalog_changes(seq, entity);
+            CREATE INDEX IF NOT EXISTS idx_catalog_changes_entity_id_seq
+                ON catalog_changes(entity, entity_id, seq DESC);
+
+            CREATE TRIGGER IF NOT EXISTS trg_catalog_files_insert
+            AFTER INSERT ON files BEGIN
+                INSERT INTO catalog_changes(entity,entity_id,operation)
+                VALUES ('file',NEW.id,'upsert');
+            END;
+            CREATE TRIGGER IF NOT EXISTS trg_catalog_files_update
+            AFTER UPDATE ON files
+            WHEN OLD.name IS NOT NEW.name
+              OR OLD.extension IS NOT NEW.extension
+              OR OLD.kind IS NOT NEW.kind
+              OR OLD.size_bytes IS NOT NEW.size_bytes
+              OR OLD.updated_at IS NOT NEW.updated_at
+              OR OLD.favorite IS NOT NEW.favorite
+              OR OLD.trashed IS NOT NEW.trashed
+              OR OLD.folder IS NOT NEW.folder
+              OR OLD.tags_json IS NOT NEW.tags_json
+              OR OLD.provider IS NOT NEW.provider
+              OR OLD.telegram_message_id IS NOT NEW.telegram_message_id
+            BEGIN
+                INSERT INTO catalog_changes(entity,entity_id,operation)
+                VALUES ('file',NEW.id,'upsert');
+            END;
+            CREATE TRIGGER IF NOT EXISTS trg_catalog_files_delete
+            AFTER DELETE ON files BEGIN
+                INSERT INTO catalog_changes(entity,entity_id,operation)
+                VALUES ('file',OLD.id,'delete');
+            END;
+            CREATE TRIGGER IF NOT EXISTS trg_catalog_locations_insert
+            AFTER INSERT ON file_locations BEGIN
+                INSERT INTO catalog_changes(entity,entity_id,operation)
+                VALUES ('file',NEW.file_id,'upsert');
+            END;
+            CREATE TRIGGER IF NOT EXISTS trg_catalog_locations_update
+            AFTER UPDATE ON file_locations
+            WHEN OLD.folder_id IS NOT NEW.folder_id
+            BEGIN
+                INSERT INTO catalog_changes(entity,entity_id,operation)
+                VALUES ('file',NEW.file_id,'upsert');
+            END;
+            CREATE TRIGGER IF NOT EXISTS trg_catalog_locations_delete
+            AFTER DELETE ON file_locations BEGIN
+                INSERT INTO catalog_changes(entity,entity_id,operation)
+                VALUES ('file',OLD.file_id,'upsert');
+            END;
+            CREATE TRIGGER IF NOT EXISTS trg_catalog_folders_insert
+            AFTER INSERT ON folders BEGIN
+                INSERT INTO catalog_changes(entity,entity_id,operation)
+                VALUES ('folder',NEW.id,'upsert');
+            END;
+            CREATE TRIGGER IF NOT EXISTS trg_catalog_folders_update
+            AFTER UPDATE ON folders
+            WHEN OLD.name IS NOT NEW.name
+              OR OLD.parent_id IS NOT NEW.parent_id
+              OR OLD.trashed IS NOT NEW.trashed
+              OR OLD.updated_at IS NOT NEW.updated_at
+            BEGIN
+                INSERT INTO catalog_changes(entity,entity_id,operation)
+                VALUES ('folder',NEW.id,'upsert');
+            END;
+            CREATE TRIGGER IF NOT EXISTS trg_catalog_folders_delete
+            AFTER DELETE ON folders BEGIN
+                INSERT INTO catalog_changes(entity,entity_id,operation)
+                VALUES ('folder',OLD.id,'delete');
+            END;
 
             INSERT OR IGNORE INTO transfer_runtime (transfer_id,phase,total_bytes,updated_at)
             SELECT t.id,
@@ -245,8 +491,16 @@ impl CatalogRepository {
             WHERE t.direction='upload' AND t.status='completed'
               AND m.remote_message_id IS NOT NULL AND m.remote_message_id<>''
               AND m.source_path IS NOT NULL AND m.source_path<>'' AND m.sha256<>'';
+
+            DROP INDEX IF EXISTS idx_files_active_updated;
+            DROP INDEX IF EXISTS idx_files_active_favorite;
+            CREATE INDEX idx_files_active_updated
+                ON files(trashed,updated_at DESC,id);
+            CREATE INDEX idx_files_active_favorite
+                ON files(trashed,favorite,updated_at DESC,id);
             "#,
         )?;
+        let _ = initialize_catalog_fts(&connection);
         Ok(())
     }
 
@@ -264,7 +518,7 @@ impl CatalogRepository {
     }
 
     pub fn list_files(&self) -> Result<Vec<CloudFile>, RepositoryError> {
-        let connection = self.connection.lock().expect("catalog mutex poisoned");
+        let connection = self.reader();
         let mut statement = connection.prepare(
             r#"WITH RECURSIVE folder_paths(id, path) AS (
                    SELECT id, name FROM folders WHERE parent_id IS NULL
@@ -312,30 +566,388 @@ impl CatalogRepository {
         Ok(files)
     }
 
-    pub fn catalog_rowid_cursor(&self) -> Result<i64, RepositoryError> {
-        self.connection
-            .lock()
-            .expect("catalog mutex poisoned")
-            .query_row("SELECT COALESCE(MAX(rowid),0) FROM files", [], |row| {
-                row.get(0)
+    pub fn list_files_page(&self, query: CatalogPageQuery) -> Result<CatalogPage, RepositoryError> {
+        let connection = self.reader();
+        let limit = query.limit.clamp(1, 200);
+        let offset = query.offset.min(10_000_000);
+        let search = query.search.trim().to_lowercase();
+        let mut predicates = Vec::<String>::new();
+        let mut values = Vec::<Value>::new();
+
+        if query.section == "trash" {
+            predicates.push("f.trashed=1".into());
+        } else {
+            predicates.push("f.trashed=0".into());
+        }
+        if query.section == "favorites" {
+            predicates.push("f.favorite=1".into());
+        }
+        if let Some(kind) = query
+            .kind
+            .as_deref()
+            .filter(|kind| *kind != "all" && !kind.is_empty())
+        {
+            predicates.push("f.kind=?".into());
+            values.push(Value::Text(kind.to_string()));
+        }
+        if let Some(tag) = query.tag.as_deref().filter(|tag| !tag.trim().is_empty()) {
+            predicates.push(
+                "EXISTS (SELECT 1 FROM json_each(f.tags_json) WHERE lower(value)=lower(?))".into(),
+            );
+            values.push(Value::Text(tag.trim().to_string()));
+        }
+        // Match the current UI semantics: when there is no search, "Mis archivos"
+        // is scoped to the selected folder. A search is intentionally global.
+        if query.section == "files" && search.is_empty() {
+            match query.folder_id {
+                Some(folder_id) => {
+                    predicates.push("fl.folder_id=?".into());
+                    values.push(Value::Text(folder_id));
+                }
+                None => predicates.push("fl.folder_id IS NULL".into()),
+            }
+        }
+        if !search.is_empty() {
+            let escaped = search
+                .replace('!', "!!")
+                .replace('%', "!%")
+                .replace('_', "!_");
+            let like = format!("%{escaped}%");
+            if search.chars().count() >= 3 && catalog_fts_available(&connection) {
+                let phrase = format!("\"{}\"", search.replace('"', "\"\""));
+                predicates.push(
+                    "(f.id IN (SELECT id FROM files_fts WHERE files_fts MATCH ?)
+                       OR lower(COALESCE(folder_paths.path,'Mi unidad')) LIKE ? ESCAPE '!')"
+                        .into(),
+                );
+                values.push(Value::Text(phrase));
+                values.push(Value::Text(like));
+            } else {
+                predicates.push(
+                    "(lower(f.name) LIKE ? ESCAPE '!'
+                       OR lower(f.extension) LIKE ? ESCAPE '!'
+                       OR lower(f.tags_json) LIKE ? ESCAPE '!'
+                       OR lower(COALESCE(folder_paths.path,'Mi unidad')) LIKE ? ESCAPE '!')"
+                        .into(),
+                );
+                for _ in 0..4 {
+                    values.push(Value::Text(like.clone()));
+                }
+            }
+        }
+
+        let where_sql = predicates.join(" AND ");
+        let cte = r#"WITH RECURSIVE folder_paths(id, path) AS (
+            SELECT id, name FROM folders WHERE parent_id IS NULL
+            UNION ALL
+            SELECT child.id, parent.path || ' / ' || child.name
+            FROM folders child JOIN folder_paths parent ON child.parent_id=parent.id
+        )"#;
+        let count_sql = format!(
+            "{cte}
+             SELECT COUNT(*)
+             FROM files f
+             LEFT JOIN file_locations fl ON fl.file_id=f.id
+             LEFT JOIN folder_paths ON folder_paths.id=fl.folder_id
+             WHERE {where_sql}"
+        );
+        let total: i64 = connection.query_row(
+            &count_sql,
+            rusqlite::params_from_iter(values.iter()),
+            |row| row.get(0),
+        )?;
+
+        let order_sql = match query.sort.as_str() {
+            "oldest" => "f.updated_at ASC,f.id ASC",
+            "name" => "f.name COLLATE NUVIO_NATURAL ASC,f.id ASC",
+            "size" => "f.size_bytes DESC,f.id ASC",
+            _ => "f.updated_at DESC,f.id ASC",
+        };
+        let data_sql = format!(
+            "{cte}
+             SELECT f.id,f.name,f.extension,f.kind,f.size_bytes,f.updated_at,
+                    f.favorite,f.trashed,COALESCE(folder_paths.path,'Mi unidad'),
+                    fl.folder_id,f.tags_json,f.provider,f.telegram_message_id
+             FROM files f
+             LEFT JOIN file_locations fl ON fl.file_id=f.id
+             LEFT JOIN folder_paths ON folder_paths.id=fl.folder_id
+             WHERE {where_sql}
+             ORDER BY {order_sql}
+             LIMIT ? OFFSET ?"
+        );
+        let mut data_values = values;
+        data_values.push(Value::Integer(limit as i64));
+        data_values.push(Value::Integer(offset as i64));
+        let mut statement = connection.prepare(&data_sql)?;
+        let rows = statement.query_map(rusqlite::params_from_iter(data_values.iter()), |row| {
+            let tags_json: String = row.get(10)?;
+            let tags = if tags_json.is_empty() || tags_json == "[]" {
+                Vec::new()
+            } else {
+                serde_json::from_str::<Vec<String>>(&tags_json).unwrap_or_default()
+            };
+            Ok(CloudFile {
+                id: row.get(0)?,
+                name: row.get(1)?,
+                extension: row.get(2)?,
+                kind: row.get(3)?,
+                size_bytes: row.get(4)?,
+                updated_at: row.get(5)?,
+                favorite: row.get::<_, i64>(6)? != 0,
+                trashed: row.get::<_, i64>(7)? != 0,
+                folder: row.get(8)?,
+                folder_id: row.get(9)?,
+                tags,
+                provider: row.get(11)?,
+                telegram_message_id: row.get(12)?,
             })
+        })?;
+        let mut files = Vec::with_capacity(limit.min(total.max(0) as usize));
+        for row in rows {
+            files.push(row?);
+        }
+
+        let total = total.max(0) as usize;
+        Ok(CatalogPage {
+            has_more: offset.saturating_add(files.len()) < total,
+            files,
+            total,
+            offset,
+            limit,
+        })
+    }
+
+    pub fn catalog_stats(&self) -> Result<(i64, usize, usize, usize), RepositoryError> {
+        let connection = self.reader();
+        let (total_bytes, file_count, favorite_count, trash_count): (i64, i64, i64, i64) =
+            connection.query_row(
+                "SELECT COALESCE(SUM(CASE WHEN trashed=0 THEN size_bytes ELSE 0 END),0),
+                        COUNT(CASE WHEN trashed=0 THEN 1 END),
+                        COUNT(CASE WHEN trashed=0 AND favorite=1 THEN 1 END),
+                        COUNT(CASE WHEN trashed=1 THEN 1 END)
+                 FROM files",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )?;
+        Ok((
+            total_bytes.max(0),
+            file_count.max(0) as usize,
+            favorite_count.max(0) as usize,
+            trash_count.max(0) as usize,
+        ))
+    }
+
+    pub fn media_cache_entry(
+        &self,
+        path: &Path,
+    ) -> Result<Option<MediaCacheEntry>, RepositoryError> {
+        let path = path.to_string_lossy();
+        self.reader()
+            .query_row(
+                "SELECT path,size_bytes,sha256,modified_ns,verified
+                 FROM media_cache_entries WHERE path=?1",
+                [path.as_ref()],
+                |row| {
+                    Ok(MediaCacheEntry {
+                        path: row.get(0)?,
+                        size_bytes: row.get(1)?,
+                        sha256: row.get(2)?,
+                        modified_ns: row.get(3)?,
+                        verified: row.get::<_, i64>(4)? != 0,
+                    })
+                },
+            )
+            .optional()
             .map_err(Into::into)
     }
 
-    pub fn sync_file_delta(
+    pub fn media_cache_reconcile_file(
         &self,
-        after_rowid: i64,
-    ) -> Result<(i64, Vec<CloudFile>), RepositoryError> {
-        let connection = self.connection.lock().expect("catalog mutex poisoned");
-        let cursor: i64 =
-            connection.query_row("SELECT COALESCE(MAX(rowid),0) FROM files", [], |row| {
-                row.get(0)
-            })?;
-        if cursor <= after_rowid {
-            return Ok((cursor, Vec::new()));
-        }
+        path: &Path,
+        size_bytes: i64,
+        modified_ns: i64,
+    ) -> Result<(), RepositoryError> {
+        self.connection
+            .lock()
+            .expect("catalog mutex poisoned")
+            .execute(
+                "INSERT INTO media_cache_entries(path,size_bytes,modified_ns,verified)
+                 VALUES (?1,?2,?3,0)
+                 ON CONFLICT(path) DO UPDATE SET
+                   size_bytes=excluded.size_bytes,
+                   sha256=CASE
+                     WHEN media_cache_entries.size_bytes=excluded.size_bytes
+                      AND media_cache_entries.modified_ns=excluded.modified_ns
+                     THEN media_cache_entries.sha256 ELSE '' END,
+                   modified_ns=excluded.modified_ns,
+                   verified=CASE
+                     WHEN media_cache_entries.size_bytes=excluded.size_bytes
+                      AND media_cache_entries.modified_ns=excluded.modified_ns
+                     THEN media_cache_entries.verified ELSE 0 END",
+                params![
+                    path.to_string_lossy().as_ref(),
+                    size_bytes.max(0),
+                    modified_ns
+                ],
+            )?;
+        Ok(())
+    }
+
+    pub fn media_cache_store_verified(
+        &self,
+        file_id: &str,
+        path: &Path,
+        size_bytes: i64,
+        sha256: &str,
+        modified_ns: i64,
+    ) -> Result<(), RepositoryError> {
+        self.connection
+            .lock()
+            .expect("catalog mutex poisoned")
+            .execute(
+                "INSERT INTO media_cache_entries(
+                    path,file_id,size_bytes,sha256,modified_ns,verified,last_access
+                 ) VALUES (?1,?2,?3,?4,?5,1,unixepoch())
+                 ON CONFLICT(path) DO UPDATE SET
+                    file_id=excluded.file_id,
+                    size_bytes=excluded.size_bytes,
+                    sha256=excluded.sha256,
+                    modified_ns=excluded.modified_ns,
+                    verified=1,
+                    last_access=unixepoch()",
+                params![
+                    path.to_string_lossy().as_ref(),
+                    file_id,
+                    size_bytes.max(0),
+                    sha256,
+                    modified_ns
+                ],
+            )?;
+        Ok(())
+    }
+
+    pub fn media_cache_touch(&self, path: &Path) -> Result<(), RepositoryError> {
+        self.connection
+            .lock()
+            .expect("catalog mutex poisoned")
+            .execute(
+                "UPDATE media_cache_entries SET last_access=unixepoch() WHERE path=?1",
+                [path.to_string_lossy().as_ref()],
+            )?;
+        Ok(())
+    }
+
+    pub fn media_cache_total_bytes(&self) -> Result<i64, RepositoryError> {
+        self.reader()
+            .query_row(
+                "SELECT COALESCE(SUM(size_bytes),0) FROM media_cache_entries",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .map(|value| value.max(0))
+            .map_err(Into::into)
+    }
+
+    pub fn media_cache_lru(&self, limit: usize) -> Result<Vec<MediaCacheEntry>, RepositoryError> {
+        let connection = self.reader();
         let mut statement = connection.prepare(
-            r#"WITH RECURSIVE folder_paths(id, path) AS (
+            "SELECT path,size_bytes,sha256,modified_ns,verified
+             FROM media_cache_entries
+             ORDER BY last_access ASC,path ASC
+             LIMIT ?1",
+        )?;
+        let rows = statement.query_map([limit.clamp(1, 4096) as i64], |row| {
+            Ok(MediaCacheEntry {
+                path: row.get(0)?,
+                size_bytes: row.get(1)?,
+                sha256: row.get(2)?,
+                modified_ns: row.get(3)?,
+                verified: row.get::<_, i64>(4)? != 0,
+            })
+        })?;
+        let mut entries = Vec::new();
+        for row in rows {
+            entries.push(row?);
+        }
+        Ok(entries)
+    }
+
+    pub fn media_cache_paths(&self) -> Result<Vec<String>, RepositoryError> {
+        let connection = self.reader();
+        let mut statement = connection.prepare("SELECT path FROM media_cache_entries")?;
+        let rows = statement.query_map([], |row| row.get::<_, String>(0))?;
+        let mut paths = Vec::new();
+        for row in rows {
+            paths.push(row?);
+        }
+        Ok(paths)
+    }
+
+    pub fn media_cache_remove_path(&self, path: &Path) -> Result<(), RepositoryError> {
+        self.connection
+            .lock()
+            .expect("catalog mutex poisoned")
+            .execute(
+                "DELETE FROM media_cache_entries WHERE path=?1",
+                [path.to_string_lossy().as_ref()],
+            )?;
+        Ok(())
+    }
+
+    pub fn media_cache_clear_index(&self) -> Result<(), RepositoryError> {
+        self.connection
+            .lock()
+            .expect("catalog mutex poisoned")
+            .execute("DELETE FROM media_cache_entries", [])?;
+        Ok(())
+    }
+
+    pub fn catalog_change_cursor(&self) -> Result<i64, RepositoryError> {
+        self.reader()
+            .query_row(
+                "SELECT COALESCE(MAX(seq),0) FROM catalog_changes",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(Into::into)
+    }
+
+    pub fn sync_file_delta(&self, after_seq: i64) -> Result<CatalogDelta, RepositoryError> {
+        let connection = self.reader();
+        let cursor: i64 = connection.query_row(
+            "SELECT COALESCE(MAX(seq),0) FROM catalog_changes",
+            [],
+            |row| row.get(0),
+        )?;
+        if cursor <= after_seq {
+            return Ok(CatalogDelta {
+                cursor,
+                files: Vec::new(),
+                removed_ids: Vec::new(),
+                folders_changed: false,
+            });
+        }
+
+        let folders_changed: bool = connection.query_row(
+            "SELECT EXISTS(SELECT 1 FROM catalog_changes WHERE seq>?1 AND entity='folder')",
+            [after_seq],
+            |row| row.get(0),
+        )?;
+
+        let mut statement = connection.prepare(
+            r#"WITH RECURSIVE
+               latest(entity_id, seq) AS (
+                   SELECT entity_id, MAX(seq)
+                   FROM catalog_changes
+                   WHERE seq > ?1 AND entity='file'
+                   GROUP BY entity_id
+               ),
+               changed(entity_id, seq, operation) AS (
+                   SELECT c.entity_id, c.seq, c.operation
+                   FROM catalog_changes c
+                   JOIN latest l ON l.seq=c.seq
+               ),
+               folder_paths(id, path) AS (
                    SELECT id, name FROM folders WHERE parent_id IS NULL
                    UNION ALL
                    SELECT child.id, parent.path || ' / ' || child.name
@@ -344,13 +956,14 @@ impl CatalogRepository {
                SELECT f.id, f.name, f.extension, f.kind, f.size_bytes, f.updated_at,
                       f.favorite, f.trashed, COALESCE(folder_paths.path, 'Mi unidad'),
                       fl.folder_id, f.tags_json, f.provider, f.telegram_message_id
-               FROM files f
-               LEFT JOIN file_locations fl ON fl.file_id = f.id
-               LEFT JOIN folder_paths ON folder_paths.id = fl.folder_id
-               WHERE f.rowid > ?1
-               ORDER BY f.rowid ASC"#,
+               FROM changed c
+               JOIN files f ON f.id=c.entity_id
+               LEFT JOIN file_locations fl ON fl.file_id=f.id
+               LEFT JOIN folder_paths ON folder_paths.id=fl.folder_id
+               WHERE c.operation='upsert'
+               ORDER BY c.seq ASC"#,
         )?;
-        let rows = statement.query_map([after_rowid], |row| {
+        let rows = statement.query_map([after_seq], |row| {
             let tags_json: String = row.get(10)?;
             let tags = if tags_json.is_empty() || tags_json == "[]" {
                 Vec::new()
@@ -377,17 +990,58 @@ impl CatalogRepository {
         for row in rows {
             files.push(row?);
         }
-        Ok((cursor, files))
+        drop(statement);
+
+        let mut removed_statement = connection.prepare(
+            r#"WITH latest(entity_id, seq) AS (
+                   SELECT entity_id, MAX(seq)
+                   FROM catalog_changes
+                   WHERE seq > ?1 AND entity='file'
+                   GROUP BY entity_id
+               )
+               SELECT c.entity_id
+               FROM catalog_changes c
+               JOIN latest l ON l.seq=c.seq
+               WHERE c.operation='delete'
+               ORDER BY c.seq ASC"#,
+        )?;
+        let removed_rows =
+            removed_statement.query_map([after_seq], |row| row.get::<_, String>(0))?;
+        let mut removed_ids = Vec::new();
+        for row in removed_rows {
+            removed_ids.push(row?);
+        }
+
+        Ok(CatalogDelta {
+            cursor,
+            files,
+            removed_ids,
+            folders_changed,
+        })
     }
 
     pub fn list_folders(&self) -> Result<Vec<CloudFolder>, RepositoryError> {
-        let connection = self.connection.lock().expect("catalog mutex poisoned");
+        let connection = self.reader();
         let mut statement = connection.prepare(
-            r#"SELECT f.id, f.name, f.parent_id, f.trashed, f.created_at, f.updated_at,
-                      (SELECT COUNT(*) FROM file_locations fl JOIN files fi ON fi.id=fl.file_id WHERE fl.folder_id=f.id AND fi.trashed=0),
-                      (SELECT COUNT(*) FROM folders child WHERE child.parent_id=f.id AND child.trashed=0),
-                      COALESCE((SELECT SUM(fi.size_bytes) FROM file_locations fl JOIN files fi ON fi.id=fl.file_id WHERE fl.folder_id=f.id AND fi.trashed=0),0)
+            r#"WITH file_stats(folder_id, file_count, size_bytes) AS (
+                   SELECT fl.folder_id, COUNT(*), COALESCE(SUM(fi.size_bytes),0)
+                   FROM file_locations fl
+                   JOIN files fi ON fi.id=fl.file_id
+                   WHERE fi.trashed=0
+                   GROUP BY fl.folder_id
+               ),
+               child_stats(parent_id, child_count) AS (
+                   SELECT parent_id, COUNT(*)
+                   FROM folders
+                   WHERE trashed=0
+                   GROUP BY parent_id
+               )
+               SELECT f.id, f.name, f.parent_id, f.trashed, f.created_at, f.updated_at,
+                      COALESCE(fs.file_count,0), COALESCE(cs.child_count,0),
+                      COALESCE(fs.size_bytes,0)
                FROM folders f
+               LEFT JOIN file_stats fs ON fs.folder_id=f.id
+               LEFT JOIN child_stats cs ON cs.parent_id=f.id
                ORDER BY lower(f.name), f.id"#,
         )?;
         let rows = statement.query_map([], |row| {
@@ -556,8 +1210,155 @@ impl CatalogRepository {
     }
 
     pub fn list_transfers(&self) -> Result<Vec<TransferJob>, RepositoryError> {
-        let connection = self.connection.lock().expect("catalog mutex poisoned");
-        let mut statement = connection.prepare(
+        self.list_transfers_matching("1=1", None)
+    }
+
+    pub fn list_active_transfers(&self) -> Result<Vec<TransferJob>, RepositoryError> {
+        let mut transfers = self.list_transfers_matching(
+            "t.status NOT IN ('completed','duplicate','cancelled')",
+            None,
+        )?;
+        self.overlay_live_runtime(&mut transfers);
+        Ok(transfers)
+    }
+
+    fn overlay_live_runtime(&self, transfers: &mut [TransferJob]) {
+        let active_ids = transfers
+            .iter()
+            .map(|job| job.id.as_str())
+            .collect::<std::collections::HashSet<_>>();
+        let mut live = self
+            .live_runtime
+            .lock()
+            .expect("live transfer runtime mutex poisoned");
+        live.retain(|id, _| active_ids.contains(id.as_str()));
+
+        for job in transfers {
+            let Some(runtime) = live.get(&job.id) else {
+                continue;
+            };
+            job.status.clone_from(&runtime.status);
+            job.phase.clone_from(&runtime.phase);
+            job.progress = runtime.progress;
+            job.processed_bytes = runtime.processed_bytes;
+            job.total_bytes = runtime.total_bytes;
+            job.speed_bps = runtime.speed_bps;
+            job.eta_seconds = runtime.eta_seconds;
+            job.speed_label.clone_from(&runtime.speed_label);
+            job.error.clone_from(&runtime.error);
+            job.can_pause = matches!(
+                job.status.as_str(),
+                "waiting"
+                    | "analyzing"
+                    | "copying"
+                    | "ready"
+                    | "queued"
+                    | "uploading"
+                    | "downloading"
+                    | "confirming"
+                    | "running"
+            );
+            job.can_retry = matches!(job.status.as_str(), "failed" | "paused" | "cancelled");
+            job.can_cancel =
+                !matches!(job.status.as_str(), "completed" | "duplicate" | "cancelled");
+        }
+    }
+
+    fn clear_live_runtime(&self, id: &str) {
+        self.live_runtime
+            .lock()
+            .expect("live transfer runtime mutex poisoned")
+            .remove(id);
+    }
+
+    fn remember_verified_staging(&self, id: &str, path: &str, size_bytes: i64) {
+        let Ok(metadata) = fs::metadata(path) else {
+            return;
+        };
+        if !metadata.is_file() || metadata.len() != size_bytes.max(0) as u64 {
+            return;
+        }
+        self.verified_staging
+            .lock()
+            .expect("verified staging mutex poisoned")
+            .insert(
+                id.to_string(),
+                VerifiedStaging {
+                    path: path.to_string(),
+                    size_bytes,
+                    modified: metadata.modified().ok(),
+                },
+            );
+    }
+
+    pub(crate) fn take_verified_staging(&self, id: &str, path: &str, size_bytes: i64) -> bool {
+        let Some(verified) = self
+            .verified_staging
+            .lock()
+            .expect("verified staging mutex poisoned")
+            .remove(id)
+        else {
+            return false;
+        };
+        if verified.path != path || verified.size_bytes != size_bytes {
+            return false;
+        }
+        let Ok(metadata) = fs::metadata(path) else {
+            return false;
+        };
+        metadata.is_file()
+            && metadata.len() == size_bytes.max(0) as u64
+            && metadata.modified().ok() == verified.modified
+    }
+
+    pub fn list_transfer_history(&self, limit: usize) -> Result<Vec<TransferJob>, RepositoryError> {
+        self.list_transfers_matching(
+            "t.status IN ('completed','duplicate','cancelled')",
+            Some(limit.clamp(1, 10_000)),
+        )
+    }
+
+    pub fn transfer_history_cursor(&self) -> Result<i64, RepositoryError> {
+        self.reader()
+            .query_row(
+                "SELECT COALESCE(MAX(seq),0) FROM transfer_history_changes",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(Into::into)
+    }
+
+    pub fn transfer_by_id(&self, id: &str) -> Result<Option<TransferJob>, RepositoryError> {
+        let connection = self.reader();
+        connection
+            .query_row(
+                r#"SELECT t.id,t.file_name,t.direction,t.progress,t.status,t.speed_label,
+                          COALESCE(r.phase,t.status),COALESCE(r.processed_bytes,0),
+                          COALESCE(r.total_bytes,m.size_bytes,0),COALESCE(r.speed_bps,0),r.eta_seconds,
+                          COALESCE(r.attempts,0),COALESCE(r.max_attempts,5),m.error,m.source_path,
+                          COALESCE(m.source_deleted,0),m.source_delete_error,m.remote_message_id,r.started_at,
+                          COALESCE(r.updated_at,m.created_at,0)
+                   FROM transfers t
+                   LEFT JOIN transfer_metadata m ON m.transfer_id=t.id
+                   LEFT JOIN transfer_runtime r ON r.transfer_id=t.id
+                   WHERE t.id=?1
+                   LIMIT 1"#,
+                [id],
+                transfer_job_from_row,
+            )
+            .optional()
+            .map_err(Into::into)
+    }
+
+    fn list_transfers_matching(
+        &self,
+        predicate: &str,
+        limit: Option<usize>,
+    ) -> Result<Vec<TransferJob>, RepositoryError> {
+        let limit_clause = limit
+            .map(|value| format!(" LIMIT {value}"))
+            .unwrap_or_default();
+        let sql = format!(
             r#"SELECT t.id,t.file_name,t.direction,t.progress,t.status,t.speed_label,
                       COALESCE(r.phase,t.status),COALESCE(r.processed_bytes,0),
                       COALESCE(r.total_bytes,m.size_bytes,0),COALESCE(r.speed_bps,0),r.eta_seconds,
@@ -567,61 +1368,12 @@ impl CatalogRepository {
                FROM transfers t
                LEFT JOIN transfer_metadata m ON m.transfer_id=t.id
                LEFT JOIN transfer_runtime r ON r.transfer_id=t.id
-               ORDER BY COALESCE(r.updated_at,m.created_at,0) DESC,t.rowid DESC"#,
-        )?;
-        let rows = statement.query_map([], |row| {
-            let raw_progress: i64 = row.get(3)?;
-            let direction: String = row.get(2)?;
-            let status: String = row.get(4)?;
-            let source_path: Option<String> = row.get(14)?;
-            let source_deleted = row.get::<_, i64>(15)? != 0;
-            let remote_message_id: Option<String> = row.get(17)?;
-            let active = matches!(
-                status.as_str(),
-                "waiting"
-                    | "analyzing"
-                    | "copying"
-                    | "ready"
-                    | "queued"
-                    | "uploading"
-                    | "downloading"
-                    | "confirming"
-                    | "retry_wait"
-                    | "running"
-            );
-            let source_delete_available = direction == "upload"
-                && status == "completed"
-                && !source_deleted
-                && source_path.as_deref().is_some_and(|path| !path.is_empty())
-                && remote_message_id
-                    .as_deref()
-                    .is_some_and(|id| !id.is_empty());
-            Ok(TransferJob {
-                id: row.get(0)?,
-                file_name: row.get(1)?,
-                direction,
-                progress: raw_progress.clamp(0, 100) as u8,
-                status: status.clone(),
-                speed_label: row.get(5)?,
-                phase: row.get(6)?,
-                processed_bytes: row.get(7)?,
-                total_bytes: row.get(8)?,
-                speed_bps: row.get(9)?,
-                eta_seconds: row.get(10)?,
-                attempts: row.get(11)?,
-                max_attempts: row.get(12)?,
-                error: row.get(13)?,
-                can_pause: active && status != "retry_wait",
-                can_retry: matches!(status.as_str(), "failed" | "paused" | "cancelled"),
-                can_cancel: !matches!(status.as_str(), "completed" | "duplicate" | "cancelled"),
-                source_delete_available,
-                source_deleted,
-                source_delete_error: row.get(16)?,
-                started_at: row.get(18)?,
-                updated_at: row.get(19)?,
-            })
-        })?;
-
+               WHERE {predicate}
+               ORDER BY COALESCE(r.updated_at,m.created_at,0) DESC,t.rowid DESC{limit_clause}"#
+        );
+        let connection = self.reader();
+        let mut statement = connection.prepare(&sql)?;
+        let rows = statement.query_map([], transfer_job_from_row)?;
         let mut transfers = Vec::new();
         for row in rows {
             transfers.push(row?);
@@ -630,10 +1382,22 @@ impl CatalogRepository {
     }
 
     pub fn queue_summary(&self, cache_bytes: i64) -> Result<QueueSummary, RepositoryError> {
-        let all_jobs = self.list_transfers()?;
-        self.queue_summary_from_jobs(&all_jobs, cache_bytes)
+        let jobs = self.list_active_transfers()?;
+        let completed: i64 = self.reader().query_row(
+            "SELECT COUNT(*) FROM transfers WHERE status IN ('completed','duplicate')",
+            [],
+            |row| row.get(0),
+        )?;
+        let settings = self.settings()?;
+        Ok(queue_summary_from_active_jobs(
+            &jobs,
+            completed.max(0) as usize,
+            cache_bytes,
+            settings.cache_limit_bytes,
+        ))
     }
 
+    #[cfg(test)]
     pub(crate) fn queue_summary_from_jobs(
         &self,
         all_jobs: &[TransferJob],
@@ -643,118 +1407,59 @@ impl CatalogRepository {
             .iter()
             .filter(|job| matches!(job.status.as_str(), "completed" | "duplicate"))
             .count();
-        let jobs: Vec<_> = all_jobs
+        let jobs = all_jobs
             .iter()
             .filter(|job| !matches!(job.status.as_str(), "completed" | "duplicate" | "cancelled"))
-            .collect();
+            .cloned()
+            .collect::<Vec<_>>();
         let settings = self.settings()?;
-        let total = jobs.len();
-        let failed = jobs.iter().filter(|j| j.status == "failed").count();
-        let active = jobs
-            .iter()
-            .filter(|j| {
-                matches!(
-                    j.status.as_str(),
-                    "analyzing"
-                        | "copying"
-                        | "uploading"
-                        | "downloading"
-                        | "confirming"
-                        | "running"
-                )
-            })
-            .count();
-        let pending = jobs
-            .iter()
-            .filter(|j| {
-                !matches!(
-                    j.status.as_str(),
-                    "completed" | "duplicate" | "failed" | "cancelled"
-                )
-            })
-            .count();
-        let total_bytes: i64 = jobs
-            .iter()
-            .filter(|j| j.status != "cancelled")
-            .map(|j| j.total_bytes.max(0))
-            .sum();
-        let processed_bytes: i64 = jobs
-            .iter()
-            .filter(|j| j.status != "cancelled")
-            .map(|j| j.processed_bytes.clamp(0, j.total_bytes.max(0)))
-            .sum();
-        let speed_bps: i64 = jobs
-            .iter()
-            .filter(|j| {
-                matches!(
-                    j.status.as_str(),
-                    "uploading" | "downloading" | "copying" | "analyzing" | "running"
-                )
-            })
-            .map(|j| j.speed_bps.max(0))
-            .sum();
-        let remaining = (total_bytes - processed_bytes).max(0);
-        let eta_seconds = if speed_bps > 0 {
-            Some((remaining + speed_bps - 1) / speed_bps)
-        } else {
-            None
-        };
-        Ok(QueueSummary {
-            total,
+        Ok(queue_summary_from_active_jobs(
+            &jobs,
             completed,
-            pending,
-            failed,
-            active,
-            processed_bytes,
-            total_bytes,
-            speed_bps,
-            eta_seconds,
             cache_bytes,
-            cache_limit_bytes: settings.cache_limit_bytes,
-        })
+            settings.cache_limit_bytes,
+        ))
     }
 
     pub fn settings(&self) -> Result<AppSettings, RepositoryError> {
-        let connection = self.connection.lock().expect("catalog mutex poisoned");
-        let get = |key: &str| -> Result<Option<String>, rusqlite::Error> {
-            connection
-                .query_row("SELECT value FROM app_settings WHERE key=?1", [key], |r| {
-                    r.get(0)
-                })
-                .optional()
-        };
+        let connection = self.reader();
+        let mut statement = connection.prepare("SELECT key,value FROM app_settings")?;
+        let rows = statement.query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })?;
+        let mut values = HashMap::with_capacity(8);
+        for row in rows {
+            let (key, value) = row?;
+            values.insert(key, value);
+        }
         let defaults = AppSettings::default();
-        let prep = get("preparation_concurrency")?
+        let get = |key: &str| values.get(key).map(String::as_str);
+        let prep = get("preparation_concurrency")
             .and_then(|v| v.parse().ok())
             .unwrap_or(defaults.preparation_concurrency)
             .clamp(1, 8);
-        let upload = get("upload_concurrency")?
+        let upload = get("upload_concurrency")
             .and_then(|v| v.parse().ok())
             .unwrap_or(defaults.upload_concurrency)
             .clamp(1, 16);
-        let download = get("download_concurrency")?
+        let download = get("download_concurrency")
             .and_then(|v| v.parse().ok())
             .unwrap_or(defaults.download_concurrency)
             .clamp(1, 8);
-        let cache = get("cache_limit_bytes")?
+        let cache = get("cache_limit_bytes")
             .and_then(|v| v.parse().ok())
             .unwrap_or(defaults.cache_limit_bytes)
             .clamp(256 * 1024 * 1024, 20 * 1024 * 1024 * 1024_i64);
-        let remember = get("remember_session")?.map(|v| v == "1").unwrap_or(false);
-        let conflict = get("conflict_policy")?
-            .filter(|v| v == "skip" || v == "rename")
+        let remember = get("remember_session").is_some_and(|v| v == "1");
+        let conflict = get("conflict_policy")
+            .filter(|v| *v == "skip" || *v == "rename")
+            .map(str::to_owned)
             .unwrap_or(defaults.conflict_policy);
-        let delete_original_after_upload = get("delete_original_after_upload")?
-            .map(|v| v == "1")
-            .unwrap_or(defaults.delete_original_after_upload);
-        let speed_limit_bps = get("speed_limit_bps")?
-            .and_then(|v| {
-                if v.is_empty() {
-                    None
-                } else {
-                    v.parse::<i64>().ok()
-                }
-            })
+        let delete_original_after_upload =
+            get("delete_original_after_upload").is_some_and(|v| v == "1");
+        let speed_limit_bps = get("speed_limit_bps")
+            .filter(|v| !v.is_empty())
+            .and_then(|v| v.parse::<i64>().ok())
             .filter(|v| *v > 0);
         Ok(AppSettings {
             preparation_concurrency: prep,
@@ -1028,6 +1733,7 @@ impl CatalogRepository {
     }
 
     pub fn reset_preparation(&self, id: &str) -> Result<(), RepositoryError> {
+        self.clear_live_runtime(id);
         let mut connection = self.connection.lock().expect("catalog mutex poisoned");
         let transaction = connection.transaction()?;
         transaction.execute(
@@ -1076,6 +1782,15 @@ impl CatalogRepository {
         let prepared_bytes = if duplicate { total_bytes } else { 0 };
         transaction.execute("UPDATE transfer_runtime SET phase=?1,processed_bytes=?2,total_bytes=?3,speed_bps=0,eta_seconds=NULL,pause_requested=0,cancel_requested=0,updated_at=unixepoch(),completed_at=CASE WHEN ?1='duplicate' THEN unixepoch() ELSE NULL END WHERE transfer_id=?4", params![status,prepared_bytes,total_bytes,id])?;
         transaction.commit()?;
+        self.clear_live_runtime(id);
+        if duplicate {
+            self.verified_staging
+                .lock()
+                .expect("verified staging mutex poisoned")
+                .remove(id);
+        } else {
+            self.remember_verified_staging(id, local_path, total_bytes);
+        }
         Ok(duplicate)
     }
 
@@ -1092,27 +1807,99 @@ impl CatalogRepository {
         speed_label: &str,
         error: Option<&str>,
     ) -> Result<(), RepositoryError> {
+        let processed_bytes = processed_bytes.max(0);
+        let total_bytes = total_bytes.max(0);
+        let speed_bps = speed_bps.max(0);
         let progress = if total_bytes > 0 {
-            (processed_bytes.saturating_mul(100) / total_bytes).clamp(0, 100)
+            (processed_bytes.saturating_mul(100) / total_bytes).clamp(0, 100) as u8
         } else {
             0
         };
-        let mut connection = self.connection.lock().expect("catalog mutex poisoned");
-        let transaction = connection.transaction()?;
-        transaction.execute(
-            "UPDATE transfers SET status=?1,progress=?2,speed_label=?3 WHERE id=?4",
-            params![status, progress, speed_label, id],
-        )?;
-        transaction.execute(
-            "UPDATE transfer_metadata SET error=?1 WHERE transfer_id=?2",
-            params![error, id],
-        )?;
-        transaction.execute(
-            "UPDATE transfer_runtime SET phase=?1,processed_bytes=?2,total_bytes=?3,speed_bps=?4,eta_seconds=?5,started_at=COALESCE(started_at,unixepoch()),updated_at=unixepoch(),completed_at=CASE WHEN ?6='completed' THEN unixepoch() ELSE completed_at END WHERE transfer_id=?7",
-            params![phase,processed_bytes.max(0),total_bytes.max(0),speed_bps.max(0),eta_seconds,status,id],
-        )?;
-        transaction.commit()?;
-        Ok(())
+        let now = Instant::now();
+
+        // UI telemetry can arrive several times per second. Keep the freshest value in
+        // memory, but persist only once per second while a phase is stable. Phase/status
+        // transitions, errors and completion boundaries are durable immediately.
+        let should_persist = {
+            let mut live = self
+                .live_runtime
+                .lock()
+                .expect("live transfer runtime mutex poisoned");
+            let previous = live.get(id);
+            let phase_changed =
+                previous.is_none_or(|value| value.phase != phase || value.status != status);
+            let crossed_completion = total_bytes > 0
+                && processed_bytes >= total_bytes
+                && previous.is_none_or(|value| value.processed_bytes < total_bytes);
+            let persistence_due = previous.is_none_or(|value| {
+                now.duration_since(value.last_persisted) >= Duration::from_secs(1)
+            });
+            let terminal = matches!(
+                status,
+                "completed" | "failed" | "paused" | "cancelled" | "duplicate" | "retry_wait"
+            );
+            let should_persist = phase_changed
+                || crossed_completion
+                || persistence_due
+                || terminal
+                || error.is_some();
+            let last_persisted = if should_persist {
+                now
+            } else {
+                previous.expect("checked above").last_persisted
+            };
+            live.insert(
+                id.to_string(),
+                LiveTransferRuntime {
+                    status: status.to_string(),
+                    phase: phase.to_string(),
+                    progress,
+                    processed_bytes,
+                    total_bytes,
+                    speed_bps,
+                    eta_seconds,
+                    speed_label: speed_label.to_string(),
+                    error: error.map(str::to_string),
+                    last_persisted,
+                },
+            );
+            should_persist
+        };
+
+        if !should_persist {
+            return Ok(());
+        }
+
+        let persisted = (|| {
+            let mut connection = self.connection.lock().expect("catalog mutex poisoned");
+            let transaction = connection.transaction()?;
+            transaction.execute(
+                "UPDATE transfers SET status=?1,progress=?2,speed_label=?3 WHERE id=?4",
+                params![status, progress as i64, speed_label, id],
+            )?;
+            transaction.execute(
+                "UPDATE transfer_metadata SET error=?1 WHERE transfer_id=?2",
+                params![error, id],
+            )?;
+            transaction.execute(
+                "UPDATE transfer_runtime SET phase=?1,processed_bytes=?2,total_bytes=?3,speed_bps=?4,eta_seconds=?5,started_at=COALESCE(started_at,unixepoch()),updated_at=unixepoch(),completed_at=CASE WHEN ?6='completed' THEN unixepoch() ELSE completed_at END WHERE transfer_id=?7",
+                params![phase,processed_bytes,total_bytes,speed_bps,eta_seconds,status,id],
+            )?;
+            transaction.commit()?;
+            Ok::<(), RepositoryError>(())
+        })();
+
+        if persisted.is_err() {
+            if let Some(runtime) = self
+                .live_runtime
+                .lock()
+                .expect("live transfer runtime mutex poisoned")
+                .get_mut(id)
+            {
+                runtime.last_persisted = Instant::now() - Duration::from_secs(1);
+            }
+        }
+        persisted
     }
 
     pub fn update_transfer_state(
@@ -1156,6 +1943,7 @@ impl CatalogRepository {
             )?;
         }
         transaction.commit()?;
+        self.clear_live_runtime(id);
         Ok(())
     }
 
@@ -1199,6 +1987,7 @@ impl CatalogRepository {
     }
 
     pub fn resume(&self, id: &str) -> Result<(), RepositoryError> {
+        self.clear_live_runtime(id);
         let mut connection = self.connection.lock().expect("catalog mutex poisoned");
         let transaction = connection.transaction()?;
         let direction: String =
@@ -1248,6 +2037,7 @@ impl CatalogRepository {
     }
 
     pub fn mark_retry_or_failed(&self, id: &str, error: &str) -> Result<bool, RepositoryError> {
+        self.clear_live_runtime(id);
         let connection = self.connection.lock().expect("catalog mutex poisoned");
         let (attempts, max_attempts): (i32, i32) = connection.query_row(
             "SELECT attempts,max_attempts FROM transfer_runtime WHERE transfer_id=?1",
@@ -1290,6 +2080,21 @@ impl CatalogRepository {
         )?;
         connection.execute("UPDATE transfer_runtime SET phase=CASE (SELECT direction FROM transfers WHERE id=transfer_id) WHEN 'upload' THEN 'ready' ELSE 'queued' END,next_retry_at=NULL,updated_at=unixepoch() WHERE next_retry_at IS NOT NULL AND next_retry_at<=unixepoch()",[])?;
         Ok(())
+    }
+
+    pub fn next_retry_delay(&self) -> Result<Option<Duration>, RepositoryError> {
+        let connection = self.reader();
+        let seconds: Option<i64> = connection.query_row(
+            "SELECT CASE
+                 WHEN MIN(next_retry_at) IS NULL THEN NULL
+                 ELSE MAX(MIN(next_retry_at)-unixepoch(),0)
+             END
+             FROM transfer_runtime
+             WHERE next_retry_at IS NOT NULL",
+            [],
+            |row| row.get(0),
+        )?;
+        Ok(seconds.map(|value| Duration::from_secs(value.max(0) as u64)))
     }
 
     pub fn active_count(&self) -> Result<usize, RepositoryError> {
@@ -1350,6 +2155,267 @@ impl CatalogRepository {
         connection.execute("UPDATE transfer_runtime SET pause_requested=1,updated_at=unixepoch() WHERE transfer_id IN (SELECT id FROM transfers WHERE status IN ('analyzing','copying','uploading','downloading','confirming','running'))",[])?;
         Ok(())
     }
+}
+
+fn queue_summary_from_active_jobs(
+    jobs: &[TransferJob],
+    completed: usize,
+    cache_bytes: i64,
+    cache_limit_bytes: i64,
+) -> QueueSummary {
+    let total = jobs.len();
+    let failed = jobs.iter().filter(|job| job.status == "failed").count();
+    let active = jobs
+        .iter()
+        .filter(|job| {
+            matches!(
+                job.status.as_str(),
+                "analyzing" | "copying" | "uploading" | "downloading" | "confirming" | "running"
+            )
+        })
+        .count();
+    let pending = jobs
+        .iter()
+        .filter(|job| {
+            !matches!(
+                job.status.as_str(),
+                "completed" | "duplicate" | "failed" | "cancelled"
+            )
+        })
+        .count();
+    let total_bytes: i64 = jobs.iter().map(|job| job.total_bytes.max(0)).sum();
+    let processed_bytes: i64 = jobs
+        .iter()
+        .map(|job| job.processed_bytes.clamp(0, job.total_bytes.max(0)))
+        .sum();
+    let speed_bps: i64 = jobs
+        .iter()
+        .filter(|job| {
+            matches!(
+                job.status.as_str(),
+                "uploading" | "downloading" | "copying" | "analyzing" | "running"
+            )
+        })
+        .map(|job| job.speed_bps.max(0))
+        .sum();
+    let remaining = (total_bytes - processed_bytes).max(0);
+    let eta_seconds = if speed_bps > 0 {
+        Some((remaining + speed_bps - 1) / speed_bps)
+    } else {
+        None
+    };
+    QueueSummary {
+        total,
+        completed,
+        pending,
+        failed,
+        active,
+        processed_bytes,
+        total_bytes,
+        speed_bps,
+        eta_seconds,
+        cache_bytes,
+        cache_limit_bytes,
+    }
+}
+
+fn transfer_job_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<TransferJob> {
+    let raw_progress: i64 = row.get(3)?;
+    let direction: String = row.get(2)?;
+    let status: String = row.get(4)?;
+    let source_path: Option<String> = row.get(14)?;
+    let source_deleted = row.get::<_, i64>(15)? != 0;
+    let remote_message_id: Option<String> = row.get(17)?;
+    let active = matches!(
+        status.as_str(),
+        "waiting"
+            | "analyzing"
+            | "copying"
+            | "ready"
+            | "queued"
+            | "uploading"
+            | "downloading"
+            | "confirming"
+            | "retry_wait"
+            | "running"
+    );
+    let source_delete_available = direction == "upload"
+        && status == "completed"
+        && !source_deleted
+        && source_path.as_deref().is_some_and(|path| !path.is_empty())
+        && remote_message_id
+            .as_deref()
+            .is_some_and(|id| !id.is_empty());
+    Ok(TransferJob {
+        id: row.get(0)?,
+        file_name: row.get(1)?,
+        direction,
+        progress: raw_progress.clamp(0, 100) as u8,
+        status: status.clone(),
+        speed_label: row.get(5)?,
+        phase: row.get(6)?,
+        processed_bytes: row.get(7)?,
+        total_bytes: row.get(8)?,
+        speed_bps: row.get(9)?,
+        eta_seconds: row.get(10)?,
+        attempts: row.get(11)?,
+        max_attempts: row.get(12)?,
+        error: row.get(13)?,
+        can_pause: active && status != "retry_wait",
+        can_retry: matches!(status.as_str(), "failed" | "paused" | "cancelled"),
+        can_cancel: !matches!(status.as_str(), "completed" | "duplicate" | "cancelled"),
+        source_delete_available,
+        source_deleted,
+        source_delete_error: row.get(16)?,
+        started_at: row.get(18)?,
+        updated_at: row.get(19)?,
+    })
+}
+
+fn initialize_catalog_fts(connection: &Connection) -> Result<bool, RepositoryError> {
+    let schema = connection.execute_batch(
+        r#"
+        CREATE VIRTUAL TABLE IF NOT EXISTS files_fts
+        USING fts5(id UNINDEXED,name,extension,tags,tokenize='trigram');
+
+        CREATE TRIGGER IF NOT EXISTS trg_files_fts_insert
+        AFTER INSERT ON files BEGIN
+            INSERT INTO files_fts(id,name,extension,tags)
+            VALUES (NEW.id,NEW.name,NEW.extension,NEW.tags_json);
+        END;
+        CREATE TRIGGER IF NOT EXISTS trg_files_fts_delete
+        AFTER DELETE ON files BEGIN
+            DELETE FROM files_fts WHERE id=OLD.id;
+        END;
+        CREATE TRIGGER IF NOT EXISTS trg_files_fts_update
+        AFTER UPDATE OF name,extension,tags_json ON files BEGIN
+            DELETE FROM files_fts WHERE id=OLD.id;
+            INSERT INTO files_fts(id,name,extension,tags)
+            VALUES (NEW.id,NEW.name,NEW.extension,NEW.tags_json);
+        END;
+        "#,
+    );
+    if schema.is_err() {
+        let _ = connection.execute(
+            "INSERT INTO app_meta(key,value) VALUES ('catalog_fts5','0')
+             ON CONFLICT(key) DO UPDATE SET value='0'",
+            [],
+        );
+        return Ok(false);
+    }
+
+    let file_count: i64 =
+        connection.query_row("SELECT COUNT(*) FROM files", [], |row| row.get(0))?;
+    let fts_count: i64 =
+        connection.query_row("SELECT COUNT(*) FROM files_fts", [], |row| row.get(0))?;
+    if file_count != fts_count {
+        let transaction = connection.unchecked_transaction()?;
+        transaction.execute("DELETE FROM files_fts", [])?;
+        transaction.execute(
+            "INSERT INTO files_fts(id,name,extension,tags)
+             SELECT id,name,extension,tags_json FROM files",
+            [],
+        )?;
+        transaction.commit()?;
+    }
+    connection.execute(
+        "INSERT INTO app_meta(key,value) VALUES ('catalog_fts5','1')
+         ON CONFLICT(key) DO UPDATE SET value='1'",
+        [],
+    )?;
+    Ok(true)
+}
+
+fn catalog_fts_available(connection: &Connection) -> bool {
+    connection
+        .query_row(
+            "SELECT value='1' FROM app_meta WHERE key='catalog_fts5'",
+            [],
+            |row| row.get::<_, bool>(0),
+        )
+        .unwrap_or(false)
+}
+
+fn natural_name_compare(left: &str, right: &str) -> std::cmp::Ordering {
+    use std::cmp::Ordering as Cmp;
+
+    let left_bytes = left.as_bytes();
+    let right_bytes = right.as_bytes();
+    let mut li = 0usize;
+    let mut ri = 0usize;
+
+    while li < left_bytes.len() && ri < right_bytes.len() {
+        if left_bytes[li].is_ascii_digit() && right_bytes[ri].is_ascii_digit() {
+            let left_start = li;
+            while li < left_bytes.len() && left_bytes[li].is_ascii_digit() {
+                li += 1;
+            }
+            let right_start = ri;
+            while ri < right_bytes.len() && right_bytes[ri].is_ascii_digit() {
+                ri += 1;
+            }
+
+            let left_run = &left[left_start..li];
+            let right_run = &right[right_start..ri];
+            let left_sig = left_run.trim_start_matches('0');
+            let right_sig = right_run.trim_start_matches('0');
+            let left_sig = if left_sig.is_empty() { "0" } else { left_sig };
+            let right_sig = if right_sig.is_empty() { "0" } else { right_sig };
+
+            match left_sig.len().cmp(&right_sig.len()) {
+                Cmp::Equal => {}
+                other => return other,
+            }
+            match left_sig.cmp(right_sig) {
+                Cmp::Equal => {}
+                other => return other,
+            }
+            match left_run.len().cmp(&right_run.len()) {
+                Cmp::Equal => {}
+                other => return other,
+            }
+            continue;
+        }
+
+        let left_char = left[li..].chars().next().expect("valid utf-8");
+        let right_char = right[ri..].chars().next().expect("valid utf-8");
+
+        let mut left_fold = left_char.to_lowercase();
+        let mut right_fold = right_char.to_lowercase();
+        loop {
+            match (left_fold.next(), right_fold.next()) {
+                (Some(a), Some(b)) if a == b => {}
+                (Some(a), Some(b)) => return a.cmp(&b),
+                (None, None) => break,
+                (None, Some(_)) => return Cmp::Less,
+                (Some(_), None) => return Cmp::Greater,
+            }
+        }
+
+        li += left_char.len_utf8();
+        ri += right_char.len_utf8();
+    }
+
+    left_bytes.len().cmp(&right_bytes.len())
+}
+
+fn configure_connection(connection: &Connection, read_only: bool) -> Result<(), RepositoryError> {
+    connection.create_collation("NUVIO_NATURAL", natural_name_compare)?;
+    connection.pragma_update(None, "journal_mode", "WAL")?;
+    // The catalog is reconstructible from Telegram. WAL + NORMAL lowers fsync cost
+    // while keeping transactional crash consistency. Readers get their own page cache
+    // so long catalog scans don't hold the writer mutex or evict writer statements.
+    connection.pragma_update(None, "synchronous", "NORMAL")?;
+    connection.pragma_update(None, "temp_store", "MEMORY")?;
+    connection.pragma_update(None, "cache_size", -65_536_i64)?;
+    connection.pragma_update(None, "mmap_size", 268_435_456_i64)?;
+    connection.pragma_update(None, "wal_autocheckpoint", 8_192_i64)?;
+    connection.pragma_update(None, "foreign_keys", "ON")?;
+    if read_only {
+        connection.pragma_update(None, "query_only", "ON")?;
+    }
+    connection.busy_timeout(std::time::Duration::from_secs(5))?;
+    Ok(())
 }
 
 pub(crate) fn validate_folder_name(name: &str) -> Result<(), RepositoryError> {
@@ -1570,7 +2636,7 @@ mod tests {
     }
 
     #[test]
-    fn sync_delta_returns_only_rows_added_after_cursor() {
+    fn sync_delta_tracks_inserts_updates_and_deletes_after_cursor() {
         let root = tempfile::tempdir().unwrap();
         let repo = CatalogRepository::open(&root.path().join("db")).unwrap();
         {
@@ -1580,19 +2646,39 @@ mod tests {
                 [],
             ).unwrap();
         }
-        let cursor = repo.catalog_rowid_cursor().unwrap();
+        let cursor = repo.catalog_change_cursor().unwrap();
         {
             let connection = repo.connection.lock().unwrap();
             connection.execute(
                 "INSERT INTO files(id,name,extension,kind,size_bytes,updated_at) VALUES('new','new','jpg','image',2,'2026-01-02T00:00:00Z')",
                 [],
             ).unwrap();
+            connection
+                .execute("UPDATE files SET favorite=1 WHERE id='old'", [])
+                .unwrap();
         }
-        let (next, files) = repo.sync_file_delta(cursor).unwrap();
-        assert!(next > cursor);
-        assert_eq!(files.len(), 1);
-        assert_eq!(files[0].id, "new");
-        assert!(repo.sync_file_delta(next).unwrap().1.is_empty());
+        let delta = repo.sync_file_delta(cursor).unwrap();
+        assert!(delta.cursor > cursor);
+        assert_eq!(delta.files.len(), 2);
+        assert!(delta.files.iter().any(|file| file.id == "new"));
+        assert!(delta
+            .files
+            .iter()
+            .any(|file| file.id == "old" && file.favorite));
+        assert!(delta.removed_ids.is_empty());
+
+        {
+            let connection = repo.connection.lock().unwrap();
+            connection
+                .execute("DELETE FROM files WHERE id='new'", [])
+                .unwrap();
+        }
+        let deleted = repo.sync_file_delta(delta.cursor).unwrap();
+        assert_eq!(deleted.removed_ids, vec!["new"]);
+        assert!(deleted.files.is_empty());
+        let empty = repo.sync_file_delta(deleted.cursor).unwrap();
+        assert!(empty.files.is_empty());
+        assert!(empty.removed_ids.is_empty());
     }
 
     #[test]
@@ -1651,6 +2737,119 @@ mod tests {
     }
 
     #[test]
+    fn live_progress_is_visible_while_sqlite_checkpoints_are_throttled() {
+        let root = tempfile::tempdir().unwrap();
+        let repo = CatalogRepository::open(&root.path().join("db")).unwrap();
+        repo.enqueue_transfer("job", "file", "file", 100, "hash", false, "ready")
+            .unwrap();
+
+        repo.update_runtime(
+            "job",
+            "uploading",
+            "uploading",
+            10,
+            100,
+            1_000,
+            Some(1),
+            "Subiendo",
+            None,
+        )
+        .unwrap();
+        let persisted: i64 = repo
+            .connection
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT processed_bytes FROM transfer_runtime WHERE transfer_id='job'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(persisted, 10);
+
+        // Same phase inside the one-second persistence window stays in memory only.
+        repo.update_runtime(
+            "job",
+            "uploading",
+            "uploading",
+            20,
+            100,
+            2_000,
+            Some(1),
+            "Subiendo",
+            None,
+        )
+        .unwrap();
+        let persisted: i64 = repo
+            .connection
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT processed_bytes FROM transfer_runtime WHERE transfer_id='job'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(persisted, 10);
+
+        let live = repo.list_active_transfers().unwrap().remove(0);
+        assert_eq!(live.processed_bytes, 20);
+        assert_eq!(live.speed_bps, 2_000);
+        assert_eq!(repo.queue_summary(0).unwrap().processed_bytes, 20);
+
+        // Reaching the end of a phase is a crash-safe checkpoint even inside the window.
+        repo.update_runtime(
+            "job",
+            "uploading",
+            "uploading",
+            100,
+            100,
+            0,
+            Some(0),
+            "Subida completa",
+            None,
+        )
+        .unwrap();
+        let persisted: i64 = repo
+            .connection
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT processed_bytes FROM transfer_runtime WHERE transfer_id='job'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(persisted, 100);
+    }
+
+    #[test]
+    fn next_retry_delay_tracks_the_earliest_scheduled_retry() {
+        let root = tempfile::tempdir().unwrap();
+        let repo = CatalogRepository::open(&root.path().join("db")).unwrap();
+        repo.enqueue_transfer("later", "file", "file", 10, "hash-a", false, "ready")
+            .unwrap();
+        repo.enqueue_transfer("sooner", "file", "file", 10, "hash-b", false, "ready")
+            .unwrap();
+        {
+            let connection = repo.connection.lock().unwrap();
+            connection.execute(
+                "UPDATE transfer_runtime SET next_retry_at=unixepoch()+60 WHERE transfer_id='later'",
+                [],
+            ).unwrap();
+            connection.execute(
+                "UPDATE transfer_runtime SET next_retry_at=unixepoch()+20 WHERE transfer_id='sooner'",
+                [],
+            ).unwrap();
+        }
+        let delay = repo.next_retry_delay().unwrap().unwrap().as_secs();
+        assert!(
+            (15..=20).contains(&delay),
+            "unexpected retry delay: {delay}"
+        );
+    }
+
+    #[test]
     fn resuming_completed_job_does_not_corrupt_phase() {
         let root = tempfile::tempdir().unwrap();
         let repo = CatalogRepository::open(&root.path().join("db")).unwrap();
@@ -1660,6 +2859,36 @@ mod tests {
         let job = repo.list_transfers().unwrap().remove(0);
         assert_eq!(job.status, "completed");
         assert_eq!(job.phase, "completed");
+    }
+
+    #[test]
+    fn history_cursor_ignores_active_progress_and_tracks_terminal_changes() {
+        let root = tempfile::tempdir().unwrap();
+        let repo = CatalogRepository::open(&root.path().join("db")).unwrap();
+        repo.enqueue_transfer("job", "file", "file", 10, "hash", false, "ready")
+            .unwrap();
+        let before = repo.transfer_history_cursor().unwrap();
+        {
+            let connection = repo.connection.lock().unwrap();
+            connection
+                .execute(
+                    "UPDATE transfer_runtime SET processed_bytes=5,updated_at=unixepoch() WHERE transfer_id='job'",
+                    [],
+                )
+                .unwrap();
+        }
+        assert_eq!(repo.transfer_history_cursor().unwrap(), before);
+        {
+            let connection = repo.connection.lock().unwrap();
+            connection
+                .execute("UPDATE transfers SET status='completed' WHERE id='job'", [])
+                .unwrap();
+        }
+        let completed = repo.transfer_history_cursor().unwrap();
+        assert!(completed > before);
+        assert_eq!(repo.list_transfer_history(1000).unwrap().len(), 1);
+        assert_eq!(repo.clear_transfer_history().unwrap(), 1);
+        assert!(repo.transfer_history_cursor().unwrap() > completed);
     }
 
     #[test]
@@ -1788,6 +3017,305 @@ mod tests {
         assert!(file.folder_id.is_none());
         assert_eq!(file.folder, "Mi unidad");
     }
+
+    #[test]
+    #[ignore = "performance budget; run with pnpm qa:perf"]
+    fn catalog_performance_budget_250k() {
+        fn elapsed_ms(start: Instant) -> u128 {
+            start.elapsed().as_millis()
+        }
+
+        let root = tempfile::tempdir().unwrap();
+        let repo = CatalogRepository::open(&root.path().join("perf.db")).unwrap();
+        {
+            let mut connection = repo.connection.lock().unwrap();
+            let tx = connection.transaction().unwrap();
+            {
+                let mut folder = tx
+                    .prepare(
+                        "INSERT INTO folders(id,name,parent_id,trashed,created_at,updated_at)
+                         VALUES(?1,?2,NULL,0,1,1)",
+                    )
+                    .unwrap();
+                for index in 0..1000 {
+                    folder
+                        .execute(params![
+                            format!("folder-{index}"),
+                            format!("Folder {index}")
+                        ])
+                        .unwrap();
+                }
+            }
+            tx.commit().unwrap();
+        }
+
+        let mut inserted = 0usize;
+        for target in [10_000usize, 30_000, 100_000, 250_000] {
+            let insert_started = Instant::now();
+            {
+                let mut connection = repo.connection.lock().unwrap();
+                let tx = connection.transaction().unwrap();
+                {
+                    let mut file = tx
+                        .prepare(
+                            "INSERT INTO files(
+                               id,name,extension,kind,size_bytes,updated_at,
+                               favorite,trashed,folder,tags_json,provider,telegram_message_id
+                             ) VALUES(?1,?2,'txt','document',?3,?4,0,0,'Mi unidad','[]','telegram',?5)",
+                        )
+                        .unwrap();
+                    let mut location = tx
+                        .prepare("INSERT INTO file_locations(file_id,folder_id) VALUES(?1,?2)")
+                        .unwrap();
+                    for index in inserted..target {
+                        let id = format!("perf-{index}");
+                        file.execute(params![
+                            id,
+                            format!("Benchfile {index}"),
+                            1024_i64 + (index % 8192) as i64,
+                            format!("2026-09-18T12:{:02}:{:02}Z", index % 60, index % 60),
+                            (index + 1).to_string(),
+                        ])
+                        .unwrap();
+                        location
+                            .execute(params![
+                                format!("perf-{index}"),
+                                format!("folder-{}", index % 1000)
+                            ])
+                            .unwrap();
+                    }
+                }
+                tx.commit().unwrap();
+            }
+            inserted = target;
+            repo.optimize().unwrap();
+            let insert_ms = elapsed_ms(insert_started);
+
+            let page_started = Instant::now();
+            let page = repo
+                .list_files_page(CatalogPageQuery {
+                    section: "recent".into(),
+                    folder_id: None,
+                    kind: None,
+                    search: String::new(),
+                    tag: None,
+                    sort: "newest".into(),
+                    offset: 0,
+                    limit: 80,
+                })
+                .unwrap();
+            let page_ms = elapsed_ms(page_started);
+            assert_eq!(page.files.len(), 80);
+            assert_eq!(page.total, target);
+
+            let search_started = Instant::now();
+            let search = repo
+                .list_files_page(CatalogPageQuery {
+                    section: "files".into(),
+                    folder_id: None,
+                    kind: None,
+                    search: format!("benchfile {}", target - 1),
+                    tag: None,
+                    sort: "newest".into(),
+                    offset: 0,
+                    limit: 80,
+                })
+                .unwrap();
+            let search_ms = elapsed_ms(search_started);
+            assert!(!search.files.is_empty());
+
+            let stats_started = Instant::now();
+            let (_, file_count, _, _) = repo.catalog_stats().unwrap();
+            let stats_ms = elapsed_ms(stats_started);
+            assert_eq!(file_count, target);
+
+            let folders_started = Instant::now();
+            let folders = repo.list_folders().unwrap();
+            let folders_ms = elapsed_ms(folders_started);
+            assert_eq!(folders.len(), 1000);
+
+            let cursor = repo.catalog_change_cursor().unwrap();
+            {
+                let connection = repo.connection.lock().unwrap();
+                connection
+                    .execute(
+                        "UPDATE files SET favorite=1 WHERE id=?1",
+                        [format!("perf-{}", target - 1)],
+                    )
+                    .unwrap();
+            }
+            let delta_started = Instant::now();
+            let delta = repo.sync_file_delta(cursor).unwrap();
+            let delta_ms = elapsed_ms(delta_started);
+            assert_eq!(delta.files.len(), 1);
+
+            eprintln!(
+                "catalog_perf files={target} insert_ms={insert_ms} page_ms={page_ms} search_ms={search_ms} stats_ms={stats_ms} folders_ms={folders_ms} delta_ms={delta_ms}"
+            );
+
+            assert!(page_ms <= 1_500, "{target}: first page took {page_ms} ms");
+            assert!(
+                search_ms <= 1_500,
+                "{target}: FTS search took {search_ms} ms"
+            );
+            assert!(
+                stats_ms <= 1_000,
+                "{target}: catalog stats took {stats_ms} ms"
+            );
+            assert!(
+                folders_ms <= 1_500,
+                "{target}: folder aggregates took {folders_ms} ms"
+            );
+            assert!(
+                delta_ms <= 500,
+                "{target}: one-file delta took {delta_ms} ms"
+            );
+        }
+    }
+
+    #[test]
+    fn catalog_name_sort_is_natural_for_numeric_runs() {
+        let root = tempfile::tempdir().unwrap();
+        let repo = CatalogRepository::open(&root.path().join("db")).unwrap();
+        {
+            let connection = repo.connection.lock().unwrap();
+            connection
+                .execute_batch(
+                    r#"
+                    INSERT INTO files(id,name,extension,kind,size_bytes,updated_at)
+                    VALUES
+                      ('ten','Archivo 10','wav','audio',10,'2026-01-02T00:00:00Z'),
+                      ('two','Archivo 2','wav','audio',20,'2026-01-01T00:00:00Z');
+                    "#,
+                )
+                .unwrap();
+        }
+        let page = repo
+            .list_files_page(CatalogPageQuery {
+                section: "recent".into(),
+                folder_id: None,
+                kind: Some("audio".into()),
+                search: String::new(),
+                tag: None,
+                sort: "name".into(),
+                offset: 0,
+                limit: 80,
+            })
+            .unwrap();
+        assert_eq!(
+            page.files
+                .iter()
+                .map(|file| file.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["two", "ten"]
+        );
+    }
+
+    #[test]
+    fn catalog_pages_preserve_filters_search_sort_and_counts() {
+        let root = tempfile::tempdir().unwrap();
+        let repo = CatalogRepository::open(&root.path().join("db")).unwrap();
+        repo.create_folder_local("folder-a", "Fotos", None).unwrap();
+        {
+            let connection = repo.connection.lock().unwrap();
+            connection.execute_batch(
+                r#"
+                INSERT INTO files(id,name,extension,kind,size_bytes,updated_at,favorite,trashed,tags_json)
+                VALUES
+                  ('a','needle-photo','jpg','image',50,'2026-01-05T00:00:00Z',1,0,'["Fotos"]'),
+                  ('b','report','pdf','pdf',40,'2026-01-04T00:00:00Z',0,0,'["Trabajo"]'),
+                  ('c','root-note','txt','text',30,'2026-01-03T00:00:00Z',0,0,'["Personal"]'),
+                  ('d','old-trash','zip','archive',20,'2026-01-02T00:00:00Z',1,1,'[]'),
+                  ('e','small','jpg','image',10,'2026-01-01T00:00:00Z',0,0,'[]');
+                INSERT INTO file_locations(file_id,folder_id) VALUES ('a','folder-a');
+                INSERT INTO file_locations(file_id,folder_id) VALUES ('b','folder-a');
+                INSERT INTO file_locations(file_id,folder_id) VALUES ('e','folder-a');
+                "#,
+            ).unwrap();
+        }
+
+        let root_page = repo
+            .list_files_page(CatalogPageQuery {
+                section: "files".into(),
+                folder_id: None,
+                kind: None,
+                search: String::new(),
+                tag: None,
+                sort: "recent".into(),
+                offset: 0,
+                limit: 80,
+            })
+            .unwrap();
+        assert_eq!(root_page.total, 1);
+        assert_eq!(root_page.files[0].id, "c");
+
+        let global_search = repo
+            .list_files_page(CatalogPageQuery {
+                section: "files".into(),
+                folder_id: None,
+                kind: None,
+                search: "eed".into(),
+                tag: None,
+                sort: "recent".into(),
+                offset: 0,
+                limit: 80,
+            })
+            .unwrap();
+        assert_eq!(global_search.total, 1);
+        assert_eq!(global_search.files[0].id, "a");
+
+        let favorites = repo
+            .list_files_page(CatalogPageQuery {
+                section: "favorites".into(),
+                folder_id: None,
+                kind: None,
+                search: String::new(),
+                tag: None,
+                sort: "recent".into(),
+                offset: 0,
+                limit: 80,
+            })
+            .unwrap();
+        assert_eq!(favorites.total, 1);
+        assert_eq!(favorites.files[0].id, "a");
+
+        let images = repo
+            .list_files_page(CatalogPageQuery {
+                section: "recent".into(),
+                folder_id: None,
+                kind: Some("image".into()),
+                search: String::new(),
+                tag: None,
+                sort: "size".into(),
+                offset: 0,
+                limit: 1,
+            })
+            .unwrap();
+        assert_eq!(images.total, 2);
+        assert!(images.has_more);
+        assert_eq!(images.files[0].id, "a");
+
+        let tagged = repo
+            .list_files_page(CatalogPageQuery {
+                section: "recent".into(),
+                folder_id: None,
+                kind: None,
+                search: String::new(),
+                tag: Some("Trabajo".into()),
+                sort: "recent".into(),
+                offset: 0,
+                limit: 80,
+            })
+            .unwrap();
+        assert_eq!(tagged.total, 1);
+        assert_eq!(tagged.files[0].id, "b");
+
+        let (_, active, favorite_count, trash_count) = repo.catalog_stats().unwrap();
+        assert_eq!(active, 4);
+        assert_eq!(favorite_count, 1);
+        assert_eq!(trash_count, 1);
+    }
+
     #[test]
     fn upload_concurrency_migrates_once_and_preserves_user_choices() {
         let root = tempfile::tempdir().unwrap();

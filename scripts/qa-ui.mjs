@@ -27,7 +27,7 @@ async function setup(viewport = { width: 1280, height: 820 }) {
       favorite: index === 2, trashed: false, folder: "Mi unidad", folderId: null, tags: [], provider: "telegram",
       __rowid: index + 1,
     }));
-    window.__qa = { files, folders: [], calls: [], media: {}, dashboardError: null, dashboardPolls: 0, syncPlan: null, syncCursor: files.length };
+    window.__qa = { files, folders: [], calls: [], media: {}, dashboardError: null, dashboardPolls: 0, statusPolls: 0, syncPlan: null, syncCursor: files.length, historyCursor: 0 };
     window.__TAURI_EVENT_PLUGIN_INTERNALS__ = { unregisterListener() {} };
     window.__TAURI_INTERNALS__ = {
       transformCallback: () => 1,
@@ -39,28 +39,72 @@ async function setup(viewport = { width: 1280, height: 820 }) {
           qa.dashboardPolls++;
           if (qa.dashboardError) throw qa.dashboardError;
           return {
-            syncProgress: qa.syncProgress, files: structuredClone(qa.files), folders: structuredClone(qa.folders), transfers: [], transferHistory: [], totalBytes: 20000, fileCount: qa.files.length,
-            favoriteCount: qa.files.filter(file => file.favorite && !file.trashed).length, recentCount: 12,
+            syncProgress: qa.syncProgress, files: [], folders: structuredClone(qa.folders), transfers: [], transferHistory: [], totalBytes: 20000, fileCount: qa.files.filter(file => !file.trashed).length,
+            favoriteCount: qa.files.filter(file => file.favorite && !file.trashed).length, trashCount: qa.files.filter(file => file.trashed).length, recentCount: qa.files.filter(file => !file.trashed).length,
             telegramConnected: true, telegramAccountLabel: "Cuenta QA", providerStatus: "Conectado · entorno de pruebas",
             queueSummary: { total: 0, completed: 0, pending: 0, failed: 0, active: 0, processedBytes: 0, totalBytes: 0, speedBps: 0, cacheBytes: 0, cacheLimitBytes: 2147483648 },
             settings: { preparationConcurrency: 2, uploadConcurrency: 1, downloadConcurrency: 2, cacheLimitBytes: 2147483648, rememberSession: false, conflictPolicy: "skip", deleteOriginalAfterUpload: false },
+            catalogCursor: qa.syncCursor,
+            historyCursor: qa.historyCursor,
           };
         }
+        if (cmd === "get_dashboard_status") {
+          qa.statusPolls++;
+          if (qa.dashboardError) throw qa.dashboardError;
+          return {
+            syncProgress: qa.syncProgress, transfers: [], transferHistory: args.afterHistoryCursor === qa.historyCursor ? null : [], totalBytes: 20000, fileCount: qa.files.filter(file => !file.trashed).length,
+            favoriteCount: qa.files.filter(file => file.favorite && !file.trashed).length, trashCount: qa.files.filter(file => file.trashed).length, recentCount: qa.files.filter(file => !file.trashed).length,
+            telegramConnected: true, telegramAccountLabel: "Cuenta QA", providerStatus: "Conectado · entorno de pruebas",
+            queueSummary: { total: 0, completed: 0, pending: 0, failed: 0, active: 0, processedBytes: 0, totalBytes: 0, speedBps: 0, cacheBytes: 0, cacheLimitBytes: 2147483648 },
+            settings: { preparationConcurrency: 2, uploadConcurrency: 1, downloadConcurrency: 2, cacheLimitBytes: 2147483648, rememberSession: false, conflictPolicy: "skip", deleteOriginalAfterUpload: false },
+            catalogCursor: qa.syncCursor,
+            historyCursor: qa.historyCursor,
+          };
+        }
+        if (cmd === "get_catalog_page") {
+          const needle = String(args.search ?? "").trim().toLowerCase();
+          let rows = qa.files.filter(file => args.section === "trash" ? file.trashed : !file.trashed);
+          if (args.section === "favorites") rows = rows.filter(file => file.favorite);
+          if (args.kind && args.kind !== "all") rows = rows.filter(file => file.kind === args.kind);
+          if (args.tag) rows = rows.filter(file => file.tags?.some(tag => tag.toLowerCase() === String(args.tag).toLowerCase()));
+          if (args.section === "files" && !needle) {
+            rows = rows.filter(file => (file.folderId ?? null) === (args.folderId ?? null));
+          }
+          if (needle) {
+            rows = rows.filter(file =>
+              `${file.name} ${file.extension} ${file.folder ?? ""} ${(file.tags ?? []).join(" ")}`
+                .toLowerCase()
+                .includes(needle)
+            );
+          }
+          rows = [...rows].sort((a, b) => {
+            if (args.sort === "name") return a.name.localeCompare(b.name, "es", { numeric: true, sensitivity: "base" });
+            if (args.sort === "size") return b.sizeBytes - a.sizeBytes;
+            const diff = (Date.parse(a.updatedAt) || 0) - (Date.parse(b.updatedAt) || 0);
+            return args.sort === "oldest" ? diff : -diff;
+          });
+          const total = rows.length;
+          const offset = Math.max(0, Number(args.offset ?? 0));
+          const limit = Math.max(1, Number(args.limit ?? 80));
+          const files = rows.slice(offset, offset + limit);
+          return { files: structuredClone(files), total, offset, limit, hasMore: offset + files.length < total };
+        }
         if (cmd === "get_sync_delta") {
-          const after = args.afterRowid;
+          const after = args.afterCursor;
           const cursor = qa.syncCursor;
           const files = after == null ? [] : qa.files.filter(file => (file.__rowid ?? 0) > after);
           return {
             cursor,
             syncProgress: qa.syncProgress ?? { active: false, phase: "idle", scanned: 0, percent: null },
             files: structuredClone(files),
+            removedIds: [],
             folders: after == null || qa.syncProgress?.phase === "folders" ? structuredClone(qa.folders) : null,
           };
         }
         if (cmd === "uploaded_image_cleanup_summary") return qa.cleanupSummary ?? { count: 0, bytes: 0 };
         if (cmd === "delete_uploaded_image_sources") return qa.cleanupResult ?? { deleted: 0, releasedBytes: 0, skipped: 0, failed: 0 };
         if (cmd === "update_setting") return {};
-        if (cmd === "set_trashed") { qa.files.find(file => file.id === args.id).trashed = args.trashed; return; }
+        if (cmd === "set_trashed") { qa.files.find(file => file.id === args.id).trashed = args.trashed; qa.syncCursor++; return; }
         if (cmd === "platform_name") return "windows";
         if (cmd === "sync_files") {
           const plan = qa.syncPlan;
@@ -92,10 +136,12 @@ async function setup(viewport = { width: 1280, height: 820 }) {
         if (cmd === "create_folder") {
           const id = `folder-${qa.folders.length}`;
           qa.folders.push({id, name: args.name, parentId: args.parentId, trashed: false, fileCount: 0, childCount: 0, sizeBytes: 0, createdAt: 0, updatedAt: 0});
+          qa.syncCursor++;
           return id;
         }
         if (cmd === "move_files_to_folder") {
           qa.files.filter(file => args.ids.includes(file.id)).forEach(file => { file.folderId = args.folderId; });
+          qa.syncCursor++;
           return args.ids.length;
         }
         if (cmd === "move_folder") {
@@ -104,8 +150,11 @@ async function setup(viewport = { width: 1280, height: 820 }) {
           folder.parentId = args.parentId;
           return;
         }
-        if (cmd === "set_favorite") { qa.files.find(file => file.id === args.id).favorite = args.favorite; return; }
+        if (cmd === "set_favorite") { qa.files.find(file => file.id === args.id).favorite = args.favorite; qa.syncCursor++; return; }
         if (cmd === "prepare_media") return new Promise(resolve => { qa.media[args.id] = resolve; });
+        if (cmd === "prepare_thumbnail_batch") {
+          return (args.ids ?? []).map(id => ({ id, source: qa.thumbnails?.[id] ?? null }));
+        }
         if (cmd === "prepare_thumbnail") return qa.thumbnails?.[args.id] ?? null;
         if (cmd === "telegram_auth_state") return { stage: "needsCredentials", connected: false, message: "Configura tus credenciales", isPremium: false };
         if (cmd === "plugin:dialog|open") return qa.uploadPaths ?? null;
@@ -153,6 +202,58 @@ async function test(name, fn, viewport) {
 }
 
 try {
+  await test("catalog-windowing-keeps-large-dom-bounded", async page => {
+    await page.evaluate(() => {
+      const qa = window.__qa;
+      qa.files = Array.from({ length: 400 }, (_, index) => ({
+        id: `bulk-${index}`,
+        name: `Archivo masivo ${index}`,
+        extension: "txt",
+        kind: "document",
+        sizeBytes: 1024 + index,
+        updatedAt: new Date(Date.UTC(2026, 8, 18, 12, 0, 0) - index * 1000).toISOString(),
+        favorite: false,
+        trashed: false,
+        folder: "Mi unidad",
+        folderId: null,
+        tags: [],
+        provider: "telegram",
+        __rowid: index + 1,
+      }));
+      qa.syncCursor++;
+    });
+    await page.getByRole("navigation", { name: "Principal", exact: true })
+      .getByRole("button", { name: "Mis archivos", exact: true }).click();
+    await expect(page.locator(".file-card")).toHaveCount(80);
+
+    const maxCatalogOffset = () => page.evaluate(() => {
+      const offsets = window.__qa.calls
+        .filter(call => call.cmd === "get_catalog_page" && call.args.section === "files")
+        .map(call => Number(call.args.offset ?? 0));
+      return offsets.length ? Math.max(...offsets) : 0;
+    });
+    for (const targetOffset of [80, 160, 240]) {
+      if (await maxCatalogOffset() < targetOffset) {
+        const loadMore = page.getByRole("button", { name: /Cargar más/ });
+        await expect(loadMore).toBeVisible();
+        await loadMore.click();
+      }
+      await expect.poll(maxCatalogOffset, { timeout: 10000 })
+        .toBeGreaterThanOrEqual(targetOffset);
+    }
+
+    await expect.poll(async () => page.locator(".file-card").count()).toBeLessThan(100);
+    const state = await page.evaluate(() => ({
+      loadedCalls: window.__qa.calls
+        .filter(call => call.cmd === "get_catalog_page" && call.args.section === "files")
+        .map(call => call.args.offset),
+    }));
+    assert.ok(state.loadedCalls.includes(0));
+    assert.ok(state.loadedCalls.includes(80));
+    assert.ok(state.loadedCalls.includes(160));
+    assert.ok(state.loadedCalls.includes(240));
+  });
+
   await test("selection-after-trash", async page => {
     await page.getByRole("checkbox", { name: "Seleccionar Archivo 00 con nombre largo", exact: true }).check();
     await page.locator(".file-card").first().getByTitle("Mover a Papelera", { exact: true }).click();
@@ -181,7 +282,7 @@ try {
     const start = pdf.length;
     pdf += `xref\n0 5\n0000000000 65535 f \n${offsets.slice(1).map(offset => `${String(offset).padStart(10, "0")} 00000 n \n`).join("")}trailer\n<< /Size 5 /Root 1 0 R >>\nstartxref\n${start}\n%%EOF`;
     await page.route("**/qa-media/large.pdf", route => route.fulfill({contentType: "application/pdf", body: pdf}));
-    await page.evaluate(() => { window.__qa.files[0].kind = "pdf"; window.__qa.files[0].extension = "pdf"; });
+    await page.evaluate(() => { window.__qa.files[0].kind = "pdf"; window.__qa.files[0].extension = "pdf"; window.__qa.syncCursor++; });
     await expect(page.locator(".file-card").first().locator(".file-extension")).toHaveText("PDF");
     await page.locator(".file-card").first().getByTitle("Vista previa", {exact: true}).click();
     await page.evaluate(() => window.__qa.media["file-0"]({path: "large.pdf", fromCache: true}));
@@ -321,6 +422,7 @@ try {
       qa.files[0].kind = "image";
       qa.files[0].updatedAt = "2026-09-10T10:00:00Z";
       qa.files[1].updatedAt = "2026-09-10T09:00:00Z";
+      qa.syncCursor++;
     });
     await expect(page.locator(".file-thumbnail img")).toHaveCount(1, { timeout: 15000 });
     const blurredThumb = page.locator(".file-thumbnail.is-blurred").first();
@@ -328,6 +430,9 @@ try {
     const filter = await blurredThumb.locator("img").evaluate((img) => getComputedStyle(img).filter);
     assert.notEqual(filter, "none", "Telegram minithumbnail should render with a blur filter");
     await expect(page.locator(".file-thumbnail pre")).toContainText("Contenido visible antes de abrirlo");
+    const thumbnailCalls = await page.evaluate(() => window.__qa.calls.filter(c => c.cmd === "prepare_thumbnail_batch"));
+    assert.ok(thumbnailCalls.some(call => call.args.ids.includes("file-0") && call.args.ids.includes("file-1")), "Visible thumbnails should be coalesced into one batch invoke");
+    assert.equal(await page.evaluate(() => window.__qa.calls.filter(c => c.cmd === "prepare_thumbnail" && ["file-0", "file-1"].includes(c.args.id)).length), 0);
     assert.equal(await page.evaluate(() => window.__qa.calls.filter(c => c.cmd === "prepare_media").length), 0);
     const directPhoto = page.getByRole("button", { name: "Abrir foto Archivo 00 con nombre largo", exact: true });
     await expect(directPhoto).toBeVisible();
@@ -340,7 +445,7 @@ try {
     await page.screenshot({ path: path.join(output, "thumbnails-current.png"), fullPage: true });
   });
   await test("large-text-preview-does-not-download", async page => {
-    await page.evaluate(() => { window.__qa.files[0].kind = "text"; window.__qa.files[0].sizeBytes = 4 * 1024 * 1024; });
+    await page.evaluate(() => { window.__qa.files[0].kind = "text"; window.__qa.files[0].sizeBytes = 4 * 1024 * 1024; window.__qa.syncCursor++; });
     await expect(page.locator(".file-card").first()).toContainText("4.00 MB");
     await page.locator(".file-card").first().getByTitle("Vista previa", { exact: true }).click();
     await expect(page.getByRole("dialog")).toContainText("limitada a 2 MB");
@@ -396,7 +501,7 @@ try {
   });
   await test("natural-sort-filters-and-concurrency", async page => {
     await page.getByRole("navigation", { name: "Principal", exact: true }).getByRole("button", { name: "Mis archivos", exact: true }).click();
-    await page.evaluate(() => { window.__qa.files[0].name = "Archivo 10"; window.__qa.files[1].name = "Archivo 2"; });
+    await page.evaluate(() => { window.__qa.files[0].name = "Archivo 10"; window.__qa.files[1].name = "Archivo 2"; window.__qa.syncCursor++; });
     await page.getByRole("group", { name: "Tipo de archivo" }).getByRole("button", { name: "Audio", exact: true }).click();
     await page.getByLabel("Ordenar", { exact: true }).selectOption("name");
     await expect(page.locator(".file-card")).toHaveCount(2);

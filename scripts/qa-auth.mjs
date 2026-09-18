@@ -26,7 +26,7 @@ async function setup(viewport = { width: 1280, height: 820 }) {
       updatedAt: new Date(Date.UTC(2026, 8, 9, 0, 0, 16 - index)).toISOString(),
       favorite: index === 2, trashed: false, folder: "Mi unidad", folderId: null, tags: [], provider: "telegram",
     }));
-    window.__qa = { files, folders: [], calls: [], media: {}, dashboardError: null, dashboardPolls: 0 };
+    window.__qa = { files, folders: [], calls: [], media: {}, dashboardError: null, dashboardPolls: 0, statusPolls: 0, syncCursor: 0, historyCursor: 0 };
     window.__TAURI_EVENT_PLUGIN_INTERNALS__ = { unregisterListener() {} };
     window.__TAURI_INTERNALS__ = {
       transformCallback: () => 1,
@@ -38,27 +38,67 @@ async function setup(viewport = { width: 1280, height: 820 }) {
           qa.dashboardPolls++;
           if (qa.dashboardError) throw qa.dashboardError;
           return {
-            syncProgress: qa.syncProgress, files: structuredClone(qa.files), folders: structuredClone(qa.folders), transfers: [], transferHistory: [], totalBytes: 20000, fileCount: qa.files.length,
-            favoriteCount: qa.files.filter(file => file.favorite && !file.trashed).length, recentCount: 12,
+            syncProgress: qa.syncProgress, files: [], folders: structuredClone(qa.folders), transfers: [], transferHistory: [], totalBytes: 20000, fileCount: qa.files.filter(file => !file.trashed).length,
+            favoriteCount: qa.files.filter(file => file.favorite && !file.trashed).length, trashCount: qa.files.filter(file => file.trashed).length, recentCount: qa.files.filter(file => !file.trashed).length,
             telegramConnected: true, telegramAccountLabel: "Cuenta QA", providerStatus: "Conectado · entorno de pruebas",
             queueSummary: { total: 0, completed: 0, pending: 0, failed: 0, active: 0, processedBytes: 0, totalBytes: 0, speedBps: 0, cacheBytes: 0, cacheLimitBytes: 2147483648 },
             settings: { preparationConcurrency: 2, uploadConcurrency: 1, downloadConcurrency: 2, cacheLimitBytes: 2147483648, rememberSession: false, conflictPolicy: "skip", deleteOriginalAfterUpload: false },
+            catalogCursor: qa.syncCursor,
+            historyCursor: qa.historyCursor,
           };
         }
+        if (cmd === "get_dashboard_status") {
+          qa.statusPolls++;
+          if (qa.dashboardError) throw qa.dashboardError;
+          return {
+            syncProgress: qa.syncProgress, transfers: [], transferHistory: args.afterHistoryCursor === qa.historyCursor ? null : [], totalBytes: 20000, fileCount: qa.files.filter(file => !file.trashed).length,
+            favoriteCount: qa.files.filter(file => file.favorite && !file.trashed).length, trashCount: qa.files.filter(file => file.trashed).length, recentCount: qa.files.filter(file => !file.trashed).length,
+            telegramConnected: true, telegramAccountLabel: "Cuenta QA", providerStatus: "Conectado · entorno de pruebas",
+            queueSummary: { total: 0, completed: 0, pending: 0, failed: 0, active: 0, processedBytes: 0, totalBytes: 0, speedBps: 0, cacheBytes: 0, cacheLimitBytes: 2147483648 },
+            settings: { preparationConcurrency: 2, uploadConcurrency: 1, downloadConcurrency: 2, cacheLimitBytes: 2147483648, rememberSession: false, conflictPolicy: "skip", deleteOriginalAfterUpload: false },
+            catalogCursor: qa.syncCursor,
+            historyCursor: qa.historyCursor,
+          };
+        }
+        if (cmd === "get_catalog_page") {
+          const needle = String(args.search ?? "").trim().toLowerCase();
+          let rows = qa.files.filter(file => args.section === "trash" ? file.trashed : !file.trashed);
+          if (args.section === "favorites") rows = rows.filter(file => file.favorite);
+          if (args.kind && args.kind !== "all") rows = rows.filter(file => file.kind === args.kind);
+          if (args.tag) rows = rows.filter(file => file.tags?.some(tag => tag.toLowerCase() === String(args.tag).toLowerCase()));
+          if (args.section === "files" && !needle) rows = rows.filter(file => (file.folderId ?? null) === (args.folderId ?? null));
+          if (needle) rows = rows.filter(file => `${file.name} ${file.extension} ${file.folder ?? ""} ${(file.tags ?? []).join(" ")}`.toLowerCase().includes(needle));
+          rows = [...rows].sort((a, b) => {
+            if (args.sort === "name") return a.name.localeCompare(b.name);
+            if (args.sort === "size") return b.sizeBytes - a.sizeBytes;
+            const diff = (Date.parse(a.updatedAt) || 0) - (Date.parse(b.updatedAt) || 0);
+            return args.sort === "oldest" ? diff : -diff;
+          });
+          const total = rows.length;
+          const offset = Math.max(0, Number(args.offset ?? 0));
+          const limit = Math.max(1, Number(args.limit ?? 80));
+          const files = rows.slice(offset, offset + limit);
+          return { files: structuredClone(files), total, offset, limit, hasMore: offset + files.length < total };
+        }
         if (cmd === "update_setting") return {};
-        if (cmd === "set_trashed") { qa.files.find(file => file.id === args.id).trashed = args.trashed; return; }
+        if (cmd === "set_trashed") { qa.files.find(file => file.id === args.id).trashed = args.trashed; qa.syncCursor++; return; }
         if (cmd === "platform_name") return "windows";
         if (cmd === "create_folder") {
           const id = `folder-${qa.folders.length}`;
           qa.folders.push({id, name: args.name, parentId: args.parentId, trashed: false, fileCount: 0, childCount: 0, sizeBytes: 0, createdAt: 0, updatedAt: 0});
+          qa.syncCursor++;
           return id;
         }
         if (cmd === "move_files_to_folder") {
           qa.files.filter(file => args.ids.includes(file.id)).forEach(file => { file.folderId = args.folderId; });
+          qa.syncCursor++;
           return args.ids.length;
         }
-        if (cmd === "set_favorite") { qa.files.find(file => file.id === args.id).favorite = args.favorite; return; }
+        if (cmd === "set_favorite") { qa.files.find(file => file.id === args.id).favorite = args.favorite; qa.syncCursor++; return; }
         if (cmd === "prepare_media") return new Promise(resolve => { qa.media[args.id] = resolve; });
+        if (cmd === "prepare_thumbnail_batch") {
+          return (args.ids ?? []).map(id => ({ id, source: qa.thumbnails?.[id] ?? null }));
+        }
         if (cmd === "prepare_thumbnail") return qa.thumbnails?.[args.id] ?? null;
         if (cmd === "telegram_auth_state") return qa.telegramAuthState ?? { stage: "needsCredentials", connected: false, message: "Configura tus credenciales", isPremium: false };
         if (cmd === "telegram_configure") {

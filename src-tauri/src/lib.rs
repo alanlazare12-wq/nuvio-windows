@@ -14,6 +14,7 @@ mod upload_advisor;
 
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -21,8 +22,10 @@ use serde::{Deserialize, Serialize};
 
 use cloud::BatchDownloadItem;
 use crypto::{decrypt_file, sha256_file};
-use domain::{AppSettings, DashboardData};
-use media::{clear_media_cache, remove_media_cache_entries, MediaReady};
+use domain::{AppSettings, DashboardData, DashboardStatus};
+use media::{
+    clear_media_cache, reconcile_media_cache_index, remove_media_cache_entries, MediaReady,
+};
 use provider::StorageProvider;
 use repository::CatalogRepository;
 use tauri::{Emitter, Manager, State};
@@ -32,15 +35,84 @@ use telegram::{
 use transfer::{PreparedUpload, TransferService};
 use zeroize::Zeroize;
 
+struct DynamicLimiter {
+    max: usize,
+    limit: AtomicUsize,
+    active: AtomicUsize,
+    notify: tokio::sync::Notify,
+}
+
+impl DynamicLimiter {
+    fn new(limit: usize, max: usize) -> Arc<Self> {
+        Arc::new(Self {
+            max,
+            limit: AtomicUsize::new(limit.clamp(1, max)),
+            active: AtomicUsize::new(0),
+            notify: tokio::sync::Notify::new(),
+        })
+    }
+
+    fn set_limit(&self, limit: usize) {
+        self.limit
+            .store(limit.clamp(1, self.max), Ordering::Release);
+        self.notify.notify_waiters();
+    }
+
+    fn try_acquire(self: &Arc<Self>) -> Option<DynamicPermit> {
+        loop {
+            let active = self.active.load(Ordering::Acquire);
+            let limit = self.limit.load(Ordering::Acquire);
+            if active >= limit {
+                return None;
+            }
+            if self
+                .active
+                .compare_exchange_weak(active, active + 1, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+            {
+                return Some(DynamicPermit {
+                    limiter: self.clone(),
+                });
+            }
+        }
+    }
+
+    async fn acquire(self: &Arc<Self>) -> DynamicPermit {
+        loop {
+            if let Some(permit) = self.try_acquire() {
+                return permit;
+            }
+            // Notify is edge-triggered. Keep a tiny timeout as a safety net so a
+            // permit released between try_acquire() and notified().await cannot
+            // leave a preparation stalled forever.
+            tokio::select! {
+                _ = self.notify.notified() => {},
+                _ = tokio::time::sleep(Duration::from_millis(100)) => {},
+            }
+        }
+    }
+}
+
+struct DynamicPermit {
+    limiter: Arc<DynamicLimiter>,
+}
+
+impl Drop for DynamicPermit {
+    fn drop(&mut self) {
+        self.limiter.active.fetch_sub(1, Ordering::AcqRel);
+        self.limiter.notify.notify_one();
+    }
+}
+
 struct AppState {
     repository: CatalogRepository,
     telegram: TelegramService,
     staging_dir: PathBuf,
     media_cache_dir: PathBuf,
-    cache_usage: Mutex<(std::time::Instant, i64)>,
-    preparation_slots: Arc<tokio::sync::Semaphore>,
-    upload_slots: Arc<tokio::sync::Semaphore>,
-    download_slots: Arc<tokio::sync::Semaphore>,
+    preparation_slots: Arc<DynamicLimiter>,
+    upload_slots: Arc<DynamicLimiter>,
+    download_slots: Arc<DynamicLimiter>,
+    worker_wake: Arc<tokio::sync::Notify>,
     sync_lock: tokio::sync::Mutex<()>,
     background_error: Mutex<Option<String>>,
 }
@@ -51,6 +123,7 @@ struct SyncDelta {
     cursor: i64,
     sync_progress: progress::SyncProgress,
     files: Vec<domain::CloudFile>,
+    removed_ids: Vec<String>,
     folders: Option<Vec<domain::CloudFolder>>,
 }
 
@@ -87,9 +160,65 @@ async fn get_dashboard(state: State<'_, Arc<AppState>>) -> Result<DashboardData,
 }
 
 #[tauri::command]
+async fn get_dashboard_status(
+    state: State<'_, Arc<AppState>>,
+    after_history_cursor: Option<i64>,
+) -> Result<DashboardStatus, String> {
+    let state = state.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        dashboard_status_snapshot(&state, after_history_cursor)
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+#[allow(clippy::too_many_arguments)] // Tauri maps these flat fields directly from the JS invoke payload.
+#[tauri::command]
+async fn get_catalog_page(
+    state: State<'_, Arc<AppState>>,
+    section: String,
+    folder_id: Option<String>,
+    kind: Option<String>,
+    search: Option<String>,
+    tag: Option<String>,
+    sort: Option<String>,
+    offset: Option<usize>,
+    limit: Option<usize>,
+) -> Result<domain::CatalogPage, String> {
+    if !matches!(
+        section.as_str(),
+        "home" | "files" | "favorites" | "recent" | "trash"
+    ) {
+        return Err("Sección de catálogo inválida".into());
+    }
+    let sort = sort.unwrap_or_else(|| "recent".to_string());
+    if !matches!(sort.as_str(), "recent" | "oldest" | "name" | "size") {
+        return Err("Orden de catálogo inválido".into());
+    }
+    let state = state.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        state
+            .repository
+            .list_files_page(repository::CatalogPageQuery {
+                section,
+                folder_id,
+                kind,
+                search: search.unwrap_or_default(),
+                tag,
+                sort,
+                offset: offset.unwrap_or(0),
+                limit: limit.unwrap_or(80),
+            })
+            .map_err(|e| e.to_string())
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+#[tauri::command]
 async fn get_sync_delta(
     state: State<'_, Arc<AppState>>,
-    after_rowid: Option<i64>,
+    after_cursor: Option<i64>,
 ) -> Result<SyncDelta, String> {
     let state = state.inner().clone();
     tauri::async_runtime::spawn_blocking(move || {
@@ -99,29 +228,34 @@ async fn get_sync_delta(
             .lock()
             .map_err(|e| e.to_string())?
             .clone();
-        let (cursor, files) = match after_rowid {
+        let delta = match after_cursor {
             Some(after) => state
                 .repository
                 .sync_file_delta(after)
                 .map_err(|e| e.to_string())?,
-            None => (
-                state
+            None => repository::CatalogDelta {
+                cursor: state
                     .repository
-                    .catalog_rowid_cursor()
+                    .catalog_change_cursor()
                     .map_err(|e| e.to_string())?,
-                Vec::new(),
-            ),
+                files: Vec::new(),
+                removed_ids: Vec::new(),
+                folders_changed: true,
+            },
         };
-        let folders =
-            if after_rowid.is_none() || progress.phase == crate::progress::SyncPhase::Folders {
-                Some(state.repository.list_folders().map_err(|e| e.to_string())?)
-            } else {
-                None
-            };
+        let folders = if after_cursor.is_none()
+            || delta.folders_changed
+            || progress.phase == crate::progress::SyncPhase::Folders
+        {
+            Some(state.repository.list_folders().map_err(|e| e.to_string())?)
+        } else {
+            None
+        };
         Ok(SyncDelta {
-            cursor,
+            cursor: delta.cursor,
             sync_progress: progress,
-            files,
+            files: delta.files,
+            removed_ids: delta.removed_ids,
             folders,
         })
     })
@@ -129,74 +263,61 @@ async fn get_sync_delta(
     .map_err(|e| e.to_string())?
 }
 
-fn dashboard_snapshot(state: &AppState) -> Result<DashboardData, String> {
-    let files = state
+fn dashboard_status_snapshot(
+    state: &AppState,
+    after_history_cursor: Option<i64>,
+) -> Result<DashboardStatus, String> {
+    let transfers = state
         .repository
-        .list_files()
+        .list_active_transfers()
         .map_err(|error| error.to_string())?;
-    let folders = state
+    let history_cursor = state
         .repository
-        .list_folders()
+        .transfer_history_cursor()
         .map_err(|error| error.to_string())?;
-    let all_transfers = state
-        .repository
-        .list_transfers()
-        .map_err(|error| error.to_string())?;
-    let transfers = all_transfers
-        .iter()
-        .filter(|job| !matches!(job.status.as_str(), "completed" | "duplicate" | "cancelled"))
-        .cloned()
-        .collect();
-    let transfer_history = all_transfers
-        .iter()
-        .filter(|job| matches!(job.status.as_str(), "completed" | "duplicate" | "cancelled"))
-        .take(1000)
-        .cloned()
-        .collect();
+    let transfer_history = if after_history_cursor == Some(history_cursor) {
+        None
+    } else {
+        Some(
+            state
+                .repository
+                .list_transfer_history(1000)
+                .map_err(|error| error.to_string())?,
+        )
+    };
     let telegram_status = state.telegram.status();
     let settings = state.repository.settings().map_err(|e| e.to_string())?;
-    let cache_bytes = {
-        let mut cached = state.cache_usage.lock().map_err(|e| e.to_string())?;
-        if cached.0.elapsed() >= Duration::from_secs(30) {
-            *cached = (
-                std::time::Instant::now(),
-                directory_size(&state.media_cache_dir).unwrap_or(0) as i64,
-            );
-        }
-        cached.1
-    };
+    let cache_bytes = state
+        .repository
+        .media_cache_total_bytes()
+        .map_err(|e| e.to_string())?;
     let queue_summary = state
         .repository
-        .queue_summary_from_jobs(&all_transfers, cache_bytes)
+        .queue_summary(cache_bytes)
+        .map_err(|e| e.to_string())?;
+    let (total_bytes, file_count, favorite_count, trash_count) = state
+        .repository
+        .catalog_stats()
+        .map_err(|e| e.to_string())?;
+    let catalog_cursor = state
+        .repository
+        .catalog_change_cursor()
         .map_err(|e| e.to_string())?;
 
-    let total_bytes = files
-        .iter()
-        .filter(|file| !file.trashed)
-        .map(|file| file.size_bytes)
-        .sum();
-    let file_count = files.iter().filter(|file| !file.trashed).count();
-    let favorite_count = files
-        .iter()
-        .filter(|file| file.favorite && !file.trashed)
-        .count();
-    let recent_count = file_count;
-
-    Ok(DashboardData {
+    Ok(DashboardStatus {
         sync_progress: state
             .telegram
             .sync_progress
             .lock()
             .expect("sync progress")
             .clone(),
-        files,
-        folders,
         transfers,
         transfer_history,
         total_bytes,
         file_count,
         favorite_count,
-        recent_count,
+        trash_count,
+        recent_count: file_count,
         telegram_connected: telegram_status.connected,
         telegram_account_label: telegram_status.account_label,
         provider_status: state
@@ -214,6 +335,37 @@ fn dashboard_snapshot(state: &AppState) -> Result<DashboardData, String> {
         queue_summary,
         settings,
         is_premium: state.telegram.cached_snapshot().is_premium,
+        catalog_cursor,
+        history_cursor,
+    })
+}
+
+fn dashboard_snapshot(state: &AppState) -> Result<DashboardData, String> {
+    let folders = state
+        .repository
+        .list_folders()
+        .map_err(|error| error.to_string())?;
+    let status = dashboard_status_snapshot(state, None)?;
+
+    Ok(DashboardData {
+        sync_progress: status.sync_progress,
+        files: Vec::new(),
+        folders,
+        transfers: status.transfers,
+        transfer_history: status.transfer_history.unwrap_or_default(),
+        total_bytes: status.total_bytes,
+        file_count: status.file_count,
+        favorite_count: status.favorite_count,
+        trash_count: status.trash_count,
+        recent_count: status.recent_count,
+        telegram_connected: status.telegram_connected,
+        telegram_account_label: status.telegram_account_label,
+        provider_status: status.provider_status,
+        queue_summary: status.queue_summary,
+        settings: status.settings,
+        is_premium: status.is_premium,
+        catalog_cursor: status.catalog_cursor,
+        history_cursor: status.history_cursor,
     })
 }
 
@@ -270,8 +422,8 @@ async fn prepare_zip_uploads(
         if item.path.starts_with("content://") {
             match mobile::stage_content_uri(&item.path).await {
                 Ok(staged) => {
-                    staged_android_sources.push(PathBuf::from(&staged));
-                    item.path = staged;
+                    staged_android_sources.push(PathBuf::from(&staged.path));
+                    item.path = staged.path;
                 }
                 Err(error) => {
                     for staged in &staged_android_sources {
@@ -286,12 +438,7 @@ async fn prepare_zip_uploads(
     let _ = &mut items;
 
     let state = state.inner().clone();
-    let permit = state
-        .preparation_slots
-        .clone()
-        .acquire_owned()
-        .await
-        .map_err(|e| e.to_string())?;
+    let permit = state.preparation_slots.acquire().await;
     let result = tauri::async_runtime::spawn_blocking(move || {
         let _permit = permit;
         let temp = tempfile::Builder::new()
@@ -317,6 +464,9 @@ async fn prepare_zip_uploads(
         // source so it is not silently discarded while reporting the failure.
         if results.iter().any(Result::is_err) {
             let _ = temp.keep();
+        }
+        if results.iter().any(Result::is_ok) {
+            state.worker_wake.notify_one();
         }
         Ok(results)
     })
@@ -355,24 +505,61 @@ async fn prepare_upload(
             return Err("No puedes subir archivos a una carpeta eliminada".into());
         }
     }
-    let _permit = state
-        .preparation_slots
-        .clone()
-        .acquire_owned()
-        .await
-        .map_err(|_| "El motor de preparación está detenido")?;
+    let _permit = state.preparation_slots.acquire().await;
     state.telegram.own_chat(&state.repository).await?;
     if encrypt {
         return Err("El cifrado adicional de archivos todavía no está habilitado para transferencias Telegram".into());
     }
 
     #[cfg(target_os = "android")]
-    let staged_android_source = if path.starts_with("content://") {
-        path = mobile::stage_content_uri(&path).await?;
-        Some(PathBuf::from(&path))
-    } else {
-        None
-    };
+    if path.starts_with("content://") {
+        let staged = mobile::stage_content_uri(&path).await?;
+        let staged_path = PathBuf::from(&staged.path);
+        let result: Result<PreparedUpload, String> = async {
+            if staged.size_bytes <= 0 {
+                return Err("Telegram no permite subir archivos vacíos (0 B)".into());
+            }
+            let limit = state.telegram.max_upload_bytes();
+            if staged.size_bytes as u64 > limit {
+                let size_gb = staged.size_bytes as f64 / 1_000_000_000.0;
+                return Err(format!(
+                    "Pesa {:.2} GB. Supera el límite de {} GB por archivo de Telegram ({})",
+                    size_gb,
+                    limit / 1_000_000_000,
+                    if state.telegram.cached_snapshot().is_premium {
+                        "límite Telegram Premium"
+                    } else {
+                        "cuenta estándar"
+                    }
+                ));
+            }
+            let owned = state.clone();
+            let original_uri = path.clone();
+            let staged_path_text = staged.path.clone();
+            let size_bytes = staged.size_bytes;
+            let sha256 = staged.sha256.clone();
+            tauri::async_runtime::spawn_blocking(move || {
+                TransferService::adopt_preverified_upload_in_folder(
+                    &owned.repository,
+                    &staged_path_text,
+                    &original_uri,
+                    size_bytes,
+                    &sha256,
+                    &owned.staging_dir,
+                    folder_id.as_deref(),
+                    delete_source_after_upload,
+                )
+            })
+            .await
+            .map_err(|e| e.to_string())?
+        }
+        .await;
+        cleanup_android_staged_source(&staged_path);
+        if result.is_ok() {
+            state.worker_wake.notify_one();
+        }
+        return result;
+    }
 
     let result: Result<PreparedUpload, String> = async {
         let limit = state.telegram.max_upload_bytes();
@@ -417,11 +604,9 @@ async fn prepare_upload(
     }
     .await;
 
-    #[cfg(target_os = "android")]
-    if let Some(staged) = staged_android_source.as_deref() {
-        cleanup_android_staged_source(staged);
+    if result.is_ok() {
+        state.worker_wake.notify_one();
     }
-
     result
 }
 
@@ -436,6 +621,9 @@ async fn sync_files(state: State<'_, Arc<AppState>>) -> Result<usize, String> {
         .sync_catalog_checked(&state.repository, true)
         .await;
     *state.background_error.lock().expect("background") = result.as_ref().err().cloned();
+    if result.is_ok() {
+        let _ = state.repository.optimize();
+    }
     result
 }
 
@@ -538,6 +726,31 @@ async fn pick_download_directory() -> Result<Option<String>, String> {
     Ok(None)
 }
 
+const MAX_DIRECTORY_UPLOAD_FILES: usize = 10_000;
+const MAX_DIRECTORY_UPLOAD_FOLDERS: usize = 10_000;
+const MAX_DIRECTORY_UPLOAD_DEPTH: usize = 128;
+
+fn validate_directory_upload_limits(
+    file_count: usize,
+    folder_count: usize,
+    depth: usize,
+) -> Result<(), String> {
+    if file_count > MAX_DIRECTORY_UPLOAD_FILES {
+        return Err("Selecciona una carpeta con máximo 10000 archivos por operación".into());
+    }
+    if folder_count > MAX_DIRECTORY_UPLOAD_FOLDERS {
+        return Err(
+            "La carpeta contiene demasiadas subcarpetas para procesarla de forma segura".into(),
+        );
+    }
+    if depth > MAX_DIRECTORY_UPLOAD_DEPTH {
+        return Err(
+            "La carpeta seleccionada supera la profundidad máxima admitida por Nuvio".into(),
+        );
+    }
+    Ok(())
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct ScannedUploadFile {
@@ -576,10 +789,12 @@ pub fn build_directory_upload_plan(dir_path: &Path) -> Result<DirectoryUploadPla
     fn walk_dir(
         current: &Path,
         root: &Path,
+        depth: usize,
         folders_set: &mut std::collections::BTreeSet<String>,
         files: &mut Vec<ScannedUploadFile>,
         total_bytes: &mut u64,
     ) -> Result<(), String> {
+        validate_directory_upload_limits(files.len(), folders_set.len(), depth)?;
         let entries =
             std::fs::read_dir(current).map_err(|e| format!("No se pudo leer la carpeta: {e}"))?;
         for entry in entries {
@@ -601,13 +816,21 @@ pub fn build_directory_upload_plan(dir_path: &Path) -> Result<DirectoryUploadPla
                 .to_string_lossy()
                 .replace('\\', "/");
 
+            let file_type = entry.file_type().map_err(|e| e.to_string())?;
+            if file_type.is_symlink() {
+                continue;
+            }
             let metadata = entry.metadata().map_err(|e| e.to_string())?;
             if metadata.is_dir() {
                 folders_set.insert(rel_path.clone());
-                walk_dir(&path, root, folders_set, files, total_bytes)?;
+                validate_directory_upload_limits(files.len(), folders_set.len(), depth + 1)?;
+                walk_dir(&path, root, depth + 1, folders_set, files, total_bytes)?;
             } else if metadata.is_file() {
+                validate_directory_upload_limits(files.len() + 1, folders_set.len(), depth)?;
                 let size = metadata.len();
-                *total_bytes += size;
+                *total_bytes = total_bytes
+                    .checked_add(size)
+                    .ok_or("La carpeta seleccionada es demasiado grande para contabilizarla")?;
                 if let Some(parent) = path.parent() {
                     if let Ok(parent_rel) = parent.strip_prefix(root) {
                         let normalized_parent = parent_rel.to_string_lossy().replace('\\', "/");
@@ -629,6 +852,7 @@ pub fn build_directory_upload_plan(dir_path: &Path) -> Result<DirectoryUploadPla
     walk_dir(
         dir_path,
         dir_path,
+        0,
         &mut folders_set,
         &mut files,
         &mut total_bytes,
@@ -696,28 +920,29 @@ fn queue_downloads(
     #[cfg(target_os = "android")]
     if directory.starts_with("content://") {
         let names = mobile::directory_names(&directory)?;
-        return Ok(state
+        let queued = state
             .repository
-            .enqueue_android_downloads(&ids, &directory, &policy, names));
+            .enqueue_android_downloads(&ids, &directory, &policy, names);
+        state.worker_wake.notify_one();
+        return Ok(queued);
     }
     let directory = PathBuf::from(directory);
     if !directory.is_absolute() || !directory.is_dir() {
         return Err("Elige una carpeta de destino válida".into());
     }
-    Ok(state
+    let queued = state
         .repository
-        .enqueue_downloads(&ids, &directory, &policy))
+        .enqueue_downloads(&ids, &directory, &policy);
+    state.worker_wake.notify_one();
+    Ok(queued)
 }
 
 #[tauri::command]
 fn pause_transfer(state: State<'_, Arc<AppState>>, id: String) -> Result<(), String> {
-    let jobs = state
+    let job = state
         .repository
-        .list_transfers()
-        .map_err(|e| e.to_string())?;
-    let job = jobs
-        .iter()
-        .find(|j| j.id == id)
+        .transfer_by_id(&id)
+        .map_err(|e| e.to_string())?
         .ok_or("Transferencia no encontrada")?;
     if matches!(
         job.status.as_str(),
@@ -739,13 +964,10 @@ fn pause_transfer(state: State<'_, Arc<AppState>>, id: String) -> Result<(), Str
 
 #[tauri::command]
 fn cancel_transfer(state: State<'_, Arc<AppState>>, id: String) -> Result<(), String> {
-    let jobs = state
+    let job = state
         .repository
-        .list_transfers()
-        .map_err(|e| e.to_string())?;
-    let job = jobs
-        .iter()
-        .find(|j| j.id == id)
+        .transfer_by_id(&id)
+        .map_err(|e| e.to_string())?
         .ok_or("Transferencia no encontrada")?;
     if matches!(
         job.status.as_str(),
@@ -772,23 +994,22 @@ async fn resume_one(state: Arc<AppState>, id: String) -> Result<(), String> {
         .map_err(|e| e.to_string())?
         .is_some()
     {
-        let permit = state
-            .preparation_slots
-            .clone()
-            .acquire_owned()
-            .await
-            .map_err(|_| "El motor de preparación está detenido")?;
+        let permit = state.preparation_slots.acquire().await;
         let owned = state.clone();
-        return tauri::async_runtime::spawn_blocking(move || {
+        tauri::async_runtime::spawn_blocking(move || {
             let _permit = permit;
             TransferService::resume_preparation(&owned.repository, &id, &owned.staging_dir)
                 .map(|_| ())
         })
         .await
-        .map_err(|e| e.to_string())?;
+        .map_err(|e| e.to_string())??;
+        state.worker_wake.notify_one();
+        return Ok(());
     }
 
-    state.repository.resume(&id).map_err(|e| e.to_string())
+    state.repository.resume(&id).map_err(|e| e.to_string())?;
+    state.worker_wake.notify_one();
+    Ok(())
 }
 
 #[tauri::command]
@@ -878,7 +1099,7 @@ async fn delete_files_permanently(
         .telegram
         .delete_files_permanently(&state.repository, &ids)
         .await?;
-    let _ = remove_media_cache_entries(&state.media_cache_dir, &ids);
+    let _ = remove_media_cache_entries(&state.repository, &state.media_cache_dir, &ids);
     Ok(removed)
 }
 
@@ -895,9 +1116,31 @@ async fn empty_trash(state: State<'_, Arc<AppState>>) -> Result<usize, String> {
             .telegram
             .delete_files_permanently(&state.repository, &batch)
             .await?;
-        let _ = remove_media_cache_entries(&state.media_cache_dir, &batch);
+        let _ = remove_media_cache_entries(&state.repository, &state.media_cache_dir, &batch);
     }
     Ok(removed)
+}
+
+#[tauri::command]
+fn prepare_thumbnail_batch(
+    state: State<'_, Arc<AppState>>,
+    ids: Vec<String>,
+) -> Result<Vec<media::ThumbnailBatchItem>, String> {
+    if ids.len() > 64 {
+        return Err("Solicita como máximo 64 miniaturas por lote".into());
+    }
+    let mut seen = std::collections::HashSet::with_capacity(ids.len());
+    let mut output = Vec::with_capacity(ids.len());
+    for id in ids {
+        if !seen.insert(id.clone()) {
+            continue;
+        }
+        output.push(media::ThumbnailBatchItem {
+            source: media::cached_thumbnail_source(&state.repository, &id)?,
+            id,
+        });
+    }
+    Ok(output)
 }
 
 #[tauri::command]
@@ -907,18 +1150,8 @@ async fn prepare_thumbnail(
 ) -> Result<Option<media::ThumbnailSource>, String> {
     // Fast path for the progressive blurred preview captured during catalog sync.
     // This is local SQLite only: no semaphore, settings lookup or Telegram request.
-    if let Ok(doc) = state.repository.remote(&id) {
-        if let Some(mini) = doc
-            .minithumbnail
-            .filter(|data| !data.is_empty() && data.len() <= 64 * 1024)
-        {
-            return Ok(Some(media::ThumbnailSource {
-                kind: "image".into(),
-                path: None,
-                data_url: Some(format!("data:image/jpeg;base64,{mini}")),
-                blurred: true,
-            }));
-        }
+    if let Some(source) = media::cached_thumbnail_source(&state.repository, &id)? {
+        return Ok(Some(source));
     }
 
     static SLOTS: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(4);
@@ -953,9 +1186,7 @@ async fn prepare_media(state: State<'_, Arc<AppState>>, id: String) -> Result<Me
 
 #[tauri::command]
 fn clear_media_cache_command(state: State<'_, Arc<AppState>>) -> Result<u64, String> {
-    let removed = clear_media_cache(&state.media_cache_dir)?;
-    *state.cache_usage.lock().map_err(|e| e.to_string())? = (std::time::Instant::now(), 0);
-    Ok(removed)
+    clear_media_cache(&state.repository, &state.media_cache_dir)
 }
 
 #[tauri::command]
@@ -969,16 +1200,10 @@ fn clear_transfer_history(state: State<'_, Arc<AppState>>) -> Result<usize, Stri
 #[tauri::command]
 fn export_diagnostics(state: State<'_, Arc<AppState>>, destination: String) -> Result<(), String> {
     let settings = state.repository.settings().map_err(|e| e.to_string())?;
-    let cache_bytes = {
-        let mut cached = state.cache_usage.lock().map_err(|e| e.to_string())?;
-        if cached.0.elapsed() >= Duration::from_secs(30) {
-            *cached = (
-                std::time::Instant::now(),
-                directory_size(&state.media_cache_dir).unwrap_or(0) as i64,
-            );
-        }
-        cached.1
-    };
+    let cache_bytes = state
+        .repository
+        .media_cache_total_bytes()
+        .map_err(|e| e.to_string())?;
     let summary = state
         .repository
         .queue_summary(cache_bytes)
@@ -1078,7 +1303,24 @@ fn update_setting(
         .repository
         .set_setting(&key, &value)
         .map_err(|e| e.to_string())?;
-    state.repository.settings().map_err(|e| e.to_string())
+    let settings = state.repository.settings().map_err(|e| e.to_string())?;
+    match key.as_str() {
+        "preparation_concurrency" => state
+            .preparation_slots
+            .set_limit(settings.preparation_concurrency),
+        "upload_concurrency" => state.upload_slots.set_limit(settings.upload_concurrency),
+        "download_concurrency" => state
+            .download_slots
+            .set_limit(settings.download_concurrency),
+        _ => {}
+    }
+    if matches!(
+        key.as_str(),
+        "preparation_concurrency" | "upload_concurrency" | "download_concurrency"
+    ) {
+        state.worker_wake.notify_one();
+    }
+    Ok(settings)
 }
 
 #[tauri::command]
@@ -1259,11 +1501,7 @@ async fn run_job(state: Arc<AppState>, job: cloud::WorkItem) {
         let _ = delete_verified_upload_source_inner(&state, &job.id, true).await;
     }
     if let Err(error) = result {
-        let current = state
-            .repository
-            .list_transfers()
-            .ok()
-            .and_then(|jobs| jobs.into_iter().find(|j| j.id == job.id));
+        let current = state.repository.transfer_by_id(&job.id).ok().flatten();
         let already_terminal = current.as_ref().is_some_and(|j| {
             matches!(
                 j.status.as_str(),
@@ -1276,6 +1514,7 @@ async fn run_job(state: Arc<AppState>, job: cloud::WorkItem) {
             }
         }
     }
+    state.worker_wake.notify_one();
 }
 
 async fn worker(state: Arc<AppState>) {
@@ -1284,14 +1523,52 @@ async fn worker(state: Arc<AppState>) {
         *state.background_error.lock().expect("background") = Some(error);
     }
     let mut bootstrap_checked = false;
+    let mut first_iteration = true;
     loop {
-        tokio::time::sleep(Duration::from_millis(350)).await;
+        if first_iteration {
+            first_iteration = false;
+        } else {
+            let wait = state
+                .repository
+                .next_retry_delay()
+                .ok()
+                .flatten()
+                .unwrap_or_else(|| Duration::from_secs(30))
+                .min(Duration::from_secs(30));
+            tokio::select! {
+                _ = state.worker_wake.notified() => {},
+                _ = state.telegram.realtime_notify.notified() => {},
+                _ = tokio::time::sleep(wait) => {},
+            }
+        }
         let _ = state.repository.release_due_retries();
         if !state.telegram.cached_snapshot().connected {
             // A later login may point to a different Telegram account/chat, whose
             // bootstrap marker is scoped independently.
             bootstrap_checked = false;
             continue;
+        }
+
+        if let Err(error) = state
+            .telegram
+            .apply_realtime_updates(&state.repository)
+            .await
+        {
+            *state.background_error.lock().expect("background") = Some(error);
+        }
+        if state.telegram.realtime_overflowed() {
+            if let Ok(_guard) = state.sync_lock.try_lock() {
+                match state
+                    .telegram
+                    .sync_catalog_checked(&state.repository, false)
+                    .await
+                {
+                    Ok(_) => state.telegram.clear_realtime_overflow(),
+                    Err(error) => {
+                        *state.background_error.lock().expect("background") = Some(error);
+                    }
+                }
+            }
         }
 
         // Startup is local-first. Only a genuinely new account/catalog performs one
@@ -1331,16 +1608,8 @@ async fn worker(state: Arc<AppState>) {
             }
         }
 
-        let upload_limit = state
-            .repository
-            .settings()
-            .unwrap_or_default()
-            .upload_concurrency;
         loop {
-            if 16 - state.upload_slots.available_permits() >= upload_limit {
-                break;
-            }
-            let Ok(permit) = state.upload_slots.clone().try_acquire_owned() else {
+            let Some(permit) = state.upload_slots.try_acquire() else {
                 break;
             };
             match state.repository.claim_pending("upload") {
@@ -1364,7 +1633,7 @@ async fn worker(state: Arc<AppState>) {
         }
 
         loop {
-            let Ok(permit) = state.download_slots.clone().try_acquire_owned() else {
+            let Some(permit) = state.download_slots.try_acquire() else {
                 break;
             };
             match state.repository.claim_pending("download") {
@@ -1429,11 +1698,21 @@ fn decrypt_nuvio_file(
     result
 }
 
+fn wake_worker_after_auth(
+    state: &AppState,
+    result: Result<TelegramAuthSnapshot, String>,
+) -> Result<TelegramAuthSnapshot, String> {
+    if result.as_ref().is_ok_and(|snapshot| snapshot.connected) {
+        state.worker_wake.notify_one();
+    }
+    result
+}
+
 #[tauri::command]
 async fn telegram_auth_state(
     state: State<'_, Arc<AppState>>,
 ) -> Result<TelegramAuthSnapshot, String> {
-    state.telegram.refresh().await
+    wake_worker_after_auth(state.inner(), state.telegram.refresh().await)
 }
 
 #[tauri::command]
@@ -1447,10 +1726,13 @@ async fn telegram_configure(
         .repository
         .set_setting("remember_session", if remember_session { "1" } else { "0" })
         .map_err(|e| e.to_string())?;
-    state
-        .telegram
-        .configure(api_id, api_hash, remember_session)
-        .await
+    wake_worker_after_auth(
+        state.inner(),
+        state
+            .telegram
+            .configure(api_id, api_hash, remember_session)
+            .await,
+    )
 }
 
 #[tauri::command]
@@ -1459,10 +1741,13 @@ async fn telegram_submit_phone(
     phone: String,
     delivery: Option<String>,
 ) -> Result<TelegramAuthSnapshot, String> {
-    state
-        .telegram
-        .submit_phone(phone, delivery.as_deref().unwrap_or("telegram"))
-        .await
+    wake_worker_after_auth(
+        state.inner(),
+        state
+            .telegram
+            .submit_phone(phone, delivery.as_deref().unwrap_or("telegram"))
+            .await,
+    )
 }
 #[tauri::command]
 async fn telegram_reset_to_phone(
@@ -1482,7 +1767,7 @@ async fn telegram_submit_email_code(
     state: State<'_, Arc<AppState>>,
     code: String,
 ) -> Result<TelegramAuthSnapshot, String> {
-    state.telegram.submit_email_code(code).await
+    wake_worker_after_auth(state.inner(), state.telegram.submit_email_code(code).await)
 }
 #[tauri::command]
 async fn telegram_submit_email_identity(
@@ -1490,7 +1775,10 @@ async fn telegram_submit_email_identity(
     provider: String,
     token: String,
 ) -> Result<TelegramAuthSnapshot, String> {
-    state.telegram.submit_email_identity(&provider, token).await
+    wake_worker_after_auth(
+        state.inner(),
+        state.telegram.submit_email_identity(&provider, token).await,
+    )
 }
 
 #[tauri::command]
@@ -1527,7 +1815,7 @@ async fn telegram_check_login_email(
     state: State<'_, Arc<AppState>>,
     code: String,
 ) -> Result<TelegramAuthSnapshot, String> {
-    state.telegram.check_login_email(code).await
+    wake_worker_after_auth(state.inner(), state.telegram.check_login_email(code).await)
 }
 
 #[tauri::command]
@@ -1535,7 +1823,7 @@ async fn telegram_submit_code(
     state: State<'_, Arc<AppState>>,
     code: String,
 ) -> Result<TelegramAuthSnapshot, String> {
-    state.telegram.submit_code(code).await
+    wake_worker_after_auth(state.inner(), state.telegram.submit_code(code).await)
 }
 #[tauri::command]
 async fn telegram_resend_code(
@@ -1549,13 +1837,16 @@ async fn telegram_submit_password(
     state: State<'_, Arc<AppState>>,
     password: String,
 ) -> Result<TelegramAuthSnapshot, String> {
-    state.telegram.submit_password(password).await
+    wake_worker_after_auth(
+        state.inner(),
+        state.telegram.submit_password(password).await,
+    )
 }
 #[tauri::command]
 async fn telegram_request_qr(
     state: State<'_, Arc<AppState>>,
 ) -> Result<TelegramAuthSnapshot, String> {
-    state.telegram.request_qr().await
+    wake_worker_after_auth(state.inner(), state.telegram.request_qr().await)
 }
 #[tauri::command]
 async fn telegram_register_user(
@@ -1563,7 +1854,10 @@ async fn telegram_register_user(
     first_name: String,
     last_name: String,
 ) -> Result<TelegramAuthSnapshot, String> {
-    state.telegram.register_user(first_name, last_name).await
+    wake_worker_after_auth(
+        state.inner(),
+        state.telegram.register_user(first_name, last_name).await,
+    )
 }
 #[tauri::command]
 async fn telegram_log_out(state: State<'_, Arc<AppState>>) -> Result<TelegramAuthSnapshot, String> {
@@ -1584,23 +1878,6 @@ async fn telegram_forget_session(
         .set_setting("remember_session", "0")
         .map_err(|e| e.to_string())?;
     state.telegram.forget_session().await
-}
-
-fn directory_size(path: &Path) -> std::io::Result<u64> {
-    if !path.exists() {
-        return Ok(0);
-    }
-    let mut total = 0_u64;
-    for entry in fs::read_dir(path)? {
-        let entry = entry?;
-        let metadata = entry.metadata()?;
-        total = total.saturating_add(if metadata.is_dir() {
-            directory_size(&entry.path())?
-        } else {
-            metadata.len()
-        });
-    }
-    Ok(total)
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -1630,6 +1907,7 @@ pub fn run() {
             let repository = CatalogRepository::open(&app_data_dir.join("nuvio.db"))
                 .map_err(|error| error.to_string())?;
             repository.init_cloud()?;
+            reconcile_media_cache_index(&repository, &media_cache_dir)?;
             let settings = repository.settings().map_err(|e| e.to_string())?;
             let telegram = TelegramService::new(&app_data_dir)?;
             let state = Arc::new(AppState {
@@ -1637,14 +1915,10 @@ pub fn run() {
                 telegram,
                 staging_dir,
                 media_cache_dir,
-                preparation_slots: Arc::new(tokio::sync::Semaphore::new(
-                    settings.preparation_concurrency,
-                )),
-                cache_usage: Mutex::new((std::time::Instant::now() - Duration::from_secs(31), 0)),
-                upload_slots: Arc::new(tokio::sync::Semaphore::new(16)),
-                download_slots: Arc::new(tokio::sync::Semaphore::new(
-                    settings.download_concurrency,
-                )),
+                preparation_slots: DynamicLimiter::new(settings.preparation_concurrency, 8),
+                upload_slots: DynamicLimiter::new(settings.upload_concurrency, 16),
+                download_slots: DynamicLimiter::new(settings.download_concurrency, 8),
+                worker_wake: Arc::new(tokio::sync::Notify::new()),
                 sync_lock: tokio::sync::Mutex::new(()),
                 background_error: Mutex::new(None),
             });
@@ -1664,6 +1938,8 @@ pub fn run() {
         })
         .invoke_handler(tauri::generate_handler![
             get_dashboard,
+            get_dashboard_status,
+            get_catalog_page,
             get_sync_delta,
             set_favorite,
             analyze_upload_selection,
@@ -1695,6 +1971,7 @@ pub fn run() {
             delete_files_permanently,
             empty_trash,
             prepare_media,
+            prepare_thumbnail_batch,
             prepare_thumbnail,
             clear_media_cache_command,
             clear_transfer_history,
@@ -1797,6 +2074,14 @@ mod tests {
         );
 
         assert_eq!(plan.total_bytes, 4 + 9 + 6);
+    }
+
+    #[test]
+    fn directory_upload_limits_are_bounded_before_large_ipc_payloads() {
+        assert!(validate_directory_upload_limits(10_000, 10_000, 128).is_ok());
+        assert!(validate_directory_upload_limits(10_001, 0, 0).is_err());
+        assert!(validate_directory_upload_limits(0, 10_001, 0).is_err());
+        assert!(validate_directory_upload_limits(0, 0, 129).is_err());
     }
 
     #[test]

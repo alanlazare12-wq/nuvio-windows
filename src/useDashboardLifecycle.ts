@@ -6,11 +6,11 @@ import {
 } from "@tauri-apps/plugin-notification";
 import { updateUploadNotification } from "./bridge/mobile";
 import { isTransferPending } from "./components/TransferRows";
-import type { DashboardData } from "./types";
+import type { DashboardData, DashboardStatus } from "./types";
 
 type UseDashboardLifecycleOptions = {
   dashboard: DashboardData | null;
-  refreshDashboard: () => Promise<DashboardData | undefined>;
+  refreshDashboardStatus: () => Promise<DashboardStatus | undefined>;
   dragActiveRef: MutableRefObject<boolean>;
   manualSyncPollingRef: MutableRefObject<boolean>;
   invalidateDashboardRequests: () => void;
@@ -19,7 +19,7 @@ type UseDashboardLifecycleOptions = {
 
 export function useDashboardLifecycle({
   dashboard,
-  refreshDashboard,
+  refreshDashboardStatus,
   dragActiveRef,
   manualSyncPollingRef,
   invalidateDashboardRequests,
@@ -44,7 +44,7 @@ export function useDashboardLifecycle({
         return;
       }
 
-      const next = await refreshDashboard();
+      const next = await refreshDashboardStatus();
       const active = next?.syncProgress?.active || (next?.queueSummary.pending ?? 0) > 0;
       if (!disposed) {
         timer = window.setTimeout(

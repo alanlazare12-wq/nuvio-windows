@@ -2,16 +2,19 @@ use crate::{
     crypto::sha256_file,
     progress::SpeedEstimator,
     repository::{CatalogRepository, RepositoryError},
-    telegram::{call, TelegramService},
+    telegram::{call, TelegramRealtimeUpdate, TelegramService},
 };
 use rusqlite::{params, OptionalExtension};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::{
     fs,
+    io::Read,
     path::{Path, PathBuf},
-    time::{Duration, Instant},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 use tdlib_rs::{enums as e, functions as f, types as t};
+use zip::{write::SimpleFileOptions, CompressionMethod, ZipArchive, ZipWriter};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RemoteDocument {
@@ -85,6 +88,172 @@ struct FileTrashEvent {
 struct FileDeleteEvent {
     v: u8,
     message_ids: Vec<i64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
+struct CatalogSnapshotCheckpoints {
+    documents: i64,
+    folders: i64,
+    moves: i64,
+    trash: i64,
+    deletes: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct CatalogSnapshotV2 {
+    v: u8,
+    generated_at: i64,
+    checkpoints: CatalogSnapshotCheckpoints,
+    documents: Vec<RemoteDocument>,
+    folders: Vec<FolderEvent>,
+    trashed_message_ids: Vec<i64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct CatalogSnapshotCaption {
+    v: u8,
+    sha256: String,
+    documents: usize,
+    generated_at: i64,
+}
+
+fn snapshot_unix_time() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|value| value.as_secs().min(i64::MAX as u64) as i64)
+        .unwrap_or(0)
+}
+
+fn valid_snapshot_hash(value: &str) -> bool {
+    value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
+fn validate_catalog_snapshot(snapshot: &CatalogSnapshotV2) -> Result<(), String> {
+    if snapshot.v != 2 {
+        return Err("Versión de snapshot de catálogo no compatible".into());
+    }
+    if snapshot.documents.len() > 1_000_000
+        || snapshot.folders.len() > 200_000
+        || snapshot.trashed_message_ids.len() > 1_000_000
+    {
+        return Err("El snapshot de catálogo excede los límites de seguridad".into());
+    }
+    if [
+        snapshot.checkpoints.documents,
+        snapshot.checkpoints.folders,
+        snapshot.checkpoints.moves,
+        snapshot.checkpoints.trash,
+        snapshot.checkpoints.deletes,
+    ]
+    .into_iter()
+    .any(|value| value < 0)
+    {
+        return Err("El snapshot contiene checkpoints inválidos".into());
+    }
+
+    let mut document_ids = std::collections::HashSet::with_capacity(snapshot.documents.len());
+    for document in &snapshot.documents {
+        if document.message_id <= 0
+            || document.size < 0
+            || !valid_snapshot_hash(&document.sha256)
+            || !document_ids.insert(document.message_id)
+        {
+            return Err("El snapshot contiene un documento inválido o duplicado".into());
+        }
+    }
+
+    let mut folder_ids = std::collections::HashSet::with_capacity(snapshot.folders.len());
+    for folder in &snapshot.folders {
+        if folder.v != 1
+            || folder.id.is_empty()
+            || !folder_ids.insert(folder.id.as_str())
+            || crate::repository::validate_folder_name(&folder.name).is_err()
+        {
+            return Err("El snapshot contiene una carpeta inválida o duplicada".into());
+        }
+    }
+    for folder in &snapshot.folders {
+        if folder
+            .parent_id
+            .as_deref()
+            .is_some_and(|parent| parent == folder.id || !folder_ids.contains(parent))
+        {
+            return Err("El snapshot contiene una jerarquía de carpetas inválida".into());
+        }
+    }
+    if snapshot
+        .trashed_message_ids
+        .iter()
+        .any(|message_id| *message_id <= 0 || !document_ids.contains(message_id))
+    {
+        return Err("El snapshot contiene referencias de Papelera inválidas".into());
+    }
+    Ok(())
+}
+
+fn write_catalog_snapshot_zip(snapshot: &CatalogSnapshotV2, path: &Path) -> Result<(), String> {
+    validate_catalog_snapshot(snapshot)?;
+    let file = fs::File::create(path).map_err(|error| error.to_string())?;
+    let mut zip = ZipWriter::new(file);
+    zip.start_file(
+        "catalog.json",
+        SimpleFileOptions::default()
+            .compression_method(CompressionMethod::Deflated)
+            .compression_level(Some(1)),
+    )
+    .map_err(|error| error.to_string())?;
+    serde_json::to_writer(&mut zip, snapshot).map_err(|error| error.to_string())?;
+    let file = zip.finish().map_err(|error| error.to_string())?;
+    file.sync_all().map_err(|error| error.to_string())?;
+    Ok(())
+}
+
+fn read_catalog_snapshot_zip(path: &Path) -> Result<CatalogSnapshotV2, String> {
+    const MAX_SNAPSHOT_JSON_BYTES: u64 = 512 * 1024 * 1024;
+    let file = fs::File::open(path).map_err(|error| error.to_string())?;
+    let mut archive = ZipArchive::new(file).map_err(|error| error.to_string())?;
+    let entry = archive
+        .by_name("catalog.json")
+        .map_err(|_| "El snapshot no contiene catalog.json".to_string())?;
+    if entry.size() > MAX_SNAPSHOT_JSON_BYTES {
+        return Err("El snapshot de catálogo descomprimido es demasiado grande".into());
+    }
+    let snapshot: CatalogSnapshotV2 =
+        serde_json::from_reader(entry.take(MAX_SNAPSHOT_JSON_BYTES + 1))
+            .map_err(|error| error.to_string())?;
+    validate_catalog_snapshot(&snapshot)?;
+    Ok(snapshot)
+}
+
+fn parse_catalog_snapshot_caption(text: &str) -> Option<CatalogSnapshotCaption> {
+    let payload = text.strip_prefix("#NuvioCatalog2 ")?;
+    let caption: CatalogSnapshotCaption = serde_json::from_str(payload).ok()?;
+    if caption.v != 2
+        || caption.documents > 1_000_000
+        || caption.generated_at <= 0
+        || !valid_snapshot_hash(&caption.sha256)
+    {
+        return None;
+    }
+    Some(caption)
+}
+
+fn catalog_snapshot_message(message: &t::Message) -> Option<(CatalogSnapshotCaption, t::File)> {
+    if message.sending_state.is_some() {
+        return None;
+    }
+    let e::MessageContent::MessageDocument(content) = &message.content else {
+        return None;
+    };
+    let caption = parse_catalog_snapshot_caption(&content.caption.text)?;
+    let file = content.document.document.clone();
+    // A catalog snapshot is metadata only. Bound the compressed payload before
+    // asking TDLib to download it; the decompressed JSON has its own stricter cap.
+    let advertised_size = file.size.max(file.expected_size);
+    if !(0..=512 * 1024 * 1024).contains(&advertised_size) {
+        return None;
+    }
+    Some((caption, file))
 }
 
 struct HistoryScanState {
@@ -307,6 +476,257 @@ impl CatalogRepository {
             )
             .map_err(|e| e.to_string())?;
         Ok(())
+    }
+
+    fn export_catalog_snapshot(&self, chat: i64) -> Result<CatalogSnapshotV2, String> {
+        let connection = self.connection.lock().map_err(|e| e.to_string())?;
+
+        let general_checkpoint: Option<i64> = connection
+            .query_row(
+                "SELECT value FROM app_meta WHERE key=?1",
+                [format!("catalog_sync_v1:{chat}")],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+            .map_err(|e| e.to_string())?
+            .map(|value| value.parse::<i64>().map_err(|e| e.to_string()))
+            .transpose()?;
+        let general_checkpoint = general_checkpoint.unwrap_or(0).max(0);
+        let stream_checkpoint = |stream: &str| -> Result<i64, String> {
+            let key = format!("catalog_sync_v2:{chat}:{stream}");
+            let value: Option<String> = connection
+                .query_row("SELECT value FROM app_meta WHERE key=?1", [&key], |row| {
+                    row.get(0)
+                })
+                .optional()
+                .map_err(|e| e.to_string())?;
+            value
+                .map(|value| value.parse::<i64>().map_err(|e| e.to_string()))
+                .transpose()
+                .map(|value| value.unwrap_or(general_checkpoint).max(0))
+        };
+
+        let checkpoints = CatalogSnapshotCheckpoints {
+            documents: stream_checkpoint("documents")?,
+            folders: stream_checkpoint("folders")?,
+            moves: stream_checkpoint("moves")?,
+            trash: stream_checkpoint("trash")?,
+            deletes: stream_checkpoint("deletes")?,
+        };
+
+        let mut documents = Vec::new();
+        {
+            let mut statement = connection
+                .prepare("SELECT document FROM remote_documents")
+                .map_err(|e| e.to_string())?;
+            let rows = statement
+                .query_map([], |row| row.get::<_, String>(0))
+                .map_err(|e| e.to_string())?;
+            for row in rows {
+                let raw = row.map_err(|e| e.to_string())?;
+                let mut document: RemoteDocument =
+                    serde_json::from_str(&raw).map_err(|e| e.to_string())?;
+                // Progressive mini-thumbnails are intentionally excluded from the
+                // portable catalog. They can dwarf metadata for 100k+ libraries and
+                // are cheaply re-fetched on demand.
+                document.minithumbnail = None;
+                documents.push(document);
+            }
+        }
+        documents.sort_by_key(|document| document.message_id);
+
+        let mut folders = Vec::new();
+        {
+            let mut statement = connection
+                .prepare(
+                    "SELECT id,name,parent_id,trashed
+                     FROM folders
+                     ORDER BY id",
+                )
+                .map_err(|e| e.to_string())?;
+            let rows = statement
+                .query_map([], |row| {
+                    Ok(FolderEvent {
+                        v: 1,
+                        id: row.get(0)?,
+                        name: row.get(1)?,
+                        parent_id: row.get(2)?,
+                        trashed: row.get::<_, i64>(3)? != 0,
+                    })
+                })
+                .map_err(|e| e.to_string())?;
+            for row in rows {
+                folders.push(row.map_err(|e| e.to_string())?);
+            }
+        }
+
+        let mut trashed_message_ids = Vec::new();
+        {
+            let mut statement = connection
+                .prepare(
+                    "SELECT telegram_message_id
+                     FROM files
+                     WHERE provider='telegram'
+                       AND trashed=1
+                       AND telegram_message_id IS NOT NULL
+                     ORDER BY CAST(telegram_message_id AS INTEGER)",
+                )
+                .map_err(|e| e.to_string())?;
+            let rows = statement
+                .query_map([], |row| row.get::<_, String>(0))
+                .map_err(|e| e.to_string())?;
+            for row in rows {
+                let raw = row.map_err(|e| e.to_string())?;
+                trashed_message_ids.push(
+                    raw.parse::<i64>()
+                        .map_err(|_| "Identificador remoto inválido en el catálogo".to_string())?,
+                );
+            }
+        }
+
+        let snapshot = CatalogSnapshotV2 {
+            v: 2,
+            generated_at: snapshot_unix_time(),
+            checkpoints,
+            documents,
+            folders,
+            trashed_message_ids,
+        };
+        validate_catalog_snapshot(&snapshot)?;
+        Ok(snapshot)
+    }
+
+    fn import_catalog_snapshot(
+        &self,
+        chat: i64,
+        snapshot: &CatalogSnapshotV2,
+    ) -> Result<usize, String> {
+        validate_catalog_snapshot(snapshot)?;
+        if self.catalog_remote_count()? != 0 {
+            return Err("El snapshot solo puede importarse sobre un catálogo remoto vacío".into());
+        }
+
+        self.apply_folder_snapshot(snapshot.folders.clone())?;
+        for batch in snapshot.documents.chunks(1000) {
+            self.record_remote_batch(batch).map_err(|e| e.to_string())?;
+        }
+        let trash_states = snapshot
+            .trashed_message_ids
+            .iter()
+            .copied()
+            .map(|message_id| (message_id, true))
+            .collect::<std::collections::HashMap<_, _>>();
+        self.reconcile_trash_states(&trash_states)?;
+
+        let checkpoints = &snapshot.checkpoints;
+        self.save_sync_checkpoint(
+            chat,
+            [
+                checkpoints.documents,
+                checkpoints.folders,
+                checkpoints.moves,
+                checkpoints.trash,
+                checkpoints.deletes,
+            ]
+            .into_iter()
+            .max()
+            .unwrap_or(0),
+        )?;
+        self.save_sync_stream_checkpoint(chat, "documents", checkpoints.documents)?;
+        self.save_sync_stream_checkpoint(chat, "folders", checkpoints.folders)?;
+        self.save_sync_stream_checkpoint(chat, "moves", checkpoints.moves)?;
+        self.save_sync_stream_checkpoint(chat, "trash", checkpoints.trash)?;
+        self.save_sync_stream_checkpoint(chat, "deletes", checkpoints.deletes)?;
+        self.mark_history_backfill_done(chat)?;
+        self.mark_fast_search_backfill_done(chat)?;
+        self.mark_trash_backfill_done(chat)?;
+        self.mark_initial_catalog_sync_done(chat)?;
+        Ok(snapshot.documents.len())
+    }
+
+    fn snapshot_publish_needed(&self, chat: i64, cursor: i64) -> Result<bool, String> {
+        if cursor <= 0 {
+            return Ok(false);
+        }
+        let connection = self.connection.lock().map_err(|e| e.to_string())?;
+        let now: i64 = connection
+            .query_row("SELECT unixepoch()", [], |row| row.get(0))
+            .map_err(|e| e.to_string())?;
+        let last_cursor: Option<String> = connection
+            .query_row(
+                "SELECT value FROM app_meta WHERE key=?1",
+                [format!("catalog_snapshot_v2_cursor:{chat}")],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|e| e.to_string())?;
+        let last_at: Option<String> = connection
+            .query_row(
+                "SELECT value FROM app_meta WHERE key=?1",
+                [format!("catalog_snapshot_v2_at:{chat}")],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|e| e.to_string())?;
+        let last_cursor = last_cursor
+            .and_then(|value| value.parse::<i64>().ok())
+            .unwrap_or(0);
+        let last_at = last_at
+            .and_then(|value| value.parse::<i64>().ok())
+            .unwrap_or(0);
+        Ok(cursor > last_cursor
+            && (last_cursor == 0
+                || cursor.saturating_sub(last_cursor) >= 1000
+                || now.saturating_sub(last_at) >= 6 * 60 * 60))
+    }
+
+    fn mark_snapshot_published(
+        &self,
+        chat: i64,
+        cursor: i64,
+        message_id: i64,
+    ) -> Result<(), String> {
+        let mut connection = self.connection.lock().map_err(|e| e.to_string())?;
+        let transaction = connection.transaction().map_err(|e| e.to_string())?;
+        let now: i64 = transaction
+            .query_row("SELECT unixepoch()", [], |row| row.get(0))
+            .map_err(|e| e.to_string())?;
+        for (key, value) in [
+            (
+                format!("catalog_snapshot_v2_cursor:{chat}"),
+                cursor.to_string(),
+            ),
+            (format!("catalog_snapshot_v2_at:{chat}"), now.to_string()),
+            (
+                format!("catalog_snapshot_v2_message:{chat}"),
+                message_id.to_string(),
+            ),
+        ] {
+            transaction
+                .execute(
+                    "INSERT INTO app_meta(key,value) VALUES (?1,?2)
+                     ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                    params![key, value],
+                )
+                .map_err(|e| e.to_string())?;
+        }
+        transaction.commit().map_err(|e| e.to_string())?;
+        Ok(())
+    }
+
+    fn snapshot_message_id(&self, chat: i64) -> Result<Option<i64>, String> {
+        let connection = self.connection.lock().map_err(|e| e.to_string())?;
+        let value: Option<String> = connection
+            .query_row(
+                "SELECT value FROM app_meta WHERE key=?1",
+                [format!("catalog_snapshot_v2_message:{chat}")],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|e| e.to_string())?;
+        value
+            .map(|raw| raw.parse::<i64>().map_err(|e| e.to_string()))
+            .transpose()
     }
 
     fn should_verify_deleted(&self, chat: i64, interval_seconds: i64) -> Result<bool, String> {
@@ -597,6 +1017,34 @@ impl CatalogRepository {
             [id.to_string()],
         )
         .map_err(|e| e.to_string())?;
+        Ok(())
+    }
+
+    fn bound_chat(&self) -> Result<Option<i64>, String> {
+        let connection = self.connection.lock().map_err(|e| e.to_string())?;
+        let value: Option<String> = connection
+            .query_row(
+                "SELECT value FROM app_meta WHERE key='telegram_saved_messages_chat'",
+                [],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|e| e.to_string())?;
+        value
+            .map(|raw| raw.parse::<i64>().map_err(|e| e.to_string()))
+            .transpose()
+    }
+
+    fn bind_chat(&self, chat_id: i64) -> Result<(), String> {
+        self.connection
+            .lock()
+            .map_err(|e| e.to_string())?
+            .execute(
+                "INSERT INTO app_meta(key,value) VALUES ('telegram_saved_messages_chat',?1)
+                 ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                [chat_id.to_string()],
+            )
+            .map_err(|e| e.to_string())?;
         Ok(())
     }
 
@@ -1201,7 +1649,325 @@ impl TelegramService {
         repo.bind_account(me.id)?;
         let e::Chat::Chat(chat) =
             call(f::create_private_chat(me.id, false, self.client_id())).await?;
+        repo.bind_chat(chat.id)?;
         Ok(chat.id)
+    }
+
+    async fn latest_catalog_snapshot(
+        &self,
+        chat: i64,
+    ) -> Result<Option<(i64, CatalogSnapshotCaption, t::File)>, String> {
+        let e::FoundChatMessages::FoundChatMessages(page) = call(f::search_chat_messages(
+            chat,
+            None,
+            "#NuvioCatalog2".to_string(),
+            None,
+            0,
+            0,
+            50,
+            None,
+            self.client_id(),
+        ))
+        .await?;
+
+        let mut best: Option<(i64, CatalogSnapshotCaption, t::File)> = None;
+        for message in page.messages {
+            if message.chat_id != chat {
+                continue;
+            }
+            let Some((caption, file)) = catalog_snapshot_message(&message) else {
+                continue;
+            };
+            let replace = best.as_ref().is_none_or(|(best_id, best_caption, _)| {
+                caption.generated_at > best_caption.generated_at
+                    || (caption.generated_at == best_caption.generated_at && message.id > *best_id)
+            });
+            if replace {
+                best = Some((message.id, caption, file));
+            }
+        }
+        Ok(best)
+    }
+
+    async fn download_catalog_snapshot(
+        &self,
+        caption: &CatalogSnapshotCaption,
+        mut file: t::File,
+    ) -> Result<CatalogSnapshotV2, String> {
+        const MAX_COMPRESSED_BYTES: i64 = 512 * 1024 * 1024;
+        let advertised_size = file.size.max(file.expected_size);
+        if !(0..=MAX_COMPRESSED_BYTES).contains(&advertised_size) {
+            return Err("El snapshot remoto excede el límite de seguridad".into());
+        }
+
+        let mut updates = self.subscribe_file_updates();
+        let e::File::File(started) =
+            call(f::download_file(file.id, 32, 0, 0, false, self.client_id())).await?;
+        file = started;
+
+        let deadline = Instant::now() + Duration::from_secs(20 * 60);
+        while !file.local.is_downloading_completed {
+            if Instant::now() >= deadline {
+                return Err("El snapshot remoto tardó demasiado en descargarse".into());
+            }
+            if !file.local.is_downloading_active {
+                return Err("Telegram interrumpió la descarga del snapshot".into());
+            }
+            file = self
+                .next_file_update(&mut updates, file.id, Duration::from_secs(5))
+                .await?;
+        }
+
+        let path = PathBuf::from(&file.local.path);
+        let metadata = fs::metadata(&path).map_err(|e| e.to_string())?;
+        if !metadata.is_file() || metadata.len() > MAX_COMPRESSED_BYTES as u64 {
+            return Err("El snapshot descargado no es un archivo válido".into());
+        }
+
+        let hash_path = path.clone();
+        let actual_hash = tauri::async_runtime::spawn_blocking(move || sha256_file(&hash_path))
+            .await
+            .map_err(|e| e.to_string())?
+            .map_err(|e| e.to_string())?;
+        if !actual_hash.eq_ignore_ascii_case(&caption.sha256) {
+            return Err("El hash del snapshot remoto no coincide".into());
+        }
+
+        let snapshot_path = path.clone();
+        let snapshot =
+            tauri::async_runtime::spawn_blocking(move || read_catalog_snapshot_zip(&snapshot_path))
+                .await
+                .map_err(|e| e.to_string())??;
+        if snapshot.documents.len() != caption.documents
+            || snapshot.generated_at != caption.generated_at
+        {
+            return Err("Los metadatos del snapshot remoto no coinciden con su contenido".into());
+        }
+        Ok(snapshot)
+    }
+
+    async fn import_latest_catalog_snapshot(
+        &self,
+        repo: &CatalogRepository,
+        chat: i64,
+    ) -> Result<Option<usize>, String> {
+        if repo.catalog_remote_count()? != 0 {
+            return Ok(None);
+        }
+        let Some((message_id, caption, file)) = self.latest_catalog_snapshot(chat).await? else {
+            return Ok(None);
+        };
+
+        // A malformed or stale snapshot must never block the normal history fallback.
+        let snapshot = match self.download_catalog_snapshot(&caption, file).await {
+            Ok(snapshot) => snapshot,
+            Err(_) => return Ok(None),
+        };
+        let imported = repo.import_catalog_snapshot(chat, &snapshot)?;
+        let cursor = [
+            snapshot.checkpoints.documents,
+            snapshot.checkpoints.folders,
+            snapshot.checkpoints.moves,
+            snapshot.checkpoints.trash,
+            snapshot.checkpoints.deletes,
+        ]
+        .into_iter()
+        .max()
+        .unwrap_or(0);
+        repo.mark_snapshot_published(chat, cursor, message_id)?;
+        Ok(Some(imported))
+    }
+
+    async fn wait_sent_message(
+        &self,
+        message: t::Message,
+        timeout_for: Duration,
+        timeout_message: &str,
+    ) -> Result<t::Message, String> {
+        if message.sending_state.is_none() {
+            return Ok(message);
+        }
+        let pending = message.id;
+        let deadline = Instant::now() + timeout_for;
+        while Instant::now() < deadline {
+            if let Some(result) = self
+                .sent
+                .lock()
+                .map_err(|e| e.to_string())?
+                .remove(&pending)
+            {
+                return result;
+            }
+            tokio::time::sleep(Duration::from_millis(120)).await;
+        }
+        Err(timeout_message.to_string())
+    }
+
+    async fn publish_catalog_snapshot_if_needed(
+        &self,
+        repo: &CatalogRepository,
+        chat: i64,
+        cursor: i64,
+    ) -> Result<(), String> {
+        if !repo.snapshot_publish_needed(chat, cursor)? {
+            return Ok(());
+        }
+
+        let snapshot = repo.export_catalog_snapshot(chat)?;
+        let temp = tempfile::Builder::new()
+            .prefix("nuvio-catalog-v2-")
+            .tempdir()
+            .map_err(|e| e.to_string())?;
+        let path = temp.path().join("nuvio-catalog-v2.zip");
+        write_catalog_snapshot_zip(&snapshot, &path)?;
+        let hash = sha256_file(&path).map_err(|e| e.to_string())?;
+        let caption = CatalogSnapshotCaption {
+            v: 2,
+            sha256: hash,
+            documents: snapshot.documents.len(),
+            generated_at: snapshot.generated_at,
+        };
+        let text = format!(
+            "#NuvioCatalog2 {}",
+            serde_json::to_string(&caption).map_err(|e| e.to_string())?
+        );
+        let content = e::InputMessageContent::InputMessageDocument(t::InputMessageDocument {
+            document: e::InputFile::Local(t::InputFileLocal {
+                path: path.to_string_lossy().into_owned(),
+            }),
+            thumbnail: None,
+            disable_content_type_detection: true,
+            caption: Some(t::FormattedText {
+                text,
+                entities: vec![],
+            }),
+        });
+
+        let old_message = repo.snapshot_message_id(chat)?;
+        let e::Message::Message(message) = call(f::send_message(
+            chat,
+            None,
+            None,
+            None,
+            content,
+            self.client_id(),
+        ))
+        .await?;
+        let message = self
+            .wait_sent_message(
+                message,
+                Duration::from_secs(15 * 60),
+                "Telegram tardó demasiado en publicar el snapshot del catálogo",
+            )
+            .await?;
+        repo.mark_snapshot_published(chat, cursor, message.id)?;
+
+        if let Some(old_id) = old_message.filter(|old_id| *old_id > 0 && *old_id != message.id) {
+            let _ = call(f::delete_messages(
+                chat,
+                vec![old_id],
+                true,
+                self.client_id(),
+            ))
+            .await;
+        }
+        Ok(())
+    }
+
+    pub async fn apply_realtime_updates(&self, repo: &CatalogRepository) -> Result<usize, String> {
+        let Ok(_gate) = self.catalog_sync_gate.try_lock() else {
+            return Ok(0);
+        };
+        let updates = self.drain_realtime_updates(512);
+        if updates.is_empty() {
+            return Ok(0);
+        }
+        let needs_chat = updates.iter().any(|update| {
+            matches!(
+                update,
+                TelegramRealtimeUpdate::Message(_) | TelegramRealtimeUpdate::DeleteMessages { .. }
+            )
+        });
+        let chat = if needs_chat {
+            Some(match repo.bound_chat()? {
+                Some(chat) => chat,
+                None => self.own_chat(repo).await?,
+            })
+        } else {
+            None
+        };
+
+        let mut applied = 0usize;
+        for update in updates {
+            match update {
+                TelegramRealtimeUpdate::Message(message) => {
+                    let message = *message;
+                    if Some(message.chat_id) != chat {
+                        continue;
+                    }
+                    if let Some(doc) = document(&message) {
+                        repo.record_remote(&doc).map_err(|e| e.to_string())?;
+                        applied += 1;
+                        continue;
+                    }
+                    if let Some(event) = folder_event(&message) {
+                        repo.apply_folder_event(
+                            &event.id,
+                            &event.name,
+                            event.parent_id.as_deref(),
+                            event.trashed,
+                        )
+                        .map_err(|e| e.to_string())?;
+                        applied += 1;
+                        continue;
+                    }
+                    if let Some(event) = file_move_event(&message) {
+                        let moves = event
+                            .message_ids
+                            .into_iter()
+                            .map(|message_id| (message_id, event.folder_id.clone()))
+                            .collect::<std::collections::HashMap<_, _>>();
+                        repo.reconcile_moves_and_orphans(&moves)?;
+                        applied += moves.len();
+                        continue;
+                    }
+                    if let Some(event) = file_trash_event(&message) {
+                        let states = event
+                            .message_ids
+                            .into_iter()
+                            .map(|message_id| (message_id, event.trashed))
+                            .collect::<std::collections::HashMap<_, _>>();
+                        repo.reconcile_trash_states(&states)?;
+                        applied += states.len();
+                        continue;
+                    }
+                    if let Some(event) = file_delete_event(&message) {
+                        let ids = event
+                            .message_ids
+                            .into_iter()
+                            .map(|message_id| format!("tg-{message_id}"))
+                            .collect::<Vec<_>>();
+                        applied += repo.remove_catalog_files(&ids).map_err(|e| e.to_string())?;
+                    }
+                }
+                TelegramRealtimeUpdate::DeleteMessages {
+                    chat_id,
+                    message_ids,
+                    is_permanent,
+                    from_cache,
+                } => {
+                    if Some(chat_id) != chat || !is_permanent || from_cache {
+                        continue;
+                    }
+                    let ids = message_ids
+                        .into_iter()
+                        .map(|message_id| format!("tg-{message_id}"))
+                        .collect::<Vec<_>>();
+                    applied += repo.remove_catalog_files(&ids).map_err(|e| e.to_string())?;
+                }
+            }
+        }
+        Ok(applied)
     }
 
     async fn send_metadata_text(&self, chat: i64, text: String) -> Result<(), String> {
@@ -1879,6 +2645,14 @@ impl TelegramService {
         verify_deleted: bool,
     ) -> Result<usize, String> {
         let chat = self.own_chat(repo).await?;
+        let imported_snapshot =
+            if repo.catalog_remote_count()? == 0 && repo.initial_catalog_sync_needed(chat)? {
+                self.import_latest_catalog_snapshot(repo, chat)
+                    .await?
+                    .unwrap_or(0)
+            } else {
+                0
+            };
         let checkpoint = repo.sync_checkpoint(chat)?;
         let document_checkpoint = repo.sync_stream_checkpoint(chat, "documents", checkpoint)?;
         let history_backfill_needed = !repo.history_backfill_done(chat)?;
@@ -2067,8 +2841,20 @@ impl TelegramService {
             repo.mark_fast_search_backfill_done(chat)?;
         }
         repo.mark_initial_catalog_sync_done(chat)?;
+        let snapshot_cursor = [
+            state.newest,
+            folder_newest,
+            move_newest,
+            trash_newest,
+            delete_newest,
+        ]
+        .into_iter()
+        .max()
+        .unwrap_or(0);
+        self.publish_catalog_snapshot_if_needed(repo, chat, snapshot_cursor)
+            .await?;
         progress.applying(state.total_documents, state.total_documents.max(1));
-        Ok(state.total_documents)
+        Ok(imported_snapshot.saturating_add(state.total_documents))
     }
 
     pub async fn delete_files_permanently(
@@ -2137,6 +2923,8 @@ impl TelegramService {
     pub async fn run_upload(&self, repo: &CatalogRepository, job: &WorkItem) -> Result<(), String> {
         let chat = self.own_chat(repo).await?;
         let mut pending = job.pending.unwrap_or(0);
+        let mut file_updates = self.subscribe_file_updates();
+        let mut upload_file_id: Option<i32> = None;
 
         if pending == 0 && job.pending.is_some() {
             self.sync_catalog(repo).await?;
@@ -2153,21 +2941,28 @@ impl TelegramService {
         }
 
         if pending == 0 {
-            let path = PathBuf::from(&job.path);
-            let expected = job.sha256.clone();
-            let expected_size = job.size;
-            tauri::async_runtime::spawn_blocking(move || {
-                if fs::metadata(&path).map_err(|e| e.to_string())?.len() != expected_size as u64
-                    || sha256_file(&path).map_err(|e| e.to_string())? != expected
-                {
-                    return Err(
-                        "El archivo cambió desde su selección. Selecciónalo de nuevo.".to_string(),
-                    );
-                }
-                Ok(())
-            })
-            .await
-            .map_err(|e| e.to_string())??;
+            // Fresh private staging was already hashed while it was prepared. Consume
+            // its one-shot verification token after checking path/size/mtime; retries
+            // and app restarts have no token and therefore re-hash cryptographically.
+            let trusted_staging = repo.take_verified_staging(&job.id, &job.path, job.size);
+            if !trusted_staging {
+                let path = PathBuf::from(&job.path);
+                let expected = job.sha256.clone();
+                let expected_size = job.size;
+                tauri::async_runtime::spawn_blocking(move || {
+                    if fs::metadata(&path).map_err(|e| e.to_string())?.len() != expected_size as u64
+                        || sha256_file(&path).map_err(|e| e.to_string())? != expected
+                    {
+                        return Err(
+                            "El archivo cambió desde su selección. Selecciónalo de nuevo."
+                                .to_string(),
+                        );
+                    }
+                    Ok(())
+                })
+                .await
+                .map_err(|e| e.to_string())??;
+            }
 
             let text = format!(
                 "#Nuvio1 {}",
@@ -2212,6 +3007,11 @@ impl TelegramService {
             pending = message.id;
             repo.set_pending(&job.id, pending)
                 .map_err(|e| e.to_string())?;
+            if let e::MessageContent::MessageDocument(content) = &message.content {
+                upload_file_id = Some(content.document.document.id);
+                repo.set_td_file_id(&job.id, content.document.document.id)
+                    .map_err(|e| e.to_string())?;
+            }
             if let Some(doc) = document(&message) {
                 repo.record_remote(&doc).map_err(|e| e.to_string())?;
                 return Ok(());
@@ -2220,6 +3020,7 @@ impl TelegramService {
 
         let deadline = Instant::now() + Duration::from_secs(3600);
         let mut estimator = SpeedEstimator::new(0);
+        let mut last_message_probe = Instant::now() - Duration::from_secs(5);
         while Instant::now() < deadline {
             let control = repo.transfer_control(&job.id).map_err(|e| e.to_string())?;
             if control.pause_requested || control.cancel_requested {
@@ -2261,63 +3062,72 @@ impl TelegramService {
                 }
             }
 
-            match call(f::get_message(chat, pending, self.client_id())).await {
-                Ok(e::Message::Message(message)) => {
-                    if let Some(doc) = document(&message) {
-                        repo.record_remote(&doc).map_err(|e| e.to_string())?;
-                        return Ok(());
-                    }
-                    if let Some(e::MessageSendingState::Failed(_)) = message.sending_state {
-                        repo.clear_pending(&job.id).map_err(|e| e.to_string())?;
-                        return Err("Telegram rechazó la subida. Revisa la conexión o el tamaño y reintenta.".into());
-                    }
-                    if let e::MessageContent::MessageDocument(content) = message.content {
-                        if let Ok(e::File::File(file)) =
-                            call(f::get_file(content.document.document.id, self.client_id())).await
-                        {
-                            repo.set_td_file_id(&job.id, file.id)
+            if upload_file_id.is_none() || last_message_probe.elapsed() >= Duration::from_secs(5) {
+                last_message_probe = Instant::now();
+                match call(f::get_message(chat, pending, self.client_id())).await {
+                    Ok(e::Message::Message(message)) => {
+                        if let Some(doc) = document(&message) {
+                            repo.record_remote(&doc).map_err(|e| e.to_string())?;
+                            return Ok(());
+                        }
+                        if let Some(e::MessageSendingState::Failed(_)) = message.sending_state {
+                            repo.clear_pending(&job.id).map_err(|e| e.to_string())?;
+                            return Err("Telegram rechazó la subida. Revisa la conexión o el tamaño y reintenta.".into());
+                        }
+                        if let e::MessageContent::MessageDocument(content) = &message.content {
+                            upload_file_id = Some(content.document.document.id);
+                            repo.set_td_file_id(&job.id, content.document.document.id)
                                 .map_err(|e| e.to_string())?;
-                            let uploaded = file.remote.uploaded_size.clamp(0, job.size.max(0));
-                            let speed = estimator.update(uploaded);
-                            let eta = SpeedEstimator::eta(job.size, uploaded, speed);
-                            let phase = if uploaded >= job.size && job.size > 0 {
-                                "confirming"
-                            } else {
-                                "uploading"
-                            };
-                            repo.update_runtime(
-                                &job.id,
-                                phase,
-                                phase,
-                                uploaded,
-                                job.size,
-                                speed,
-                                eta,
-                                if phase == "confirming" {
-                                    "Confirmando en Telegram"
-                                } else {
-                                    "Subiendo a Telegram"
-                                },
-                                None,
-                            )
-                            .map_err(|e| e.to_string())?;
                         }
                     }
-                }
-                Err(_) => {
-                    self.sync_catalog(repo).await?;
-                    if repo
-                        .list_transfers()
-                        .map_err(|e| e.to_string())?
-                        .iter()
-                        .any(|t| t.id == job.id && t.status == "completed")
-                    {
-                        return Ok(());
+                    Err(_) if upload_file_id.is_none() => {
+                        self.sync_catalog(repo).await?;
+                        if repo
+                            .transfer_by_id(&job.id)
+                            .map_err(|e| e.to_string())?
+                            .is_some_and(|transfer| transfer.status == "completed")
+                        {
+                            return Ok(());
+                        }
+                        return Err("No se pudo confirmar la subida anterior. Nuvio la reintentará sin perder el resto de la cola.".into());
                     }
-                    return Err("No se pudo confirmar la subida anterior. Nuvio la reintentará sin perder el resto de la cola.".into());
+                    Err(_) => {}
                 }
             }
-            tokio::time::sleep(Duration::from_secs(1)).await;
+
+            if let Some(file_id) = upload_file_id {
+                if let Ok(file) = self
+                    .next_file_update(&mut file_updates, file_id, Duration::from_secs(1))
+                    .await
+                {
+                    let uploaded = file.remote.uploaded_size.clamp(0, job.size.max(0));
+                    let speed = estimator.update(uploaded);
+                    let eta = SpeedEstimator::eta(job.size, uploaded, speed);
+                    let phase = if uploaded >= job.size && job.size > 0 {
+                        "confirming"
+                    } else {
+                        "uploading"
+                    };
+                    repo.update_runtime(
+                        &job.id,
+                        phase,
+                        phase,
+                        uploaded,
+                        job.size,
+                        speed,
+                        eta,
+                        if phase == "confirming" {
+                            "Confirmando en Telegram"
+                        } else {
+                            "Subiendo a Telegram"
+                        },
+                        None,
+                    )
+                    .map_err(|e| e.to_string())?;
+                }
+            } else {
+                tokio::time::sleep(Duration::from_secs(1)).await;
+            }
         }
         Err("La subida excedió el tiempo máximo de confirmación.".into())
     }
@@ -2337,7 +3147,9 @@ impl TelegramService {
         let file_id = content.document.document.id;
         repo.set_td_file_id(&job.id, file_id)
             .map_err(|e| e.to_string())?;
-        call(f::download_file(file_id, 16, 0, 0, false, self.client_id())).await?;
+        let mut file_updates = self.subscribe_file_updates();
+        let e::File::File(mut file) =
+            call(f::download_file(file_id, 16, 0, 0, false, self.client_id())).await?;
         let deadline = Instant::now() + Duration::from_secs(3600);
         let mut estimator = SpeedEstimator::new(0);
 
@@ -2353,7 +3165,6 @@ impl TelegramService {
                 return Ok(());
             }
 
-            let e::File::File(file) = call(f::get_file(file_id, self.client_id())).await?;
             if file.local.is_downloading_completed {
                 repo.update_runtime(
                     &job.id,
@@ -2408,7 +3219,9 @@ impl TelegramService {
                 None,
             )
             .map_err(|e| e.to_string())?;
-            tokio::time::sleep(Duration::from_secs(1)).await;
+            file = self
+                .next_file_update(&mut file_updates, file_id, Duration::from_secs(1))
+                .await?;
         }
         Err("La descarga excedió el tiempo máximo permitido.".into())
     }
@@ -2434,7 +3247,7 @@ pub fn verified_copy(
             size,
         );
     }
-    use std::io::Write;
+    use std::io::{Read, Write};
     if target.exists() {
         return Err("El destino ya existe; Nuvio no sobrescribe archivos.".into());
     }
@@ -2442,10 +3255,21 @@ pub fn verified_copy(
     fs::create_dir_all(parent).map_err(|e| e.to_string())?;
     let mut tmp = tempfile::NamedTempFile::new_in(parent).map_err(|e| e.to_string())?;
     let mut input = fs::File::open(source).map_err(|e| e.to_string())?;
-    let copied = std::io::copy(&mut input, &mut tmp).map_err(|e| e.to_string())?;
+    let mut hasher = Sha256::new();
+    let mut copied = 0_u64;
+    let mut buffer = vec![0_u8; 1024 * 1024];
+    loop {
+        let read = input.read(&mut buffer).map_err(|e| e.to_string())?;
+        if read == 0 {
+            break;
+        }
+        tmp.write_all(&buffer[..read]).map_err(|e| e.to_string())?;
+        hasher.update(&buffer[..read]);
+        copied += read as u64;
+    }
     tmp.flush().map_err(|e| e.to_string())?;
-    if copied != size as u64 || sha256_file(tmp.path()).map_err(|e| e.to_string())? != expected_hash
-    {
+    let actual_hash = hex::encode(hasher.finalize());
+    if copied != size as u64 || actual_hash != expected_hash {
         return Err(
             "La descarga no coincide con el original. No se guardó una copia dañada.".into(),
         );
@@ -2495,6 +3319,22 @@ mod tests {
         marked_repo.init_cloud().unwrap();
         marked_repo.mark_initial_catalog_sync_done(77).unwrap();
         assert!(!marked_repo.catalog_bootstrap_required_locally().unwrap());
+    }
+
+    #[test]
+    fn saved_messages_chat_binding_survives_restart() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("db");
+        {
+            let repo = CatalogRepository::open(&path).unwrap();
+            repo.init_cloud().unwrap();
+            assert_eq!(repo.bound_chat().unwrap(), None);
+            repo.bind_chat(987_654_321).unwrap();
+            assert_eq!(repo.bound_chat().unwrap(), Some(987_654_321));
+        }
+        let repo = CatalogRepository::open(&path).unwrap();
+        repo.init_cloud().unwrap();
+        assert_eq!(repo.bound_chat().unwrap(), Some(987_654_321));
     }
 
     #[test]
@@ -2556,6 +3396,111 @@ mod tests {
     }
 
     #[test]
+    fn catalog_snapshot_v2_round_trip_rebuilds_resolved_catalog_and_checkpoints() {
+        let source_root = tempfile::tempdir().unwrap();
+        let source = CatalogRepository::open(&source_root.path().join("source.db")).unwrap();
+        source.init_cloud().unwrap();
+        source
+            .apply_folder_event("folder-root", "Documentos", None, false)
+            .unwrap();
+        source
+            .apply_folder_event("folder-child", "Proyectos", Some("folder-root"), false)
+            .unwrap();
+
+        let mut first = test_document(101, "one.txt");
+        first.folder_id = Some("folder-child".into());
+        first.minithumbnail = Some("ignored-preview".into());
+        let second = test_document(102, "two.bin");
+        source.record_remote_batch(&[first, second]).unwrap();
+        source
+            .reconcile_trash_states(&std::collections::HashMap::from([(102, true)]))
+            .unwrap();
+
+        source.save_sync_checkpoint(42, 220).unwrap();
+        source
+            .save_sync_stream_checkpoint(42, "documents", 220)
+            .unwrap();
+        source
+            .save_sync_stream_checkpoint(42, "folders", 210)
+            .unwrap();
+        source
+            .save_sync_stream_checkpoint(42, "moves", 205)
+            .unwrap();
+        source
+            .save_sync_stream_checkpoint(42, "trash", 215)
+            .unwrap();
+        source
+            .save_sync_stream_checkpoint(42, "deletes", 200)
+            .unwrap();
+
+        let snapshot = source.export_catalog_snapshot(42).unwrap();
+        assert_eq!(snapshot.v, 2);
+        assert_eq!(snapshot.documents.len(), 2);
+        assert!(snapshot
+            .documents
+            .iter()
+            .all(|document| document.minithumbnail.is_none()));
+        assert_eq!(
+            snapshot.checkpoints,
+            CatalogSnapshotCheckpoints {
+                documents: 220,
+                folders: 210,
+                moves: 205,
+                trash: 215,
+                deletes: 200,
+            }
+        );
+        assert_eq!(snapshot.trashed_message_ids, vec![102]);
+
+        let zip_path = source_root.path().join("catalog-v2.zip");
+        write_catalog_snapshot_zip(&snapshot, &zip_path).unwrap();
+        let decoded = read_catalog_snapshot_zip(&zip_path).unwrap();
+        assert_eq!(decoded.documents.len(), 2);
+        assert_eq!(decoded.folders.len(), 2);
+
+        let target_root = tempfile::tempdir().unwrap();
+        let target = CatalogRepository::open(&target_root.path().join("target.db")).unwrap();
+        target.init_cloud().unwrap();
+        assert_eq!(target.import_catalog_snapshot(42, &decoded).unwrap(), 2);
+
+        let files = target.list_files().unwrap();
+        assert_eq!(files.len(), 2);
+        assert!(files.iter().any(|file| {
+            file.id == "tg-101"
+                && file.folder_id.as_deref() == Some("folder-child")
+                && !file.trashed
+        }));
+        assert!(files.iter().any(|file| file.id == "tg-102" && file.trashed));
+
+        let folders = target.list_folders().unwrap();
+        assert!(folders.iter().any(|folder| {
+            folder.id == "folder-child" && folder.parent_id.as_deref() == Some("folder-root")
+        }));
+        assert_eq!(target.sync_checkpoint(42).unwrap(), Some(220));
+        assert_eq!(
+            target.sync_stream_checkpoint(42, "folders", None).unwrap(),
+            Some(210)
+        );
+        assert!(target.history_backfill_done(42).unwrap());
+        assert!(target.fast_search_backfill_done(42).unwrap());
+        assert!(!target.initial_catalog_sync_needed(42).unwrap());
+
+        let caption = CatalogSnapshotCaption {
+            v: 2,
+            sha256: "b".repeat(64),
+            documents: 2,
+            generated_at: decoded.generated_at,
+        };
+        let text = format!(
+            "#NuvioCatalog2 {}",
+            serde_json::to_string(&caption).unwrap()
+        );
+        let parsed = parse_catalog_snapshot_caption(&text).unwrap();
+        assert_eq!(parsed.documents, 2);
+        assert_eq!(parsed.sha256, "b".repeat(64));
+    }
+
+    #[test]
     fn catalog_has_no_ten_thousand_file_ceiling() {
         let root = tempfile::tempdir().unwrap();
         let repo = CatalogRepository::open(&root.path().join("db")).unwrap();
@@ -2573,7 +3518,7 @@ mod tests {
         }
         assert_eq!(repo.list_files().unwrap().len(), TOTAL as usize);
         assert_eq!(repo.catalog_message_ids().unwrap().len(), TOTAL as usize);
-        assert_eq!(repo.sync_file_delta(0).unwrap().1.len(), TOTAL as usize);
+        assert_eq!(repo.sync_file_delta(0).unwrap().files.len(), TOTAL as usize);
         assert_eq!(repo.catalog_oldest_message_id().unwrap(), Some(1));
     }
 

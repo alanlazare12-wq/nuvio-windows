@@ -20,6 +20,16 @@ pub struct CloudFile {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+pub struct CatalogPage {
+    pub files: Vec<CloudFile>,
+    pub total: usize,
+    pub offset: usize,
+    pub limit: usize,
+    pub has_more: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct CloudFolder {
     pub id: String,
     pub name: String,
@@ -105,6 +115,27 @@ impl Default for AppSettings {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+pub struct DashboardStatus {
+    pub sync_progress: crate::progress::SyncProgress,
+    pub transfers: Vec<TransferJob>,
+    pub transfer_history: Option<Vec<TransferJob>>,
+    pub total_bytes: i64,
+    pub file_count: usize,
+    pub favorite_count: usize,
+    pub trash_count: usize,
+    pub recent_count: usize,
+    pub telegram_connected: bool,
+    pub telegram_account_label: Option<String>,
+    pub provider_status: String,
+    pub queue_summary: QueueSummary,
+    pub settings: AppSettings,
+    pub is_premium: bool,
+    pub catalog_cursor: i64,
+    pub history_cursor: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct DashboardData {
     pub sync_progress: crate::progress::SyncProgress,
     pub files: Vec<CloudFile>,
@@ -114,6 +145,7 @@ pub struct DashboardData {
     pub total_bytes: i64,
     pub file_count: usize,
     pub favorite_count: usize,
+    pub trash_count: usize,
     pub recent_count: usize,
     pub telegram_connected: bool,
     pub telegram_account_label: Option<String>,
@@ -121,4 +153,6 @@ pub struct DashboardData {
     pub queue_summary: QueueSummary,
     pub settings: AppSettings,
     pub is_premium: bool,
+    pub catalog_cursor: i64,
+    pub history_cursor: i64,
 }

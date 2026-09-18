@@ -23,6 +23,7 @@ import app.tauri.plugin.JSObject
 import app.tauri.plugin.Plugin
 import java.io.File
 import java.io.FileInputStream
+import java.io.FileOutputStream
 import java.security.KeyStore
 import java.security.MessageDigest
 import java.util.UUID
@@ -94,6 +95,9 @@ class NuvioMobilePlugin(private val activity: Activity) : Plugin(activity) {
     private const val SYNC_NOTIFICATION_ID = 4101
     private const val UPLOAD_NOTIFICATION_ID = 4102
     private const val NOTIFICATION_PERMISSION_REQUEST = 4103
+    private const val MAX_TREE_FILES = 10_000
+    private const val MAX_TREE_FOLDERS = 10_000
+    private const val MAX_TREE_DEPTH = 128
   }
 
   private var notificationPermissionRequested = false
@@ -188,11 +192,32 @@ class NuvioMobilePlugin(private val activity: Activity) : Plugin(activity) {
       directory = File(activity.cacheDir, "upload_staging/${UUID.randomUUID()}")
       if (!directory.mkdirs() && !directory.isDirectory) throw IllegalStateException("No se pudo crear la caché privada de Nuvio")
       val destination = File(directory, name)
+      val digest = MessageDigest.getInstance("SHA-256")
+      var size = 0L
       activity.contentResolver.openInputStream(uri).use { input ->
         if (input == null) throw IllegalStateException("Android no pudo abrir el archivo seleccionado")
-        destination.outputStream().use { output -> input.copyTo(output) }
+        FileOutputStream(destination).use { output ->
+          val buffer = ByteArray(1024 * 1024)
+          while (true) {
+            val read = input.read(buffer)
+            if (read < 0) break
+            if (read == 0) continue
+            output.write(buffer, 0, read)
+            digest.update(buffer, 0, read)
+            size += read
+          }
+          output.flush()
+          output.fd.sync()
+        }
       }
-      invoke.resolve(JSObject().apply { put("path", destination.absolutePath) })
+      if (size <= 0L || destination.length() != size) {
+        throw IllegalStateException("El archivo seleccionado está vacío o no pudo copiarse completo")
+      }
+      invoke.resolve(JSObject().apply {
+        put("path", destination.absolutePath)
+        put("sizeBytes", size)
+        put("sha256", digest.digest().joinToString("") { "%02x".format(it) })
+      })
     } catch (error: Exception) {
       directory?.deleteRecursively()
       invoke.reject(error.message ?: "No se pudo preparar el archivo seleccionado")
@@ -226,7 +251,8 @@ class NuvioMobilePlugin(private val activity: Activity) : Plugin(activity) {
       val folders = mutableListOf<String>()
       val files = JSArray()
       var totalBytes = 0L
-      walkTree(tree, rootId, "", folders, files) { totalBytes += it }
+      val counters = ScanCounters()
+      walkTree(tree, rootId, "", 0, counters, folders, files) { totalBytes += it }
       invoke.resolve(JSObject().apply {
         put("cancelled", false)
         put("rootName", rootName)
@@ -241,24 +267,49 @@ class NuvioMobilePlugin(private val activity: Activity) : Plugin(activity) {
 
   @Command
   fun publishDownload(invoke: Invoke) {
+    var target: Uri? = null
     try {
       val args = invoke.parseArgs(PublishArgs::class.java)
       val source = File(args.source)
       if (!source.isFile) throw IllegalStateException("El archivo debe estar en la caché privada de Nuvio")
-      if (source.length() != args.size || sha256File(source) != args.sha256) throw IllegalStateException("La descarga local no coincide con Telegram")
+      if (source.length() != args.size) throw IllegalStateException("La descarga local no coincide con Telegram")
       val tree = Uri.parse(args.uri)
-      val target = createDocument(tree, args.name, args.policy)
-      activity.contentResolver.openOutputStream(target, "w").use { output ->
+      val createdTarget = createDocument(tree, args.name, args.policy)
+      target = createdTarget
+
+      var copied = 0L
+      activity.contentResolver.openOutputStream(createdTarget, "w").use { output ->
         if (output == null) throw IllegalStateException("Android no concedió permiso para guardar el archivo")
-        FileInputStream(source).use { input -> input.copyTo(output) }
+        FileInputStream(source).use { input ->
+          val buffer = ByteArray(1024 * 1024)
+          while (true) {
+            val read = input.read(buffer)
+            if (read < 0) break
+            if (read == 0) continue
+            output.write(buffer, 0, read)
+            copied += read
+          }
+          output.flush()
+        }
       }
-      val verified = hashContentUri(target)
+      if (copied != args.size) {
+        runCatching { DocumentsContract.deleteDocument(activity.contentResolver, createdTarget) }
+        target = null
+        throw IllegalStateException("La descarga local no coincide con Telegram")
+      }
+
+      // Verify the bytes that Android actually persisted. Hashing the source while
+      // copying is redundant: Rust/TDLib already validated its expected size, and
+      // this destination hash is the integrity check that matters for SAF providers.
+      val verified = hashContentUri(createdTarget)
       if (verified.first != args.size || verified.second != args.sha256) {
-        runCatching { DocumentsContract.deleteDocument(activity.contentResolver, target) }
+        runCatching { DocumentsContract.deleteDocument(activity.contentResolver, createdTarget) }
+        target = null
         throw IllegalStateException("No se pudo verificar el archivo guardado")
       }
       invoke.resolve(JSObject())
     } catch (error: Exception) {
+      target?.let { runCatching { DocumentsContract.deleteDocument(activity.contentResolver, it) } }
       invoke.reject(error.message ?: "No se pudo publicar la descarga")
     }
   }
@@ -349,14 +400,35 @@ class NuvioMobilePlugin(private val activity: Activity) : Plugin(activity) {
   }
 
   private data class DocInfo(val id: String, val name: String, val mime: String, val size: Long)
+  private data class ScanCounters(var files: Int = 0, var folders: Int = 0)
 
-  private fun walkTree(tree: Uri, documentId: String, prefix: String, folders: MutableList<String>, files: JSArray, addBytes: (Long) -> Unit) {
+  private fun walkTree(
+    tree: Uri,
+    documentId: String,
+    prefix: String,
+    depth: Int,
+    counters: ScanCounters,
+    folders: MutableList<String>,
+    files: JSArray,
+    addBytes: (Long) -> Unit,
+  ) {
+    if (depth > MAX_TREE_DEPTH) {
+      throw IllegalStateException("La carpeta seleccionada supera la profundidad máxima admitida por Nuvio")
+    }
     for (child in listChildrenById(tree, documentId)) {
       val relative = if (prefix.isEmpty()) child.name else "$prefix/${child.name}"
       if (child.mime == DocumentsContract.Document.MIME_TYPE_DIR) {
+        counters.folders += 1
+        if (counters.folders > MAX_TREE_FOLDERS) {
+          throw IllegalStateException("La carpeta contiene demasiadas subcarpetas para procesarla de forma segura")
+        }
         folders.add(relative)
-        walkTree(tree, child.id, relative, folders, files, addBytes)
+        walkTree(tree, child.id, relative, depth + 1, counters, folders, files, addBytes)
       } else {
+        counters.files += 1
+        if (counters.files > MAX_TREE_FILES) {
+          throw IllegalStateException("Selecciona una carpeta con máximo 10000 archivos por operación")
+        }
         val uri = DocumentsContract.buildDocumentUriUsingTree(tree, child.id)
         files.put(JSObject().apply {
           put("relativePath", relative)
@@ -440,18 +512,6 @@ class NuvioMobilePlugin(private val activity: Activity) : Plugin(activity) {
     return size to digest.digest().joinToString("") { "%02x".format(it) }
   }
 
-  private fun sha256File(file: File): String {
-    val digest = MessageDigest.getInstance("SHA-256")
-    FileInputStream(file).use { input ->
-      val buffer = ByteArray(1024 * 1024)
-      while (true) {
-        val read = input.read(buffer)
-        if (read < 0) break
-        if (read > 0) digest.update(buffer, 0, read)
-      }
-    }
-    return digest.digest().joinToString("") { "%02x".format(it) }
-  }
 
   private fun getOrCreateSecretKey(): SecretKey {
     val store = KeyStore.getInstance("AndroidKeyStore").apply { load(null) }

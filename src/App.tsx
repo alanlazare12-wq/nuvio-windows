@@ -45,11 +45,13 @@ import {
   X,
   Zap,
 } from "lucide-react";
-import { memo, useEffect, useMemo, useRef, useState } from "react";
+import { memo, useDeferredValue, useEffect, useMemo, useRef, useState } from "react";
 import {
   backgroundApp,
   listenMobileBack,
+  loadCatalogPage,
   loadDashboard,
+  loadDashboardStatus,
   pauseQueue,
   readableError,
   resumeQueue,
@@ -80,6 +82,7 @@ import { MoveToFolderDialog } from "./components/MoveToFolderDialog";
 import { TelegramConnectModal } from "./components/TelegramConnectModal";
 import { UploadPreparationDialog } from "./components/UploadPreparationDialog";
 import { useCatalogSync } from "./useCatalogSync";
+import { useCatalogWindow } from "./useCatalogWindow";
 import { useDashboardLifecycle } from "./useDashboardLifecycle";
 import { useFileDragDrop } from "./useFileDragDrop";
 import { useFolderActions } from "./useFolderActions";
@@ -122,6 +125,23 @@ const filterItems: Array<{ key: FileFilter; label: string }> = [
 ];
 
 const tagOptions = ["Trabajo", "Personal", "Fotos", "Proyectos"];
+
+type FileItemActions = {
+  select: (file: CloudFile) => void;
+  favorite: (file: CloudFile) => void;
+  download: (file: CloudFile) => void;
+  preview: (file: CloudFile) => void;
+  move: (file: CloudFile) => void;
+  trash: (file: CloudFile) => void;
+  delete: (file: CloudFile) => void;
+  dragStart: (event: React.DragEvent<HTMLElement>, file: CloudFile) => void;
+  dragEnd: () => void;
+  pointerDown: (event: React.PointerEvent<HTMLElement>, file: CloudFile) => void;
+  pointerMove: (event: React.PointerEvent<HTMLElement>) => void;
+  pointerUp: (event: React.PointerEvent<HTMLElement>) => void;
+  pointerCancel: () => void;
+};
+type FileActionTargets = FileItemActions;
 
 function initialDarkMode(): boolean {
   try {
@@ -190,6 +210,7 @@ function App() {
   const [section, setSection] = useState<SectionKey>("home");
   const [currentFolderId, setCurrentFolderId] = useState<string | null>(null);
   const [query, setQuery] = useState("");
+  const deferredQuery = useDeferredValue(query);
   const [fileFilter, setFileFilter] = useState<FileFilter>("all");
   const [sort, setSort] = useState<SortKey>("recent");
   const [view, setView] = useState<"grid" | "list">("grid");
@@ -201,6 +222,11 @@ function App() {
   const [loadError, setLoadError] = useState<string | null>(null);
   const [appNotice, setAppNotice] = useState<string | null>(null);
   const [selectedFiles, setSelectedFiles] = useState<Set<string>>(() => new Set());
+  const [catalogFiles, setCatalogFiles] = useState<CloudFile[]>([]);
+  const [catalogTotal, setCatalogTotal] = useState(0);
+  const [catalogHasMore, setCatalogHasMore] = useState(false);
+  const [catalogLoading, setCatalogLoading] = useState(false);
+  const catalogPageRequestRef = useRef(0);
   useEffect(() => { if (!dashboard?.telegramConnected) clearThumbnailCache(); }, [dashboard?.telegramConnected]);
   const hasAutoPromptedLoginRef = useRef(false);
   useEffect(() => {
@@ -216,6 +242,9 @@ function App() {
   const searchInputRef = useRef<HTMLInputElement>(null);
   const fileSearchInputRef = useRef<HTMLInputElement>(null);
   const dashboardRequestRef = useRef(0);
+  const catalogCursorRef = useRef<number | null>(null);
+  const historyCursorRef = useRef<number | null>(null);
+  const fileActionTargetsRef = useRef<FileActionTargets | null>(null);
 
   const backHandlerRef = useRef<() => void>(() => {});
   backHandlerRef.current = () => {
@@ -272,11 +301,119 @@ function App() {
     try {
       const next = await loadDashboard();
       if (request !== dashboardRequestRef.current) return;
+      catalogCursorRef.current = next.catalogCursor;
+      historyCursorRef.current = next.historyCursor;
       setDashboard(next);
       setLoadError(null);
       return next;
     } catch (error) {
       if (request === dashboardRequestRef.current) setLoadError(readableError(error));
+    }
+  };
+
+  const refreshDashboardStatus = async () => {
+    const request = ++dashboardRequestRef.current;
+    try {
+      const next = await loadDashboardStatus(historyCursorRef.current);
+      if (request !== dashboardRequestRef.current) return;
+      if (
+        catalogCursorRef.current == null
+        || next.catalogCursor !== catalogCursorRef.current
+      ) {
+        return await refreshDashboard();
+      }
+      historyCursorRef.current = next.historyCursor;
+      setDashboard((current) => current ? {
+        ...current,
+        ...next,
+        transferHistory: next.transferHistory ?? current.transferHistory,
+      } : current);
+      setLoadError(null);
+      return next;
+    } catch (error) {
+      if (request === dashboardRequestRef.current) setLoadError(readableError(error));
+    }
+  };
+
+  const catalogSection = section === "history" ? null : section;
+  const catalogPageLimit = section === "home" && !deferredQuery.trim() ? 12 : 80;
+
+  useEffect(() => {
+    const request = ++catalogPageRequestRef.current;
+    if (!dashboard || !catalogSection) {
+      setCatalogFiles([]);
+      setCatalogTotal(0);
+      setCatalogHasMore(false);
+      setCatalogLoading(false);
+      return;
+    }
+
+    setCatalogLoading(true);
+    const timer = window.setTimeout(() => {
+      void loadCatalogPage({
+        section: catalogSection,
+        folderId: currentFolderId,
+        kind: fileFilter,
+        search: deferredQuery,
+        tag: selectedTag,
+        sort,
+        offset: 0,
+        limit: catalogPageLimit,
+      }).then((page) => {
+        if (request !== catalogPageRequestRef.current) return;
+        setCatalogFiles(page.files);
+        setCatalogTotal(page.total);
+        setCatalogHasMore(
+          page.hasMore && !(catalogSection === "home" && !deferredQuery.trim()),
+        );
+        setLoadError(null);
+      }).catch((error) => {
+        if (request === catalogPageRequestRef.current) {
+          setLoadError(readableError(error));
+        }
+      }).finally(() => {
+        if (request === catalogPageRequestRef.current) setCatalogLoading(false);
+      });
+    }, query.trim() ? 120 : 0);
+
+    return () => window.clearTimeout(timer);
+  }, [
+    dashboard?.catalogCursor,
+    catalogSection,
+    currentFolderId,
+    fileFilter,
+    deferredQuery,
+    selectedTag,
+    sort,
+    catalogPageLimit,
+  ]);
+
+  const loadMoreCatalog = async () => {
+    if (!dashboard || !catalogSection || catalogLoading || !catalogHasMore) return;
+    const request = ++catalogPageRequestRef.current;
+    setCatalogLoading(true);
+    try {
+      const page = await loadCatalogPage({
+        section: catalogSection,
+        folderId: currentFolderId,
+        kind: fileFilter,
+        search: deferredQuery,
+        tag: selectedTag,
+        sort,
+        offset: catalogFiles.length,
+        limit: 80,
+      });
+      if (request !== catalogPageRequestRef.current) return;
+      setCatalogFiles((current) => {
+        const known = new Set(current.map((file) => file.id));
+        return [...current, ...page.files.filter((file) => !known.has(file.id))];
+      });
+      setCatalogTotal(page.total);
+      setCatalogHasMore(page.hasMore);
+    } catch (error) {
+      if (request === catalogPageRequestRef.current) setAppNotice(readableError(error));
+    } finally {
+      if (request === catalogPageRequestRef.current) setCatalogLoading(false);
     }
   };
 
@@ -439,7 +576,7 @@ function App() {
 
   useDashboardLifecycle({
     dashboard,
-    refreshDashboard,
+    refreshDashboardStatus,
     dragActiveRef,
     manualSyncPollingRef,
     invalidateDashboardRequests: () => {
@@ -470,7 +607,7 @@ function App() {
   }, [dashboard, currentFolderId]);
   const visibleFolders = useMemo(() => {
     if (!dashboard) return [] as CloudFolder[];
-    const needle = query.trim().toLowerCase();
+    const needle = deferredQuery.trim().toLowerCase();
     if (section === "home") {
       if (!needle) return [] as CloudFolder[];
       return dashboard.folders
@@ -482,60 +619,31 @@ function App() {
       .filter((folder) => !folder.trashed && (needle ? true : (folder.parentId ?? null) === currentFolderId))
       .filter((folder) => !needle || folder.name.toLowerCase().includes(needle))
       .sort((a, b) => a.name.localeCompare(b.name, "es", { numeric: true, sensitivity: "base" }));
-  }, [dashboard, currentFolderId, query, section]);
+  }, [dashboard, currentFolderId, deferredQuery, section]);
 
-  const files = useMemo(() => {
-    if (!dashboard) return [];
-    const needle = query.trim().toLowerCase();
-    let output = dashboard.files.filter((item) => {
-      if (section === "favorites" && !item.favorite) return false;
-      if (section === "trash" && !item.trashed) return false;
-      if (section !== "trash" && item.trashed) return false;
-      if (fileFilter !== "all" && item.kind !== fileFilter) return false;
-      if (selectedTag && !item.tags.includes(selectedTag)) return false;
-      if (section === "files") {
-        if (!needle && (item.folderId ?? null) !== currentFolderId) return false;
-      }
-      if (!needle) return true;
-      const normalized = `${item.name} ${item.extension} ${item.folder} ${item.tags.join(" ")}`.toLowerCase();
-      return normalized.includes(needle);
-    });
-    if (sort === "name") {
-      output.sort((a, b) => a.name.localeCompare(b.name, "es", { numeric: true, sensitivity: "base" }));
-    } else if (sort === "size") {
-      output.sort((a, b) => b.sizeBytes - a.sizeBytes);
-    } else if (sort === "oldest") {
-      output.sort((a, b) => (Date.parse(a.updatedAt) || 0) - (Date.parse(b.updatedAt) || 0));
-    }
-    // Nota: para sort === "recent", dashboard.files ya viene ordenado por updated_at DESC desde SQLite
-    return section === "home" ? (needle ? output : output.slice(0, 12)) : output;
-  }, [dashboard, currentFolderId, fileFilter, query, section, selectedTag, sort]);
-
-  const [visibleCount, setVisibleCount] = useState(80);
+  const files = catalogFiles;
+  const {
+    hostRef: catalogWindowRef,
+    visibleFiles,
+    topSpacer: catalogTopSpacer,
+    bottomSpacer: catalogBottomSpacer,
+  } = useCatalogWindow(files, view);
   const loadMoreSentinelRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
-    setVisibleCount(80);
-  }, [section, currentFolderId, fileFilter, query, sort, selectedTag]);
-
-  useEffect(() => {
     const el = loadMoreSentinelRef.current;
-    if (!el) return;
+    if (!el || !catalogHasMore || catalogLoading) return;
     const observer = new IntersectionObserver(
       (entries) => {
-        if (entries.some((e) => e.isIntersecting)) {
-          setVisibleCount((prev) => Math.min(prev + 80, files.length));
+        if (entries.some((entry) => entry.isIntersecting)) {
+          void loadMoreCatalog();
         }
       },
-      { rootMargin: "400px" }
+      { rootMargin: "400px" },
     );
     observer.observe(el);
     return () => observer.disconnect();
-  }, [files.length, visibleCount]);
-
-  const visibleFiles = useMemo(() => {
-    return files.slice(0, visibleCount);
-  }, [files, visibleCount]);
+  }, [catalogHasMore, catalogLoading, catalogFiles.length]);
 
   useEffect(() => {
     if (currentFolderId && dashboard && !dashboard.folders.some((folder) => folder.id === currentFolderId && !folder.trashed)) {
@@ -559,6 +667,37 @@ function App() {
       setAppNotice(readableError(error));
     }
   };
+
+  fileActionTargetsRef.current = {
+    select: (file) => toggleSelection(file.id),
+    favorite: (file) => { void action(() => setFavorite(file.id, !file.favorite)); },
+    download: (file) => { void handleBulkDownload([file.id]); },
+    preview: (file) => { void handleMedia(file); },
+    move: (file) => setMoveDialog({ kind: "files", ids: [file.id] }),
+    trash: (file) => { void action(() => setTrashed(file.id, !file.trashed)); },
+    delete: (file) => { void handlePermanentDelete([file.id]); },
+    dragStart: (event, file) => desktopDragStart(event, file),
+    dragEnd: clearFileDrag,
+    pointerDown: (event, file) => touchDragStart(event, file),
+    pointerMove: touchDragMove,
+    pointerUp: touchDragEnd,
+    pointerCancel: clearFileDrag,
+  };
+  const stableFileActions = useMemo<FileItemActions>(() => ({
+    select: (file) => fileActionTargetsRef.current?.select(file),
+    favorite: (file) => fileActionTargetsRef.current?.favorite(file),
+    download: (file) => fileActionTargetsRef.current?.download(file),
+    preview: (file) => fileActionTargetsRef.current?.preview(file),
+    move: (file) => fileActionTargetsRef.current?.move(file),
+    trash: (file) => fileActionTargetsRef.current?.trash(file),
+    delete: (file) => fileActionTargetsRef.current?.delete(file),
+    dragStart: (event, file) => fileActionTargetsRef.current?.dragStart(event, file),
+    dragEnd: () => fileActionTargetsRef.current?.dragEnd(),
+    pointerDown: (event, file) => fileActionTargetsRef.current?.pointerDown(event, file),
+    pointerMove: (event) => fileActionTargetsRef.current?.pointerMove(event),
+    pointerUp: (event) => fileActionTargetsRef.current?.pointerUp(event),
+    pointerCancel: () => fileActionTargetsRef.current?.pointerCancel(),
+  }), []);
 
   const scrollFileTypes = (direction: -1 | 1) => {
     filterTabsRef.current?.scrollBy({ left: direction * 280, behavior: "smooth" });
@@ -991,22 +1130,37 @@ function App() {
               </div>
             ) : files.length === 0 ? null : view === "grid" ? (
               <>
-                <div className="file-grid">{visibleFiles.map((file) => <FileCard key={file.id} file={file} selected={selectedFiles.has(file.id)} isDragging={draggingFileIds.includes(file.id)} onSelect={() => toggleSelection(file.id)} onFavorite={() => void action(() => setFavorite(file.id, !file.favorite))} onDownload={() => void handleBulkDownload([file.id])} onPreview={() => void handleMedia(file)} onMove={() => setMoveDialog({ kind: "files", ids: [file.id] })} onTrash={() => void action(() => setTrashed(file.id, !file.trashed))} onDelete={() => void handlePermanentDelete([file.id])} onDragStart={(event) => desktopDragStart(event, file)} onDragEnd={clearFileDrag} onPointerDown={(event) => touchDragStart(event, file)} onPointerMove={touchDragMove} onPointerUp={touchDragEnd} onPointerCancel={clearFileDrag} />)}</div>
-                {visibleCount < files.length && (
+                <div
+                  ref={catalogWindowRef}
+                  className="virtual-grid-window"
+                  style={{ paddingTop: catalogTopSpacer, paddingBottom: catalogBottomSpacer }}
+                >
+                  <div className="file-grid">{visibleFiles.map((file) => <FileCard key={file.id} file={file} selected={selectedFiles.has(file.id)} isDragging={draggingFileIds.includes(file.id)} actions={stableFileActions} />)}</div>
+                </div>
+                {catalogHasMore && (
                   <div ref={loadMoreSentinelRef} className="load-more-sentinel" style={{ padding: "16px 0", textAlign: "center" }}>
-                    <button className="secondary-button" type="button" onClick={() => setVisibleCount((prev) => Math.min(prev + 80, files.length))}>
-                      Cargar más ({visibleFiles.length} de {files.length})
+                    <button className="secondary-button" type="button" disabled={catalogLoading} onClick={() => void loadMoreCatalog()}>
+                      {catalogLoading ? "Cargando…" : `Cargar más (${files.length} de ${catalogTotal})`}
                     </button>
                   </div>
                 )}
               </>
             ) : (
               <>
-                <div className="file-list"><div className="file-list-head"><span>Nombre</span><span>Ubicación</span><span>Tamaño</span><span>Modificado</span><span /></div>{visibleFiles.map((file) => <FileRow key={file.id} file={file} selected={selectedFiles.has(file.id)} isDragging={draggingFileIds.includes(file.id)} onSelect={() => toggleSelection(file.id)} onFavorite={() => void action(() => setFavorite(file.id, !file.favorite))} onDownload={() => void handleBulkDownload([file.id])} onPreview={() => void handleMedia(file)} onMove={() => setMoveDialog({ kind: "files", ids: [file.id] })} onTrash={() => void action(() => setTrashed(file.id, !file.trashed))} onDelete={() => void handlePermanentDelete([file.id])} onDragStart={(event) => desktopDragStart(event, file)} onDragEnd={clearFileDrag} onPointerDown={(event) => touchDragStart(event, file)} onPointerMove={touchDragMove} onPointerUp={touchDragEnd} onPointerCancel={clearFileDrag} />)}</div>
-                {visibleCount < files.length && (
+                <div className="file-list">
+                  <div className="file-list-head"><span>Nombre</span><span>Ubicación</span><span>Tamaño</span><span>Modificado</span><span /></div>
+                  <div
+                    ref={catalogWindowRef}
+                    className="virtual-list-body"
+                    style={{ paddingTop: catalogTopSpacer, paddingBottom: catalogBottomSpacer }}
+                  >
+                    {visibleFiles.map((file) => <FileRow key={file.id} file={file} selected={selectedFiles.has(file.id)} isDragging={draggingFileIds.includes(file.id)} actions={stableFileActions} />)}
+                  </div>
+                </div>
+                {catalogHasMore && (
                   <div ref={loadMoreSentinelRef} className="load-more-sentinel" style={{ padding: "16px 0", textAlign: "center" }}>
-                    <button className="secondary-button" type="button" onClick={() => setVisibleCount((prev) => Math.min(prev + 80, files.length))}>
-                      Cargar más ({visibleFiles.length} de {files.length})
+                    <button className="secondary-button" type="button" disabled={catalogLoading} onClick={() => void loadMoreCatalog()}>
+                      {catalogLoading ? "Cargando…" : `Cargar más (${files.length} de ${catalogTotal})`}
                     </button>
                   </div>
                 )}
@@ -1218,39 +1372,41 @@ type FileActions = {
   file: CloudFile;
   selected: boolean;
   isDragging?: boolean;
-  onSelect: () => void;
-  onFavorite: () => void;
-  onDownload: () => void;
-  onPreview: () => void;
-  onMove: () => void;
-  onTrash: () => void;
-  onDelete: () => void;
-  onDragStart: (event: React.DragEvent<HTMLElement>) => void;
-  onDragEnd: () => void;
-  onPointerDown: (event: React.PointerEvent<HTMLElement>) => void;
-  onPointerMove: (event: React.PointerEvent<HTMLElement>) => void;
-  onPointerUp: (event: React.PointerEvent<HTMLElement>) => void;
-  onPointerCancel: () => void;
+  actions: FileItemActions;
 };
 
-const FileCard = memo(function FileCard({ file, selected, isDragging, onSelect, onFavorite, onDownload, onPreview, onMove, onTrash, onDelete, onDragStart, onDragEnd, onPointerDown, onPointerMove, onPointerUp, onPointerCancel }: FileActions) {
+const FileCard = memo(function FileCard({ file, selected, isDragging, actions }: FileActions) {
   const Icon = kindIcon(file.kind);
-  return <article className={`file-card ${!file.trashed ? "is-draggable" : ""} ${selected ? "selected" : ""} ${isDragging ? "is-touch-dragging" : ""}`} draggable={false} tabIndex={0} aria-label={fileName(file)} onClick={(event) => { if (!(event.target as Element).closest("button,input,label,select,a")) onSelect(); }} onKeyDown={(event) => { if (event.target === event.currentTarget && event.key === " ") { event.preventDefault(); onSelect(); } }} onDragStart={onDragStart} onDragEnd={onDragEnd} onPointerDown={onPointerDown} onPointerMove={onPointerMove} onPointerUp={onPointerUp} onPointerCancel={onPointerCancel}>
+  const onPreview = () => actions.preview(file);
+  return <article
+    className={`file-card ${!file.trashed ? "is-draggable" : ""} ${selected ? "selected" : ""} ${isDragging ? "is-touch-dragging" : ""}`}
+    draggable={false}
+    tabIndex={0}
+    aria-label={fileName(file)}
+    onClick={(event) => { if (!(event.target as Element).closest("button,input,label,select,a")) actions.select(file); }}
+    onKeyDown={(event) => { if (event.target === event.currentTarget && event.key === " ") { event.preventDefault(); actions.select(file); } }}
+    onDragStart={(event) => actions.dragStart(event, file)}
+    onDragEnd={actions.dragEnd}
+    onPointerDown={(event) => actions.pointerDown(event, file)}
+    onPointerMove={actions.pointerMove}
+    onPointerUp={actions.pointerUp}
+    onPointerCancel={actions.pointerCancel}
+  >
     <div className={`file-preview kind-${file.kind}`}>
-      <label className="file-select-checkbox"><input type="checkbox" checked={selected} onChange={onSelect} aria-label={`Seleccionar ${file.name}`} /></label>
+      <label className="file-select-checkbox"><input type="checkbox" checked={selected} onChange={() => actions.select(file)} aria-label={`Seleccionar ${file.name}`} /></label>
       <FileThumbnail file={file} onOpen={file.kind === "image" ? onPreview : undefined}><div className="file-type-icon"><Icon size={27} strokeWidth={1.7} /></div></FileThumbnail>
       <span className="file-extension">{file.extension.toUpperCase()}</span>
-      <button className={`favorite-button ${file.favorite ? "active" : ""}`} onClick={onFavorite} aria-label="Favorito" aria-pressed={file.favorite}><Star size={16} fill={file.favorite ? "currentColor" : "none"} /></button>
+      <button className={`favorite-button ${file.favorite ? "active" : ""}`} onClick={() => actions.favorite(file)} aria-label="Favorito" aria-pressed={file.favorite}><Star size={16} fill={file.favorite ? "currentColor" : "none"} /></button>
     </div>
     <div className="file-card-copy">
       <div className="file-card-title-row">
         <div className="file-name-wrap"><strong title={fileName(file)}>{file.name}</strong><span>{kindLabel(file.kind)}</span></div>
         <div className="file-actions">
           {!file.trashed && canPreview(file.kind) && <button className="ghost-icon" onClick={onPreview} title="Vista previa">{file.kind === "audio" || file.kind === "video" ? <Play size={16} /> : <Eye size={16} />}</button>}
-          {!file.trashed && <button className="ghost-icon" onClick={onDownload} title="Descargar"><ArrowDownToLine size={17} /></button>}
-          {!file.trashed && <button className="ghost-icon" onClick={onMove} title="Mover a carpeta"><Move size={16} /></button>}
-          <button className="ghost-icon" onClick={onTrash} title={file.trashed ? "Restaurar" : "Mover a Papelera"}>{file.trashed ? <RotateCcw size={16} /> : <Trash2 size={16} />}</button>
-          {file.trashed && <button className="ghost-icon danger" onClick={onDelete} title="Eliminar definitivamente"><Trash2 size={16} /></button>}
+          {!file.trashed && <button className="ghost-icon" onClick={() => actions.download(file)} title="Descargar"><ArrowDownToLine size={17} /></button>}
+          {!file.trashed && <button className="ghost-icon" onClick={() => actions.move(file)} title="Mover a carpeta"><Move size={16} /></button>}
+          <button className="ghost-icon" onClick={() => actions.trash(file)} title={file.trashed ? "Restaurar" : "Mover a Papelera"}>{file.trashed ? <RotateCcw size={16} /> : <Trash2 size={16} />}</button>
+          {file.trashed && <button className="ghost-icon danger" onClick={() => actions.delete(file)} title="Eliminar definitivamente"><Trash2 size={16} /></button>}
         </div>
       </div>
       <div className="file-meta"><span>{formatBytes(file.sizeBytes)}</span><span className="meta-dot" /><span>{relativeDate(file.updatedAt)}</span></div>
@@ -1258,22 +1414,36 @@ const FileCard = memo(function FileCard({ file, selected, isDragging, onSelect, 
   </article>;
 });
 
-const FileRow = memo(function FileRow({ file, selected, isDragging, onSelect, onFavorite, onDownload, onPreview, onMove, onTrash, onDelete, onDragStart, onDragEnd, onPointerDown, onPointerMove, onPointerUp, onPointerCancel }: FileActions) {
+const FileRow = memo(function FileRow({ file, selected, isDragging, actions }: FileActions) {
   const Icon = kindIcon(file.kind);
-  return <article className={`file-row ${!file.trashed ? "is-draggable" : ""} ${selected ? "selected" : ""} ${isDragging ? "is-touch-dragging" : ""}`} draggable={false} tabIndex={0} aria-label={fileName(file)} onClick={(event) => { if (!(event.target as Element).closest("button,input,label,select,a")) onSelect(); }} onKeyDown={(event) => { if (event.target === event.currentTarget && event.key === " ") { event.preventDefault(); onSelect(); } }} onDragStart={onDragStart} onDragEnd={onDragEnd} onPointerDown={onPointerDown} onPointerMove={onPointerMove} onPointerUp={onPointerUp} onPointerCancel={onPointerCancel}>
+  const onPreview = () => actions.preview(file);
+  return <article
+    className={`file-row ${!file.trashed ? "is-draggable" : ""} ${selected ? "selected" : ""} ${isDragging ? "is-touch-dragging" : ""}`}
+    draggable={false}
+    tabIndex={0}
+    aria-label={fileName(file)}
+    onClick={(event) => { if (!(event.target as Element).closest("button,input,label,select,a")) actions.select(file); }}
+    onKeyDown={(event) => { if (event.target === event.currentTarget && event.key === " ") { event.preventDefault(); actions.select(file); } }}
+    onDragStart={(event) => actions.dragStart(event, file)}
+    onDragEnd={actions.dragEnd}
+    onPointerDown={(event) => actions.pointerDown(event, file)}
+    onPointerMove={actions.pointerMove}
+    onPointerUp={actions.pointerUp}
+    onPointerCancel={actions.pointerCancel}
+  >
     <div className="file-row-name">
-      <input type="checkbox" checked={selected} onChange={onSelect} aria-label={`Seleccionar ${file.name}`} />
+      <input type="checkbox" checked={selected} onChange={() => actions.select(file)} aria-label={`Seleccionar ${file.name}`} />
       <div className={`small-file-icon kind-${file.kind}`}><FileThumbnail file={file} onOpen={file.kind === "image" ? onPreview : undefined}><Icon size={18} /></FileThumbnail></div>
       <div><strong title={fileName(file)}>{fileName(file)}</strong><small>{kindLabel(file.kind)}</small></div>
     </div>
     <span>{file.folder}</span><span>{formatBytes(file.sizeBytes)}</span><span>{relativeDate(file.updatedAt)}</span>
     <div className="row-actions">
-      <button className={`ghost-icon ${file.favorite ? "active" : ""}`} onClick={onFavorite} aria-label="Favorito" aria-pressed={file.favorite}><Star size={16} fill={file.favorite ? "currentColor" : "none"} /></button>
+      <button className={`ghost-icon ${file.favorite ? "active" : ""}`} onClick={() => actions.favorite(file)} aria-label="Favorito" aria-pressed={file.favorite}><Star size={16} fill={file.favorite ? "currentColor" : "none"} /></button>
       {!file.trashed && canPreview(file.kind) && <button className="ghost-icon" onClick={onPreview} title="Vista previa">{file.kind === "audio" || file.kind === "video" ? <Play size={16} /> : <Eye size={16} />}</button>}
-      {!file.trashed && <button className="ghost-icon" onClick={onDownload} title="Descargar"><ArrowDownToLine size={16} /></button>}
-      {!file.trashed && <button className="ghost-icon" onClick={onMove} title="Mover a carpeta"><Move size={15} /></button>}
-      <button className="ghost-icon" onClick={onTrash} title={file.trashed ? "Restaurar" : "Mover a Papelera"}>{file.trashed ? <RotateCcw size={16} /> : <Trash2 size={16} />}</button>
-      {file.trashed && <button className="ghost-icon danger" onClick={onDelete} title="Eliminar definitivamente"><Trash2 size={16} /></button>}
+      {!file.trashed && <button className="ghost-icon" onClick={() => actions.download(file)} title="Descargar"><ArrowDownToLine size={16} /></button>}
+      {!file.trashed && <button className="ghost-icon" onClick={() => actions.move(file)} title="Mover a carpeta"><Move size={15} /></button>}
+      <button className="ghost-icon" onClick={() => actions.trash(file)} title={file.trashed ? "Restaurar" : "Mover a Papelera"}>{file.trashed ? <RotateCcw size={16} /> : <Trash2 size={16} />}</button>
+      {file.trashed && <button className="ghost-icon danger" onClick={() => actions.delete(file)} title="Eliminar definitivamente"><Trash2 size={16} /></button>}
     </div>
   </article>;
 });

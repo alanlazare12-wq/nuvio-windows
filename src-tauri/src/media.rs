@@ -1,6 +1,7 @@
+use std::collections::HashSet;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::time::{Duration, Instant, SystemTime};
+use std::time::{Duration, Instant, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 use tdlib_rs::{enums as e, functions as f};
@@ -28,6 +29,35 @@ pub struct ThumbnailSource {
     pub blurred: bool,
 }
 
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ThumbnailBatchItem {
+    pub id: String,
+    pub source: Option<ThumbnailSource>,
+}
+
+pub fn cached_thumbnail_source(
+    repo: &CatalogRepository,
+    file_id: &str,
+) -> Result<Option<ThumbnailSource>, String> {
+    let Ok(doc) = repo.remote(file_id) else {
+        return Ok(None);
+    };
+    let Some(mini) = doc
+        .minithumbnail
+        .as_ref()
+        .filter(|data| !data.is_empty() && data.len() <= 64 * 1024)
+    else {
+        return Ok(None);
+    };
+    Ok(Some(ThumbnailSource {
+        kind: "image".into(),
+        path: None,
+        data_url: Some(format!("data:image/jpeg;base64,{mini}")),
+        blurred: true,
+    }))
+}
+
 impl TelegramService {
     pub async fn prepare_thumbnail(
         &self,
@@ -36,19 +66,10 @@ impl TelegramService {
         cache_dir: &Path,
         cache_limit: i64,
     ) -> Result<Option<ThumbnailSource>, String> {
-        let doc = repo.remote(file_id)?;
-        if let Some(mini) = doc
-            .minithumbnail
-            .as_ref()
-            .filter(|data| !data.is_empty() && data.len() <= 64 * 1024)
-        {
-            return Ok(Some(ThumbnailSource {
-                kind: "image".into(),
-                path: None,
-                data_url: Some(format!("data:image/jpeg;base64,{mini}")),
-                blurred: true,
-            }));
+        if let Some(source) = cached_thumbnail_source(repo, file_id)? {
+            return Ok(Some(source));
         }
+        let doc = repo.remote(file_id)?;
         let chat = self.own_chat(repo).await?;
         let e::Message::Message(message) =
             call(f::get_message(chat, doc.message_id, self.client_id())).await?;
@@ -91,7 +112,14 @@ impl TelegramService {
                     let target = cache_dir.join(format!("{}.thumb.jpg", sanitize_id(file_id)));
                     let hash = sha256_file(source).map_err(|e| e.to_string())?;
                     copy_media(source, &target, &hash, size as i64)?;
-                    clean_cache(cache_dir, cache_limit, Some(&target))?;
+                    record_verified_cache(
+                        repo,
+                        &format!("{file_id}:thumb"),
+                        &target,
+                        size as i64,
+                        &hash,
+                    )?;
+                    clean_cache(repo, cache_limit, Some(&target))?;
                     return Ok(Some(ThumbnailSource {
                         kind: "image".into(),
                         path: Some(target.to_string_lossy().into_owned()),
@@ -135,11 +163,8 @@ impl TelegramService {
             .unwrap_or("bin");
         let cache_path = cache_dir.join(format!("{}.{extension}", sanitize_id(file_id)));
 
-        if cache_path.exists()
-            && fs::metadata(&cache_path).map_err(|e| e.to_string())?.len() == doc.size as u64
-            && sha256_file(&cache_path).map_err(|e| e.to_string())? == doc.sha256
-        {
-            clean_cache(cache_dir, cache_limit, Some(&cache_path))?;
+        if cache_hit_verified(repo, file_id, &cache_path, doc.size, &doc.sha256)? {
+            clean_cache(repo, cache_limit, Some(&cache_path))?;
             return Ok(MediaReady {
                 file_id: file_id.to_string(),
                 path: cache_path.to_string_lossy().into_owned(),
@@ -157,27 +182,11 @@ impl TelegramService {
         };
         let td_file_id = content.document.document.id;
 
-        // Request an initial prefix first, then request the whole file. This avoids a separate
-        // user-visible download and lets TDLib reuse whatever prefix is already cached locally.
-        let prefix = doc.size.clamp(1, 8 * 1024 * 1024);
-        call(f::download_file(
-            td_file_id,
-            32,
-            0,
-            prefix,
-            false,
-            self.client_id(),
-        ))
-        .await?;
-        let prefix_deadline = Instant::now() + Duration::from_secs(30);
-        while Instant::now() < prefix_deadline {
-            let e::File::File(file) = call(f::get_file(td_file_id, self.client_id())).await?;
-            if file.local.is_downloading_completed || file.local.downloaded_prefix_size >= prefix {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(180)).await;
-        }
-        call(f::download_file(
+        // Subscribe before starting the download so an immediate UpdateFile can't race
+        // past the waiter. The previous 8 MiB prefix phase never surfaced partial media
+        // to the UI, so it only added requests and polling without reducing visible latency.
+        let mut file_updates = self.subscribe_file_updates();
+        let e::File::File(mut file) = call(f::download_file(
             td_file_id,
             32,
             0,
@@ -189,11 +198,11 @@ impl TelegramService {
 
         let deadline = Instant::now() + Duration::from_secs(3600);
         while Instant::now() < deadline {
-            let e::File::File(file) = call(f::get_file(td_file_id, self.client_id())).await?;
             if file.local.is_downloading_completed {
                 let source = PathBuf::from(file.local.path);
                 let from_cache = copy_media(&source, &cache_path, &doc.sha256, doc.size)?;
-                clean_cache(cache_dir, cache_limit, Some(&cache_path))?;
+                record_verified_cache(repo, file_id, &cache_path, doc.size, &doc.sha256)?;
+                clean_cache(repo, cache_limit, Some(&cache_path))?;
                 return Ok(MediaReady {
                     file_id: file_id.to_string(),
                     path: cache_path.to_string_lossy().into_owned(),
@@ -204,7 +213,9 @@ impl TelegramService {
             if !file.local.is_downloading_active {
                 return Err("Telegram interrumpió la preparación de la vista previa".into());
             }
-            tokio::time::sleep(Duration::from_millis(350)).await;
+            file = self
+                .next_file_update(&mut file_updates, td_file_id, Duration::from_secs(5))
+                .await?;
         }
         Err("La preparación de la vista previa tardó demasiado".into())
     }
@@ -256,7 +267,100 @@ fn copy_media(source: &Path, target: &Path, hash: &str, size: i64) -> Result<boo
     }
 }
 
-pub fn remove_media_cache_entries(cache_dir: &Path, file_ids: &[String]) -> Result<u64, String> {
+fn modified_ns(metadata: &fs::Metadata) -> i64 {
+    metadata
+        .modified()
+        .ok()
+        .and_then(|value| value.duration_since(UNIX_EPOCH).ok())
+        .map(|value| value.as_nanos().min(i64::MAX as u128) as i64)
+        .unwrap_or(0)
+}
+
+fn cache_hit_verified(
+    repo: &CatalogRepository,
+    file_id: &str,
+    path: &Path,
+    expected_size: i64,
+    expected_hash: &str,
+) -> Result<bool, String> {
+    let metadata = match fs::metadata(path) {
+        Ok(metadata) if metadata.is_file() => metadata,
+        _ => {
+            let _ = repo.media_cache_remove_path(path);
+            return Ok(false);
+        }
+    };
+    if metadata.len() != expected_size.max(0) as u64 {
+        let _ = repo.media_cache_remove_path(path);
+        return Ok(false);
+    }
+    let stamp = modified_ns(&metadata);
+    if let Some(entry) = repo.media_cache_entry(path).map_err(|e| e.to_string())? {
+        if entry.verified
+            && entry.size_bytes == expected_size
+            && entry.sha256 == expected_hash
+            && entry.modified_ns == stamp
+        {
+            repo.media_cache_touch(path).map_err(|e| e.to_string())?;
+            return Ok(true);
+        }
+    }
+
+    if sha256_file(path).map_err(|e| e.to_string())? != expected_hash {
+        let _ = repo.media_cache_remove_path(path);
+        return Ok(false);
+    }
+    repo.media_cache_store_verified(file_id, path, expected_size, expected_hash, stamp)
+        .map_err(|e| e.to_string())?;
+    Ok(true)
+}
+
+fn record_verified_cache(
+    repo: &CatalogRepository,
+    file_id: &str,
+    path: &Path,
+    size: i64,
+    hash: &str,
+) -> Result<(), String> {
+    let metadata = fs::metadata(path).map_err(|e| e.to_string())?;
+    repo.media_cache_store_verified(file_id, path, size, hash, modified_ns(&metadata))
+        .map_err(|e| e.to_string())
+}
+
+pub fn reconcile_media_cache_index(
+    repo: &CatalogRepository,
+    cache_dir: &Path,
+) -> Result<(), String> {
+    fs::create_dir_all(cache_dir).map_err(|e| e.to_string())?;
+    let indexed: HashSet<String> = repo
+        .media_cache_paths()
+        .map_err(|e| e.to_string())?
+        .into_iter()
+        .collect();
+    let mut present = HashSet::new();
+    for entry in fs::read_dir(cache_dir).map_err(|e| e.to_string())? {
+        let entry = entry.map_err(|e| e.to_string())?;
+        let metadata = entry.metadata().map_err(|e| e.to_string())?;
+        if !metadata.is_file() {
+            continue;
+        }
+        let path = entry.path();
+        present.insert(path.to_string_lossy().into_owned());
+        repo.media_cache_reconcile_file(&path, metadata.len() as i64, modified_ns(&metadata))
+            .map_err(|e| e.to_string())?;
+    }
+    for stale in indexed.difference(&present) {
+        repo.media_cache_remove_path(Path::new(stale))
+            .map_err(|e| e.to_string())?;
+    }
+    Ok(())
+}
+
+pub fn remove_media_cache_entries(
+    repo: &CatalogRepository,
+    cache_dir: &Path,
+    file_ids: &[String],
+) -> Result<u64, String> {
     if !cache_dir.exists() || file_ids.is_empty() {
         return Ok(0);
     }
@@ -273,74 +377,62 @@ pub fn remove_media_cache_entries(cache_dir: &Path, file_ids: &[String]) -> Resu
         }
         let name = entry.file_name().to_string_lossy().into_owned();
         if prefixes.iter().any(|prefix| name.starts_with(prefix)) {
-            fs::remove_file(entry.path()).map_err(|e| e.to_string())?;
+            let path = entry.path();
+            fs::remove_file(&path).map_err(|e| e.to_string())?;
+            repo.media_cache_remove_path(&path)
+                .map_err(|e| e.to_string())?;
             removed = removed.saturating_add(metadata.len());
         }
     }
     Ok(removed)
 }
 
-pub fn clear_media_cache(cache_dir: &Path) -> Result<u64, String> {
+pub fn clear_media_cache(repo: &CatalogRepository, cache_dir: &Path) -> Result<u64, String> {
     if !cache_dir.exists() {
+        repo.media_cache_clear_index().map_err(|e| e.to_string())?;
         return Ok(0);
     }
-    let before = directory_size(cache_dir)?;
+    let before = repo.media_cache_total_bytes().map_err(|e| e.to_string())? as u64;
     for entry in fs::read_dir(cache_dir).map_err(|e| e.to_string())? {
         let entry = entry.map_err(|e| e.to_string())?;
         if entry.file_type().map_err(|e| e.to_string())?.is_file() {
             fs::remove_file(entry.path()).map_err(|e| e.to_string())?;
         }
     }
+    repo.media_cache_clear_index().map_err(|e| e.to_string())?;
     Ok(before)
 }
 
-fn clean_cache(cache_dir: &Path, limit: i64, keep: Option<&Path>) -> Result<(), String> {
-    let limit = limit.max(0) as u64;
-    let mut entries = Vec::new();
-    let mut total = 0_u64;
-    for entry in fs::read_dir(cache_dir).map_err(|e| e.to_string())? {
-        let entry = entry.map_err(|e| e.to_string())?;
-        let metadata = entry.metadata().map_err(|e| e.to_string())?;
-        if !metadata.is_file() {
-            continue;
-        }
-        total = total.saturating_add(metadata.len());
-        entries.push((
-            entry.path(),
-            metadata.len(),
-            metadata.modified().unwrap_or(SystemTime::UNIX_EPOCH),
-        ));
-    }
-    entries.sort_by_key(|entry| entry.2);
-    for (path, size, _) in entries {
-        if total <= limit {
+fn clean_cache(repo: &CatalogRepository, limit: i64, keep: Option<&Path>) -> Result<(), String> {
+    let limit = limit.max(0);
+    let mut total = repo.media_cache_total_bytes().map_err(|e| e.to_string())?;
+    while total > limit {
+        let candidates = repo.media_cache_lru(128).map_err(|e| e.to_string())?;
+        if candidates.is_empty() {
             break;
         }
-        if keep.is_some_and(|keep_path| keep_path == path) {
-            continue;
+        let mut progressed = false;
+        for entry in candidates {
+            if total <= limit {
+                break;
+            }
+            let path = PathBuf::from(&entry.path);
+            if keep.is_some_and(|keep_path| keep_path == path) {
+                continue;
+            }
+            if path.exists() && fs::remove_file(&path).is_err() {
+                continue;
+            }
+            repo.media_cache_remove_path(&path)
+                .map_err(|e| e.to_string())?;
+            total = total.saturating_sub(entry.size_bytes.max(0));
+            progressed = true;
         }
-        if fs::remove_file(&path).is_ok() {
-            total = total.saturating_sub(size);
+        if !progressed {
+            break;
         }
     }
     Ok(())
-}
-
-fn directory_size(path: &Path) -> Result<u64, String> {
-    let mut total = 0_u64;
-    if !path.exists() {
-        return Ok(0);
-    }
-    for entry in fs::read_dir(path).map_err(|e| e.to_string())? {
-        let entry = entry.map_err(|e| e.to_string())?;
-        let metadata = entry.metadata().map_err(|e| e.to_string())?;
-        total = total.saturating_add(if metadata.is_dir() {
-            directory_size(&entry.path())?
-        } else {
-            metadata.len()
-        });
-    }
-    Ok(total)
 }
 
 fn sanitize_id(value: &str) -> String {
@@ -386,13 +478,36 @@ mod tests {
     #[test]
     fn cache_cleanup_keeps_requested_file() {
         let root = tempfile::tempdir().unwrap();
-        let keep = root.path().join("keep.mp4");
-        let old = root.path().join("old.mp4");
+        let cache = root.path().join("cache");
+        fs::create_dir_all(&cache).unwrap();
+        let repo = CatalogRepository::open(&root.path().join("db")).unwrap();
+        let keep = cache.join("keep.mp4");
+        let old = cache.join("old.mp4");
         fs::write(&old, vec![0_u8; 1024]).unwrap();
         std::thread::sleep(std::time::Duration::from_millis(10));
         fs::write(&keep, vec![0_u8; 1024]).unwrap();
-        clean_cache(root.path(), 1024, Some(&keep)).unwrap();
+        reconcile_media_cache_index(&repo, &cache).unwrap();
+        clean_cache(&repo, 1024, Some(&keep)).unwrap();
         assert!(keep.exists());
         assert!(!old.exists());
+        assert_eq!(repo.media_cache_total_bytes().unwrap(), 1024);
+    }
+
+    #[test]
+    fn verified_cache_hit_is_invalidated_when_file_changes() {
+        let root = tempfile::tempdir().unwrap();
+        let cache = root.path().join("cache");
+        fs::create_dir_all(&cache).unwrap();
+        let repo = CatalogRepository::open(&root.path().join("db")).unwrap();
+        let path = cache.join("tg-1.bin");
+        fs::write(&path, b"abc").unwrap();
+        let hash = sha256_file(&path).unwrap();
+        record_verified_cache(&repo, "tg-1", &path, 3, &hash).unwrap();
+        assert!(cache_hit_verified(&repo, "tg-1", &path, 3, &hash).unwrap());
+
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        fs::write(&path, b"abd").unwrap();
+        assert!(!cache_hit_verified(&repo, "tg-1", &path, 3, &hash).unwrap());
+        assert!(repo.media_cache_entry(&path).unwrap().is_none());
     }
 }

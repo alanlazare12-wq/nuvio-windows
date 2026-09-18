@@ -58,6 +58,17 @@ pub struct TelegramAuthSnapshot {
     pub future_auth_token_count: usize,
 }
 
+#[derive(Debug, Clone)]
+pub(crate) enum TelegramRealtimeUpdate {
+    Message(Box<tdlib_rs::types::Message>),
+    DeleteMessages {
+        chat_id: i64,
+        message_ids: Vec<i64>,
+        is_permanent: bool,
+        from_cache: bool,
+    },
+}
+
 impl Default for TelegramAuthSnapshot {
     fn default() -> Self {
         Self {
@@ -163,11 +174,71 @@ pub struct TelegramService {
     future_tokens_path: PathBuf,
     future_auth_tokens: Arc<Mutex<Vec<String>>>,
     accept_future_auth_tokens: Arc<AtomicBool>,
+    realtime_updates: Mutex<tokio::sync::mpsc::Receiver<TelegramRealtimeUpdate>>,
+    pub(crate) realtime_notify: Arc<tokio::sync::Notify>,
+    realtime_overflowed: Arc<AtomicBool>,
+    file_updates: tokio::sync::broadcast::Sender<tdlib_rs::types::File>,
 }
 
 impl TelegramService {
     pub(crate) fn client_id(&self) -> i32 {
         self.client_id_atomic.load(Ordering::SeqCst)
+    }
+
+    pub(crate) fn drain_realtime_updates(&self, limit: usize) -> Vec<TelegramRealtimeUpdate> {
+        let mut receiver = self
+            .realtime_updates
+            .lock()
+            .expect("telegram realtime update mutex poisoned");
+        let mut updates = Vec::with_capacity(limit.min(256));
+        for _ in 0..limit {
+            match receiver.try_recv() {
+                Ok(update) => updates.push(update),
+                Err(tokio::sync::mpsc::error::TryRecvError::Empty) => break,
+                Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => break,
+            }
+        }
+        if updates.len() == limit {
+            self.realtime_notify.notify_one();
+        }
+        updates
+    }
+
+    pub(crate) fn realtime_overflowed(&self) -> bool {
+        self.realtime_overflowed.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn clear_realtime_overflow(&self) {
+        self.realtime_overflowed.store(false, Ordering::Release);
+    }
+
+    pub(crate) fn subscribe_file_updates(
+        &self,
+    ) -> tokio::sync::broadcast::Receiver<tdlib_rs::types::File> {
+        self.file_updates.subscribe()
+    }
+
+    pub(crate) async fn next_file_update(
+        &self,
+        receiver: &mut tokio::sync::broadcast::Receiver<tdlib_rs::types::File>,
+        file_id: i32,
+        fallback_after: Duration,
+    ) -> Result<tdlib_rs::types::File, String> {
+        loop {
+            match tokio::time::timeout(fallback_after, receiver.recv()).await {
+                Ok(Ok(file)) if file.id == file_id => return Ok(file),
+                Ok(Ok(_)) => continue,
+                Ok(Err(tokio::sync::broadcast::error::RecvError::Lagged(_)))
+                | Ok(Err(tokio::sync::broadcast::error::RecvError::Closed))
+                | Err(_) => {
+                    return match call(tdlib_rs::functions::get_file(file_id, self.client_id()))
+                        .await?
+                    {
+                        tdlib_rs::enums::File::File(file) => Ok(file),
+                    };
+                }
+            }
+        }
     }
 
     fn set_future_auth_persistence(&self, enabled: bool) -> Result<(), String> {
@@ -203,6 +274,10 @@ impl TelegramService {
         let future_auth_tokens =
             Arc::new(Mutex::new(load_future_auth_tokens(&future_tokens_path)?));
         let accept_future_auth_tokens = Arc::new(AtomicBool::new(false));
+        let (realtime_sender, realtime_receiver) = tokio::sync::mpsc::channel(4096);
+        let realtime_notify = Arc::new(tokio::sync::Notify::new());
+        let realtime_overflowed = Arc::new(AtomicBool::new(false));
+        let (file_updates, _) = tokio::sync::broadcast::channel(2048);
 
         let client_id_atomic = Arc::new(AtomicI32::new(tdlib_rs::create_client()));
         let cached = Arc::new(Mutex::new(TelegramAuthSnapshot::default()));
@@ -212,6 +287,9 @@ impl TelegramService {
         let future_tokens_updates = future_auth_tokens.clone();
         let future_tokens_path_updates = future_tokens_path.clone();
         let accept_future_tokens_updates = accept_future_auth_tokens.clone();
+        let realtime_notify_updates = realtime_notify.clone();
+        let realtime_overflow_updates = realtime_overflowed.clone();
+        let file_updates_receiver = file_updates.clone();
         let client_id_recv = client_id_atomic.clone();
         std::thread::Builder::new()
             .name("telegram-receive".into())
@@ -268,6 +346,37 @@ impl TelegramService {
                                 .expect("send mutex")
                                 .insert(v.old_message_id, Err(td_error(v.error)));
                         }
+                        tdlib_rs::enums::Update::NewMessage(v) => {
+                            match realtime_sender
+                                .try_send(TelegramRealtimeUpdate::Message(Box::new(v.message)))
+                            {
+                                Ok(()) => realtime_notify_updates.notify_one(),
+                                Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+                                    realtime_overflow_updates.store(true, Ordering::Release);
+                                    realtime_notify_updates.notify_one();
+                                }
+                                Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {}
+                            }
+                        }
+                        tdlib_rs::enums::Update::DeleteMessages(v) => {
+                            let event = TelegramRealtimeUpdate::DeleteMessages {
+                                chat_id: v.chat_id,
+                                message_ids: v.message_ids,
+                                is_permanent: v.is_permanent,
+                                from_cache: v.from_cache,
+                            };
+                            match realtime_sender.try_send(event) {
+                                Ok(()) => realtime_notify_updates.notify_one(),
+                                Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+                                    realtime_overflow_updates.store(true, Ordering::Release);
+                                    realtime_notify_updates.notify_one();
+                                }
+                                Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {}
+                            }
+                        }
+                        tdlib_rs::enums::Update::File(v) => {
+                            let _ = file_updates_receiver.send(v.file);
+                        }
                         _ => {}
                     }
                 }
@@ -287,6 +396,10 @@ impl TelegramService {
             future_tokens_path,
             future_auth_tokens,
             accept_future_auth_tokens,
+            realtime_updates: Mutex::new(realtime_receiver),
+            realtime_notify,
+            realtime_overflowed,
+            file_updates,
         })
     }
 
