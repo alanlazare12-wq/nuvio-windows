@@ -13,10 +13,20 @@
 - El checkpoint del catálogo se sube con `preliminaryUploadFile` y prioridad explícita 32, y cancela su subida preliminar si el `sendMessage` falla, para que un snapshot pequeño no quede en 0 bytes detrás de las subidas del usuario ni acumule trabajo oculto en cada reintento.
 - El selector "Subidas simultáneas" aclara que aplica a los archivos pequeños, para que el ajuste no contradiga lo que el usuario ve con volúmenes grandes.
 
+### Compresión
+
+- Diagnosticada la lentitud al dividir respaldos grandes: `THREAD_MODE_BACKGROUND_BEGIN` no sólo baja la prioridad de CPU, también deja el hilo en prioridad de E/S "Very Low", el nivel que Windows reserva para el indexador y el desfragmentador y estrangula en cuanto algo más toca el disco. Medido en un host NVMe, mantenía la división secuencial en **2.4 MB/s**: un respaldo de 90 GB tardaba más de diez horas sólo en la primera pasada.
+- Sustituido por una reducción de prioridad exclusivamente de CPU. Todos los perfiles corren por debajo de lo normal, Máximo incluido, porque en esta carga la prioridad más baja también resultó ser **la más rápida**: en tres mediciones independientes la misma división de 4 GiB tardó 16-28 s por debajo de lo normal y 36-93 s a prioridad normal, sin que ninguna muestra se solapara. Un hilo a prioridad normal retiene la CPU entre finalizaciones de E/S, deja sin turno a los hilos de vaciado del administrador de caché y termina bloqueado en escrituras síncronas. Máximo se gana su nombre con `compression_concurrency`, no peleando contra el planificador.
+- Eliminado el `sleep` de 1 ms por cada 8 MB del perfil Equilibrado: en Windows la resolución del temporizador puede convertir ese `Sleep(1)` en un tick completo de 15.6 ms. Ahora cede la rebanada de CPU (`yield`) sin dormir. El perfil Bajo conserva su pausa real, porque ahí el tope de rendimiento es el objetivo. Todos los perfiles ceden: una pasada que nunca cede resultó 4x más lenta.
+- La verificación de volúmenes lee cada parte **una sola vez** y obtiene de esos mismos bytes dos SHA-256: el del `.zip` terminado y el del contenido almacenado dentro, intersectando el rango del payload con cada bloque de 1 MiB. `create_archives_with_profile` devuelve ahora `ArchiveArtifact` con ese hash verificado y la preparación de la subida lo reutiliza en vez de releer el archivo entero. De tres lecturas por volumen a dos.
+- Las pasadas secuenciales largas abren con `FILE_FLAG_SEQUENTIAL_SCAN` para que el administrador de caché descarte esas páginas al consumirlas, en lugar de dejar que un respaldo de 90 GB barra la caché del sistema y expulse lo que el usuario tiene abierto.
+- Resultado medido sobre 4 GiB divididos en 47 volúmenes: 15-21 s por pasada completa (escritura + verificación), ~250 MiB/s de origen procesado, frente a los 2.4 MB/s anteriores.
+
 ### QA
 
-- Suite Rust: 110/110 aprobados, con tests nuevos para los turnos de volúmenes, la prioridad de reanudación y los umbrales del vigilante.
-- `pnpm lint:rust` (`clippy --all-targets -D warnings`), `pnpm check` y QA UI (20/20): aprobados.
+- Suite Rust: 111/111 aprobados, con tests nuevos para los turnos de volúmenes, la prioridad de reanudación, los umbrales del vigilante y la equivalencia entre el hash reutilizado y el del volumen en disco.
+- `pnpm lint:rust` (`clippy --all-targets -D warnings`), `pnpm check` y QA UI (22/22): aprobados.
+- Nuevo benchmark reproducible `pnpm qa:zip-perf`: divide 4 GiB y reporta MiB/s por perfil, corriendo cada uno en ambas posiciones para descartar el sesgo de la caché.
 
 ## 1.2.5 — 2026-09-18 — Catálogo incremental, sincronización realtime y rendimiento masivo
 

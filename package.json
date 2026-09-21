@@ -9,6 +9,7 @@
     "check": "tsc --noEmit",
     "qa:rust": "cargo test --manifest-path src-tauri/Cargo.toml --lib",
     "qa:perf": "cargo test --release --manifest-path src-tauri/Cargo.toml --lib catalog_performance_budget_250k -- --ignored --nocapture",
+    "qa:zip-perf": "cargo test --release --manifest-path src-tauri/Cargo.toml --lib split_throughput_by_resource_profile -- --ignored --nocapture",
     "qa:ui": "node scripts/qa-ui.mjs",
     "lint:rust": "cargo clippy --manifest-path src-tauri/Cargo.toml --all-targets -- -D warnings",
     "preview": "vite preview",

@@ -532,7 +532,7 @@ async fn prepare_zip_uploads(
             .prefix("zip-")
             .tempdir_in(&state.staging_dir)
             .map_err(|e| e.to_string())?;
-        let paths = archive::create_archives_with_profile(
+        let artifacts = archive::create_archives_with_profile(
             &items,
             temp.path(),
             archive::ZIP_LIMIT,
@@ -541,15 +541,16 @@ async fn prepare_zip_uploads(
                 let _ = app.emit("nuvio-zip-progress", progress);
             },
         )?;
-        let results: Vec<_> = paths
+        let results: Vec<_> = artifacts
             .iter()
-            .map(|path| {
+            .map(|artifact| {
                 TransferService::adopt_generated_upload_in_folder(
                     &state.repository,
-                    &path.to_string_lossy(),
+                    &artifact.path.to_string_lossy(),
                     &state.staging_dir,
                     folder_id.as_deref(),
                     profile,
+                    artifact.verified_sha256.as_deref(),
                 )
             })
             .collect();

@@ -42,26 +42,32 @@ impl ResourceProfile {
         }
     }
 
+    /// How much data may pass before the writer hands the CPU back. Every profile
+    /// yields, including Max: measured on an NVMe host, a pass that never yields
+    /// ran 4x *slower* (83-93 s vs 20-22 s for the same 4 GiB), because a writer
+    /// that outruns the Windows lazy writer hits the dirty-page threshold and is
+    /// forced into synchronous flushes. Pacing the stream is what keeps it fast.
     fn pause_after_bytes(self) -> u64 {
         match self {
             Self::Low => 2 * 1024 * 1024,
-            Self::Balanced => 8 * 1024 * 1024,
-            Self::Max => u64::MAX,
+            Self::Balanced | Self::Max => 8 * 1024 * 1024,
         }
     }
 
+    /// Balanced only yields the rest of its time slice. A real sleep is hostage to
+    /// the Windows timer resolution — `Sleep(1)` can park the thread for a full
+    /// 15.6 ms tick — which on a fast disk costs far more throughput than it buys
+    /// in responsiveness now that the thread already runs below normal priority.
+    /// Low keeps a genuine pause because that profile exists to leave the machine
+    /// alone, and its cap is the point.
     fn pause_duration(self) -> Duration {
         match self {
             Self::Low => Duration::from_millis(4),
-            Self::Balanced => Duration::from_millis(1),
-            Self::Max => Duration::ZERO,
+            Self::Balanced | Self::Max => Duration::ZERO,
         }
     }
 
     pub(crate) fn throttle(self, bytes_since_pause: &mut u64, processed: usize) {
-        if self == Self::Max {
-            return;
-        }
         *bytes_since_pause = bytes_since_pause.saturating_add(processed as u64);
         if *bytes_since_pause < self.pause_after_bytes() {
             return;
@@ -105,7 +111,6 @@ impl ResourceGovernor {
 #[cfg(windows)]
 struct ThreadPriorityGuard {
     previous: i32,
-    background_mode: bool,
     changed_priority: bool,
 }
 
@@ -113,35 +118,26 @@ struct ThreadPriorityGuard {
 impl ThreadPriorityGuard {
     fn new(profile: ResourceProfile) -> Self {
         use windows_sys::Win32::System::Threading::{
-            GetCurrentThread, GetThreadPriority, SetThreadPriority, THREAD_MODE_BACKGROUND_BEGIN,
-            THREAD_PRIORITY_BELOW_NORMAL, THREAD_PRIORITY_LOWEST,
+            GetCurrentThread, GetThreadPriority, SetThreadPriority, THREAD_PRIORITY_BELOW_NORMAL,
+            THREAD_PRIORITY_LOWEST,
         };
-        // Windows background mode lowers both CPU scheduling priority and I/O priority
-        // for the current blocking-pool thread. That matters more than CPU priority alone:
-        // multi-GB ZIP writes should not monopolize the storage queue and make Explorer or
-        // the desktop feel frozen. Max mode deliberately leaves the thread untouched.
+        // Only CPU scheduling priority is lowered here, never Windows background mode
+        // (THREAD_MODE_BACKGROUND_BEGIN). Background mode also drops the thread's I/O
+        // priority to Very Low, a tier Windows reserves for the search indexer and
+        // defragmenter and deliberately starves whenever anything else touches the
+        // disk. Measured on an NVMe host it held a sequential split to 2.4 MB/s, which
+        // turns a 90 GB backup into a ten-hour job.
+        //
+        // Every profile runs below normal, Max included, because on this workload a
+        // lower priority is also the *faster* one: across three benchmark runs the
+        // same 4 GiB split took 16-28 s below normal and 36-93 s at normal priority,
+        // with no sample overlapping. A thread at normal priority holds the CPU
+        // between I/O completions, starves the cache manager's flushers and ends up
+        // stalling on synchronous writes. Max earns its name through
+        // `compression_concurrency`, not by fighting the scheduler.
         unsafe {
             let thread = GetCurrentThread();
             let previous = GetThreadPriority(thread);
-            if profile == ResourceProfile::Max {
-                return Self {
-                    previous,
-                    background_mode: false,
-                    changed_priority: false,
-                };
-            }
-
-            let background_mode = SetThreadPriority(thread, THREAD_MODE_BACKGROUND_BEGIN) != 0;
-            if background_mode {
-                return Self {
-                    previous,
-                    background_mode: true,
-                    changed_priority: false,
-                };
-            }
-
-            // Background mode can fail on older/unusual Windows environments. Fall back
-            // to a conventional CPU-priority reduction rather than failing the upload.
             let desired = if profile == ResourceProfile::Low {
                 THREAD_PRIORITY_LOWEST
             } else {
@@ -150,7 +146,6 @@ impl ThreadPriorityGuard {
             let changed_priority = SetThreadPriority(thread, desired) != 0;
             Self {
                 previous,
-                background_mode: false,
                 changed_priority,
             }
         }
@@ -160,15 +155,10 @@ impl ThreadPriorityGuard {
 #[cfg(windows)]
 impl Drop for ThreadPriorityGuard {
     fn drop(&mut self) {
-        use windows_sys::Win32::System::Threading::{
-            GetCurrentThread, SetThreadPriority, THREAD_MODE_BACKGROUND_END,
-        };
+        use windows_sys::Win32::System::Threading::{GetCurrentThread, SetThreadPriority};
         unsafe {
-            let thread = GetCurrentThread();
-            if self.background_mode {
-                let _ = SetThreadPriority(thread, THREAD_MODE_BACKGROUND_END);
-            } else if self.changed_priority {
-                let _ = SetThreadPriority(thread, self.previous);
+            if self.changed_priority {
+                let _ = SetThreadPriority(GetCurrentThread(), self.previous);
             }
         }
     }
@@ -184,12 +174,42 @@ impl ThreadPriorityGuard {
     }
 }
 
+/// Opens a file for a long sequential pass. On Windows `FILE_FLAG_SEQUENTIAL_SCAN`
+/// asks the cache manager to age these pages out as soon as they are consumed;
+/// without it a 90 GB backup walks the whole system cache and evicts whatever the
+/// user actually has open, which is what makes the desktop feel slow during a big
+/// copy far more than CPU time does.
+pub(crate) fn open_sequential(path: &Path) -> io::Result<File> {
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        const FILE_FLAG_SEQUENTIAL_SCAN: u32 = 0x0800_0000;
+        File::options()
+            .read(true)
+            .custom_flags(FILE_FLAG_SEQUENTIAL_SCAN)
+            .open(path)
+    }
+    #[cfg(not(windows))]
+    {
+        File::open(path)
+    }
+}
+
 pub(crate) fn with_resource_priority<T>(
     profile: ResourceProfile,
     operation: impl FnOnce() -> T,
 ) -> T {
     let _priority = ThreadPriorityGuard::new(profile);
     operation()
+}
+
+/// A finished archive ready to be adopted as an upload. `verified_sha256` carries
+/// the hash of the file on disk when the verification pass already confirmed it,
+/// so the upload preparation can skip re-reading every byte of a multi-gigabyte
+/// volume just to compute what is already known.
+pub struct ArchiveArtifact {
+    pub path: PathBuf,
+    pub verified_sha256: Option<String>,
 }
 
 #[derive(Clone, serde::Deserialize)]
@@ -428,6 +448,96 @@ fn append_split_manifests(
     Ok(())
 }
 
+/// Streams the finished volume once, hashing the whole `.zip` as it sits on disk
+/// and, from the same bytes, the stored payload range. One sequential read yields
+/// both the integrity check and the SHA-256 the uploader needs.
+fn hash_volume_and_payload(
+    path: &Path,
+    payload_start: u64,
+    payload_size: u64,
+    processed: &mut u64,
+    governor: &mut ResourceGovernor,
+) -> Result<(String, String), String> {
+    let mut reader = open_sequential(path).map_err(|error| error.to_string())?;
+    let mut buffer = vec![0; 1024 * 1024];
+    let mut file_hasher = Sha256::new();
+    let mut payload_hasher = Sha256::new();
+    let payload_end = payload_start
+        .checked_add(payload_size)
+        .ok_or("El volumen declara un contenido imposible")?;
+    let mut offset = 0u64;
+    let mut payload_seen = 0u64;
+    loop {
+        let count = reader
+            .read(&mut buffer)
+            .map_err(|error| error.to_string())?;
+        if count == 0 {
+            break;
+        }
+        let chunk = &buffer[..count];
+        file_hasher.update(chunk);
+        let chunk_end = offset + count as u64;
+        // Intersect this chunk with the payload range; a 1 MiB read can straddle
+        // either edge of it.
+        let from = payload_start.max(offset);
+        let to = payload_end.min(chunk_end);
+        if from < to {
+            let start = (from - offset) as usize;
+            let end = (to - offset) as usize;
+            payload_hasher.update(&chunk[start..end]);
+            payload_seen += (end - start) as u64;
+        }
+        offset = chunk_end;
+        *processed = processed.saturating_add(count as u64);
+        governor.checkpoint(count);
+    }
+    if payload_seen != payload_size {
+        return Err(format!(
+            "{} no contiene todo el volumen anunciado",
+            path.display()
+        ));
+    }
+    Ok((
+        hex::encode(file_hasher.finalize()),
+        hex::encode(payload_hasher.finalize()),
+    ))
+}
+
+/// Fallback for a volume whose stored payload offset the ZIP reader did not
+/// expose: verify through the entry itself, as before, and leave the uploader to
+/// hash the file on its own.
+fn hash_entry_payload(
+    archive: &mut ZipArchive<File>,
+    entry_name: &str,
+    expected_size: u64,
+    processed: &mut u64,
+    governor: &mut ResourceGovernor,
+) -> Result<String, String> {
+    let mut entry = archive
+        .by_name(entry_name)
+        .map_err(|error| error.to_string())?;
+    let mut buffer = vec![0; 1024 * 1024];
+    let mut hasher = Sha256::new();
+    let mut verified = 0u64;
+    loop {
+        let count = entry.read(&mut buffer).map_err(|error| error.to_string())?;
+        if count == 0 {
+            break;
+        }
+        hasher.update(&buffer[..count]);
+        verified += count as u64;
+        *processed = processed.saturating_add(count as u64);
+        governor.checkpoint(count);
+    }
+    if verified != expected_size {
+        return Err("El volumen no contiene todo el contenido anunciado".into());
+    }
+    Ok(hex::encode(hasher.finalize()))
+}
+
+/// Verifies every volume against what was actually written to disk and returns the
+/// SHA-256 of each finished `.zip`, so the upload preparation does not have to read
+/// all of it a second time.
 fn verify_split_parts(
     source: &SourceFile,
     parts: &[SplitPart],
@@ -436,9 +546,9 @@ fn verify_split_parts(
     total_work: u64,
     governor: &mut ResourceGovernor,
     report: &mut impl FnMut(ArchiveProgress),
-) -> Result<(), String> {
+) -> Result<Vec<Option<String>>, String> {
     let expected_count = u32::try_from(parts.len()).map_err(|_| "Demasiadas partes ZIP")?;
-    let mut buffer = vec![0; 1024 * 1024];
+    let mut volume_hashes = Vec::with_capacity(parts.len());
     for part in parts {
         report(ArchiveProgress {
             processed_bytes: *processed,
@@ -448,7 +558,7 @@ fn verify_split_parts(
                 part.part_index, expected_count
             ),
         });
-        let file = File::open(&part.path).map_err(|error| error.to_string())?;
+        let file = open_sequential(&part.path).map_err(|error| error.to_string())?;
         let mut archive = ZipArchive::new(file).map_err(|error| error.to_string())?;
         if archive.len() != 2 {
             return Err(format!(
@@ -481,35 +591,46 @@ fn verify_split_parts(
                 part.path.display()
             ));
         }
-        let mut entry = archive
-            .by_name(&part.entry_name)
-            .map_err(|error| error.to_string())?;
-        if entry.size() != part.size {
-            return Err(format!(
-                "{} tiene un tamaño interno incorrecto",
-                part.path.display()
-            ));
-        }
-        let mut hasher = Sha256::new();
-        let mut verified = 0u64;
-        loop {
-            let count = entry.read(&mut buffer).map_err(|error| error.to_string())?;
-            if count == 0 {
-                break;
+        let payload_start = {
+            let entry = archive
+                .by_name(&part.entry_name)
+                .map_err(|error| error.to_string())?;
+            if entry.size() != part.size {
+                return Err(format!(
+                    "{} tiene un tamaño interno incorrecto",
+                    part.path.display()
+                ));
             }
-            hasher.update(&buffer[..count]);
-            verified += count as u64;
-            *processed = processed.saturating_add(count as u64);
-            governor.checkpoint(count);
-        }
-        if verified != part.size || hex::encode(hasher.finalize()) != part.sha256 {
+            entry.data_start()
+        };
+
+        let (volume_hash, payload_hash) = match payload_start {
+            Some(start) => {
+                drop(archive);
+                let (volume, payload) =
+                    hash_volume_and_payload(&part.path, start, part.size, processed, governor)?;
+                (Some(volume), payload)
+            }
+            None => {
+                let payload = hash_entry_payload(
+                    &mut archive,
+                    &part.entry_name,
+                    part.size,
+                    processed,
+                    governor,
+                )?;
+                (None, payload)
+            }
+        };
+        if payload_hash != part.sha256 {
             return Err(format!(
                 "{} no superó la verificación SHA-256",
                 part.path.display()
             ));
         }
+        volume_hashes.push(volume_hash);
     }
-    Ok(())
+    Ok(volume_hashes)
 }
 
 struct ArchiveWriteState<'a, F: FnMut(ArchiveProgress)> {
@@ -542,7 +663,7 @@ fn write_regular_archive<F: FnMut(ArchiveProgress)>(
     group: &[usize],
     sequence: usize,
     state: &mut ArchiveWriteState<'_, F>,
-) -> Result<PathBuf, String> {
+) -> Result<ArchiveArtifact, String> {
     let first_label = output_label(&sources[group[0]].name);
     let target = if group.len() == 1 {
         state
@@ -581,7 +702,7 @@ fn write_regular_archive<F: FnMut(ArchiveProgress)>(
             .large_file(source.size >= u32::MAX as u64);
         zip.start_file(&source.name, options)
             .map_err(|error| error.to_string())?;
-        let mut input = File::open(&source.path).map_err(|error| error.to_string())?;
+        let mut input = open_sequential(&source.path).map_err(|error| error.to_string())?;
         let mut read_size = 0u64;
         loop {
             let count = input
@@ -611,13 +732,16 @@ fn write_regular_archive<F: FnMut(ArchiveProgress)>(
     let writer = zip.finish().map_err(|error| error.to_string())?;
     finalize_zip(writer, &target, state.limit)?;
     verify_regular_archive(&target, group.len())?;
-    Ok(target)
+    Ok(ArchiveArtifact {
+        path: target,
+        verified_sha256: None,
+    })
 }
 
 fn write_split_archives<F: FnMut(ArchiveProgress)>(
     source: &SourceFile,
     state: &mut ArchiveWriteState<'_, F>,
-) -> Result<Vec<PathBuf>, String> {
+) -> Result<Vec<ArchiveArtifact>, String> {
     let reserve = (state.limit / 20).clamp(1024, 4 * 1024 * 1024);
     let chunk_limit = state
         .budget
@@ -628,7 +752,7 @@ fn write_split_archives<F: FnMut(ArchiveProgress)>(
     let part_count =
         u32::try_from(part_count_u64).map_err(|_| "El archivo requiere demasiadas partes")?;
     let label = output_label(&source.name);
-    let mut input = File::open(&source.path).map_err(|error| error.to_string())?;
+    let mut input = open_sequential(&source.path).map_err(|error| error.to_string())?;
     let mut global_hasher = Sha256::new();
     let mut parts = Vec::with_capacity(part_count as usize);
     let mut total_read = 0u64;
@@ -706,7 +830,7 @@ fn write_split_archives<F: FnMut(ArchiveProgress)>(
     }
     let original_sha256 = hex::encode(global_hasher.finalize());
     append_split_manifests(source, &parts, &original_sha256, state.limit)?;
-    verify_split_parts(
+    let volume_hashes = verify_split_parts(
         source,
         &parts,
         &original_sha256,
@@ -715,7 +839,14 @@ fn write_split_archives<F: FnMut(ArchiveProgress)>(
         &mut state.governor,
         &mut *state.report,
     )?;
-    Ok(parts.into_iter().map(|part| part.path).collect())
+    Ok(parts
+        .into_iter()
+        .zip(volume_hashes)
+        .map(|(part, verified_sha256)| ArchiveArtifact {
+            path: part.path,
+            verified_sha256,
+        })
+        .collect())
 }
 
 #[cfg(test)]
@@ -724,7 +855,7 @@ pub fn create_archives(
     output: &Path,
     limit: u64,
     report: impl FnMut(ArchiveProgress),
-) -> Result<Vec<PathBuf>, String> {
+) -> Result<Vec<ArchiveArtifact>, String> {
     create_archives_with_profile(items, output, limit, ResourceProfile::Balanced, report)
 }
 
@@ -734,7 +865,7 @@ pub fn create_archives_with_profile(
     limit: u64,
     profile: ResourceProfile,
     mut report: impl FnMut(ArchiveProgress),
-) -> Result<Vec<PathBuf>, String> {
+) -> Result<Vec<ArchiveArtifact>, String> {
     let _priority = ThreadPriorityGuard::new(profile);
     if items.is_empty() || items.len() > 10000 {
         return Err("Selecciona entre 1 y 10000 archivos para comprimir".into());
@@ -899,6 +1030,10 @@ mod tests {
         assert!(!stored("datos.csv"));
     }
 
+    fn archive_paths(artifacts: &[ArchiveArtifact]) -> Vec<PathBuf> {
+        artifacts.iter().map(|a| a.path.clone()).collect()
+    }
+
     fn split_manifest(path: &Path) -> SplitManifest {
         let file = File::open(path).unwrap();
         let mut archive = ZipArchive::new(file).unwrap();
@@ -914,7 +1049,7 @@ mod tests {
         let original = vec![b'x'; 100000];
         let source = root.path().join("original.txt");
         fs::write(&source, &original).unwrap();
-        let paths = create_archives(
+        let artifacts = create_archives(
             &[ArchiveInput {
                 path: source.to_string_lossy().into_owned(),
                 name: Some("Carpeta/área.txt".into()),
@@ -924,6 +1059,7 @@ mod tests {
             |_| {},
         )
         .unwrap();
+        let paths = archive_paths(&artifacts);
         assert!(fs::metadata(&paths[0]).unwrap().len() < 2000);
         let mut zip = ZipArchive::new(File::open(&paths[0]).unwrap()).unwrap();
         let mut restored = Vec::new();
@@ -933,6 +1069,62 @@ mod tests {
             .unwrap();
         assert_eq!(restored, original);
         assert_eq!(fs::read(source).unwrap(), original);
+    }
+
+    /// Mide el coste real de dividir un archivo grande bajo cada perfil de
+    /// recursos. `cargo test --release -- --ignored --nocapture split_throughput`
+    #[test]
+    #[ignore = "benchmark de E/S; ejecutar en release con --ignored"]
+    fn split_throughput_by_resource_profile() {
+        const SOURCE_BYTES: u64 = 4 * 1024 * 1024 * 1024;
+        const PART_LIMIT: u64 = 96 * 1024 * 1024;
+
+        let root = tempfile::tempdir().unwrap();
+        let source = root.path().join("respaldo.mkv");
+        let mut writer =
+            std::io::BufWriter::with_capacity(1024 * 1024, File::create(&source).unwrap());
+        let block: Vec<u8> = (0..1024 * 1024).map(|index| (index % 251) as u8).collect();
+        let mut written = 0u64;
+        while written < SOURCE_BYTES {
+            writer.write_all(&block).unwrap();
+            written += block.len() as u64;
+        }
+        writer.into_inner().unwrap().sync_all().unwrap();
+        println!("origen: {} MiB", SOURCE_BYTES / (1024 * 1024));
+
+        // El orden se invierte en la segunda vuelta: leer el mismo origen dos
+        // veces lo deja en la caché de Windows y favorecería al perfil que corra
+        // segundo, así que cada uno corre en ambas posiciones.
+        for profile in [
+            ResourceProfile::Balanced,
+            ResourceProfile::Max,
+            ResourceProfile::Max,
+            ResourceProfile::Balanced,
+        ] {
+            let out = root.path().join("out");
+            fs::create_dir_all(&out).unwrap();
+            let start = Instant::now();
+            let parts = create_archives_with_profile(
+                &[ArchiveInput {
+                    path: source.to_string_lossy().into_owned(),
+                    name: None,
+                }],
+                &out,
+                PART_LIMIT,
+                profile,
+                |_| {},
+            )
+            .unwrap();
+            let elapsed = start.elapsed();
+            let mib = SOURCE_BYTES as f64 / (1024.0 * 1024.0);
+            println!(
+                "{profile:?}: {} partes en {:.1} s → {:.0} MiB/s de origen procesado",
+                parts.len(),
+                elapsed.as_secs_f64(),
+                mib / elapsed.as_secs_f64()
+            );
+            fs::remove_dir_all(&out).unwrap();
+        }
     }
 
     #[test]
@@ -947,7 +1139,9 @@ mod tests {
                 name: None,
             });
         }
-        let paths = create_archives(&items, &root.path().join("out"), 10000, |_| {}).unwrap();
+        let paths = archive_paths(
+            &create_archives(&items, &root.path().join("out"), 10000, |_| {}).unwrap(),
+        );
         assert_eq!(paths.len(), 3);
         for path in paths {
             assert!(fs::metadata(path).unwrap().len() <= 10000);
@@ -960,7 +1154,7 @@ mod tests {
         let original: Vec<u8> = (0..25000).map(|index| (index % 251) as u8).collect();
         let path = root.path().join("archivo-grande.rar");
         fs::write(&path, &original).unwrap();
-        let paths = create_archives(
+        let artifacts = create_archives(
             &[ArchiveInput {
                 path: path.to_string_lossy().into_owned(),
                 name: None,
@@ -970,6 +1164,7 @@ mod tests {
             |_| {},
         )
         .unwrap();
+        let paths = archive_paths(&artifacts);
         assert!(paths.len() >= 3);
         assert!(paths
             .iter()
@@ -998,6 +1193,51 @@ mod tests {
     }
 
     #[test]
+    fn split_volumes_carry_the_hash_of_the_file_on_disk() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("respaldo.rar");
+        let original: Vec<u8> = (0..60000).map(|index| (index % 251) as u8).collect();
+        fs::write(&path, &original).unwrap();
+        let volumes = create_archives(
+            &[ArchiveInput {
+                path: path.to_string_lossy().into_owned(),
+                name: None,
+            }],
+            &root.path().join("out"),
+            10000,
+            |_| {},
+        )
+        .unwrap();
+
+        assert!(volumes.len() >= 6);
+        for volume in &volumes {
+            // The upload records this hash in the catalog without re-reading the
+            // file, so it has to match the bytes that actually landed on disk.
+            let declared = volume
+                .verified_sha256
+                .as_deref()
+                .expect("cada volumen dividido trae su SHA-256 verificado");
+            assert_eq!(declared, crate::crypto::sha256_file(&volume.path).unwrap());
+        }
+
+        // A regular archive is not verified byte by byte, so it must not claim a
+        // hash the preparation would then trust blindly.
+        let plain = root.path().join("nota.txt");
+        fs::write(&plain, b"hola").unwrap();
+        let regular = create_archives(
+            &[ArchiveInput {
+                path: plain.to_string_lossy().into_owned(),
+                name: None,
+            }],
+            &root.path().join("out-regular"),
+            ZIP_LIMIT,
+            |_| {},
+        )
+        .unwrap();
+        assert!(regular[0].verified_sha256.is_none());
+    }
+
+    #[test]
     fn split_parts_use_descriptive_names_and_manifests() {
         let root = tempfile::tempdir().unwrap();
         let path = root.path().join("respaldo importante.zip");
@@ -1012,6 +1252,7 @@ mod tests {
             |_| {},
         )
         .unwrap();
+        let paths = archive_paths(&paths);
         assert!(paths[0]
             .file_name()
             .unwrap()

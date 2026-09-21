@@ -98,12 +98,17 @@ impl TransferService {
         )
     }
 
+    /// `verified_sha256` is the hash the compression pass already confirmed against
+    /// the bytes on disk. When it is present this skips a full re-read of the file,
+    /// which on a multi-gigabyte volume is the difference between adopting it
+    /// instantly and reading every byte a third time.
     pub fn adopt_generated_upload_in_folder(
         repository: &CatalogRepository,
         path: &str,
         staging_dir: &Path,
         folder_id: Option<&str>,
         resource_profile: ResourceProfile,
+        verified_sha256: Option<&str>,
     ) -> Result<PreparedUpload, String> {
         let source_path = normalize_path(path)?;
         let metadata = fs::metadata(&source_path).map_err(|error| error.to_string())?;
@@ -167,26 +172,31 @@ impl TransferService {
             return Err(error);
         }
 
-        let sha256 = match crate::archive::with_resource_priority(resource_profile, || {
-            hash_with_progress_profile(
-                repository,
-                &transfer_id,
-                &snapshot,
-                size_bytes,
-                Some(resource_profile),
-            )
-        }) {
-            Ok(hash) => hash,
-            Err(error) => {
-                mark_preparation_failure(
+        let sha256 = match verified_sha256 {
+            Some(hash) if hash.len() == 64 && hash.bytes().all(|byte| byte.is_ascii_hexdigit()) => {
+                hash.to_string()
+            }
+            _ => match crate::archive::with_resource_priority(resource_profile, || {
+                hash_with_progress_profile(
                     repository,
                     &transfer_id,
+                    &snapshot,
                     size_bytes,
-                    "Error al verificar ZIP generado",
-                    &error,
-                );
-                return Err(error);
-            }
+                    Some(resource_profile),
+                )
+            }) {
+                Ok(hash) => hash,
+                Err(error) => {
+                    mark_preparation_failure(
+                        repository,
+                        &transfer_id,
+                        size_bytes,
+                        "Error al verificar ZIP generado",
+                        &error,
+                    );
+                    return Err(error);
+                }
+            },
         };
 
         let duplicate = match repository.finish_preparation(
@@ -623,7 +633,7 @@ fn hash_with_progress_profile(
 ) -> Result<String, String> {
     let mut reader = BufReader::with_capacity(
         2 * 1024 * 1024,
-        fs::File::open(path).map_err(|e| e.to_string())?,
+        crate::archive::open_sequential(path).map_err(|e| e.to_string())?,
     );
     let mut hasher = Sha256::new();
     let mut buffer = vec![0_u8; 1024 * 1024];
@@ -970,6 +980,7 @@ mod tests {
             &staging,
             None,
             ResourceProfile::Balanced,
+            None,
         )
         .unwrap();
 
