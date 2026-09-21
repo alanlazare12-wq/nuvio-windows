@@ -13,6 +13,11 @@
 - El checkpoint del catálogo se sube con `preliminaryUploadFile` y prioridad explícita 32, y cancela su subida preliminar si el `sendMessage` falla, para que un snapshot pequeño no quede en 0 bytes detrás de las subidas del usuario ni acumule trabajo oculto en cada reintento.
 - El selector "Subidas simultáneas" aclara que aplica a los archivos pequeños, para que el ajuste no contradiga lo que el usuario ve con volúmenes grandes.
 
+### Subidas
+
+- El aviso "Esperando progreso de Telegram" saltaba tras sólo 8 s sin bytes nuevos y borraba la velocidad y el ETA válidos de una subida que avanzaba con normalidad. TDLib informa el progreso por partes completas: en un enlace lento dos muestras ya están a 5.5 s (4 MB a 750 KB/s) y el jitter normal superaba el umbral constantemente. Ahora espera 45 s y, mientras tanto, la interfaz conserva la última velocidad y estimación persistidas.
+- Añadida la cancelación de subidas huérfanas al arrancar. Un cierre inesperado deja las transferencias en curso como `paused` y los reintentos agotados las dejan en `failed`, pero en ambos casos TDLib sigue enviando sus mensajes en segundo plano: gastaban el presupuesto de subida de la cuenta detrás de la cola que el usuario sí está mirando. `discard_abandoned_uploads` las detiene una vez por sesión, respetando las que sí van a reanudarse (`retry_wait`) o están activas, y dejando intacto un mensaje que ya se envió para que la sincronización lo adopte como subida terminada.
+
 ### Compresión
 
 - Diagnosticada la lentitud al dividir respaldos grandes: `THREAD_MODE_BACKGROUND_BEGIN` no sólo baja la prioridad de CPU, también deja el hilo en prioridad de E/S "Very Low", el nivel que Windows reserva para el indexador y el desfragmentador y estrangula en cuanto algo más toca el disco. Medido en un host NVMe, mantenía la división secuencial en **2.4 MB/s**: un respaldo de 90 GB tardaba más de diez horas sólo en la primera pasada.
@@ -24,7 +29,7 @@
 
 ### QA
 
-- Suite Rust: 111/111 aprobados, con tests nuevos para los turnos de volúmenes, la prioridad de reanudación, los umbrales del vigilante y la equivalencia entre el hash reutilizado y el del volumen en disco.
+- Suite Rust: 112/112 aprobados, con tests nuevos para los turnos de volúmenes, la prioridad de reanudación, los umbrales del vigilante, la equivalencia entre el hash reutilizado y el del volumen en disco, y la frontera entre una subida huérfana y una que sí va a reanudarse.
 - `pnpm lint:rust` (`clippy --all-targets -D warnings`), `pnpm check` y QA UI (22/22): aprobados.
 - Nuevo benchmark reproducible `pnpm qa:zip-perf`: divide 4 GiB y reporta MiB/s por perfil, corriendo cada uno en ambas posiciones para descartar el sesgo de la caché.
 

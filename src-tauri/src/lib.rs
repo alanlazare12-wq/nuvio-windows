@@ -1683,6 +1683,7 @@ async fn worker(state: Arc<AppState>) {
         *state.background_error.lock().expect("background") = Some(error);
     }
     let mut bootstrap_checked = false;
+    let mut abandoned_uploads_checked = false;
     let mut first_iteration = true;
     loop {
         if first_iteration {
@@ -1706,7 +1707,26 @@ async fn worker(state: Arc<AppState>) {
             // A later login may point to a different Telegram account/chat, whose
             // bootstrap marker is scoped independently.
             bootstrap_checked = false;
+            abandoned_uploads_checked = false;
             continue;
+        }
+
+        // A crash or a restart leaves interrupted uploads paused, and exhausted
+        // retries leave them failed, but TDLib keeps sending their messages either
+        // way. Those uploads answer to nobody and would spend the account's upload
+        // budget behind the queue the user is watching, so stop them once per
+        // session before claiming any new work.
+        if !abandoned_uploads_checked {
+            match state
+                .telegram
+                .discard_abandoned_uploads(&state.repository)
+                .await
+            {
+                Ok(_) => abandoned_uploads_checked = true,
+                Err(error) => {
+                    *state.background_error.lock().expect("background") = Some(error);
+                }
+            }
         }
 
         if let Err(error) = state

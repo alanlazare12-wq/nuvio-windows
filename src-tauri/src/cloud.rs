@@ -35,6 +35,14 @@ pub const SERIAL_UPLOAD_MIN_BYTES: i64 = 128 * 1024 * 1024;
 /// alone cannot decide whether a transfer is broken: only the lack of progress
 /// can. These bound the three ways a transfer can stop being useful.
 const TRANSFER_STALL_TIMEOUT: Duration = Duration::from_secs(20 * 60);
+
+/// How long the upload may go without a single byte before the UI stops showing
+/// the last known speed and says it is waiting on Telegram. TDLib reports upload
+/// progress in bursts of whole parts, so on a slow uplink two samples are already
+/// several seconds apart — 4 MB at 750 KB/s is 5.5 s — and jitter on top of that
+/// made an eight second threshold fire constantly, blanking a perfectly good ETA
+/// on a transfer that was advancing normally.
+const UPLOAD_PROGRESS_GAP_WARNING: Duration = Duration::from_secs(45);
 const UPLOAD_CONFIRM_TIMEOUT: Duration = Duration::from_secs(30 * 60);
 const TRANSFER_MAX_RUNTIME: Duration = Duration::from_secs(12 * 60 * 60);
 
@@ -1181,6 +1189,25 @@ impl CatalogRepository {
         }
         tx.commit()?;
         Ok(row)
+    }
+
+    /// Uploads that still hold a Telegram message nobody will resume on their own.
+    /// A crash or a restart turns an in-flight upload into `paused` (see the startup
+    /// reset) and exhausted retries leave it `failed`, but in both cases TDLib keeps
+    /// pushing that message's bytes in the background, stealing the upload budget
+    /// from the transfer the user is actually watching.
+    pub fn abandoned_upload_messages(&self) -> Result<Vec<(String, i64)>, RepositoryError> {
+        let connection = self.connection.lock().expect("catalog");
+        let mut statement = connection.prepare(
+            "SELECT t.id,p.message_id
+             FROM transfers t JOIN transfer_pending p ON p.id=t.id
+             WHERE t.direction='upload' AND t.status IN ('paused','failed') AND p.message_id>0
+             ORDER BY t.rowid",
+        )?;
+        let rows = statement
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(rows)
     }
 
     pub fn set_pending(&self, id: &str, message: i64) -> Result<(), RepositoryError> {
@@ -3579,6 +3606,51 @@ impl TelegramService {
         Ok(removed)
     }
 
+    /// Stops Telegram uploads that belong to transfers nobody is going to resume.
+    /// Returns how many were still being pushed and got cancelled.
+    pub async fn discard_abandoned_uploads(
+        &self,
+        repo: &CatalogRepository,
+    ) -> Result<usize, String> {
+        let abandoned = repo
+            .abandoned_upload_messages()
+            .map_err(|e| e.to_string())?;
+        if abandoned.is_empty() {
+            return Ok(0);
+        }
+        let chat = self.own_chat(repo).await?;
+        let mut cancelled = 0usize;
+        for (id, message_id) in abandoned {
+            let Ok(e::Message::Message(message)) =
+                call(f::get_message(chat, message_id, self.client_id())).await
+            else {
+                // Could not ask Telegram about it right now; leave the marker in place
+                // so a later pass can still find it instead of losing the reference.
+                continue;
+            };
+            if message.sending_state.is_some() {
+                let _ = call(f::delete_messages(
+                    chat,
+                    vec![message_id],
+                    true,
+                    self.client_id(),
+                ))
+                .await;
+                cancelled += 1;
+            }
+            // An already sent message is left untouched: the catalog sync adopts it as
+            // a finished upload. Either way this transfer no longer owns a live upload.
+            repo.clear_pending(&id).map_err(|e| e.to_string())?;
+        }
+        if cancelled > 0 {
+            self.log_sync_event(
+                "abandoned_uploads_cancelled",
+                serde_json::json!({ "count": cancelled }),
+            );
+        }
+        Ok(cancelled)
+    }
+
     pub async fn run_upload(&self, repo: &CatalogRepository, job: &WorkItem) -> Result<(), String> {
         let chat = self.own_chat(repo).await?;
         let mut pending = job.pending.unwrap_or(0);
@@ -3816,10 +3888,13 @@ impl TelegramService {
                         )
                         .map_err(|e| e.to_string())?;
                     } else if !waiting_reported
-                        && last_progress_at.elapsed() >= Duration::from_secs(8)
+                        && last_progress_at.elapsed() >= UPLOAD_PROGRESS_GAP_WARNING
                     {
                         // Do not replace a valid ETA with "calculando" on every duplicate
-                        // TDLib sample. Only mark a real sustained pause after eight seconds.
+                        // TDLib sample, nor on the ordinary gap between two part uploads:
+                        // until the gap is long enough to be meaningful the UI keeps the
+                        // last persisted speed and estimate, which is what the transfer is
+                        // actually doing.
                         repo.update_runtime(
                             &job.id,
                             "uploading",
@@ -4890,6 +4965,60 @@ mod tests {
                 .id,
             "volume-2"
         );
+    }
+
+    #[test]
+    fn only_uploads_nobody_will_resume_count_as_abandoned() {
+        let root = tempfile::tempdir().unwrap();
+        let repo = CatalogRepository::open(&root.path().join("db")).unwrap();
+        repo.init_cloud().unwrap();
+        for (index, id) in ["interrumpida", "agotada", "reintentando", "activa"]
+            .iter()
+            .enumerate()
+        {
+            repo.create_upload_placeholder_in_folder(
+                id,
+                &format!("{id}.bin"),
+                &format!("C:/origen/{id}.bin"),
+                None,
+                4096,
+                None,
+                false,
+            )
+            .unwrap();
+            repo.finish_preparation(
+                id,
+                &format!("C:/staging/{id}.bin"),
+                &format!("{index:064}"),
+                4096,
+                false,
+            )
+            .unwrap();
+            repo.set_pending(id, 100 + index as i64).unwrap();
+        }
+        // A restart parks an in-flight upload here, and exhausted retries end here:
+        // neither resumes on its own, yet TDLib keeps sending both.
+        repo.mark_paused("interrumpida").unwrap();
+        while repo
+            .mark_retry_or_failed("agotada", "sin intentos")
+            .unwrap()
+        {}
+        // These two are still owned by the queue and must keep their message.
+        repo.update_transfer_state("reintentando", "retry_wait", 0, "Reintento", None, None)
+            .unwrap();
+        repo.update_transfer_state("activa", "uploading", 0, "Subiendo", None, None)
+            .unwrap();
+
+        let abandoned = repo.abandoned_upload_messages().unwrap();
+        let ids: Vec<_> = abandoned.iter().map(|(id, _)| id.as_str()).collect();
+        assert_eq!(ids, ["interrumpida", "agotada"]);
+        assert_eq!(abandoned[0].1, 100);
+
+        // A transfer with no Telegram message of its own is not abandoned work.
+        repo.clear_pending("interrumpida").unwrap();
+        let remaining = repo.abandoned_upload_messages().unwrap();
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(remaining[0].0, "agotada");
     }
 
     #[test]
