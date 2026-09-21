@@ -1340,6 +1340,21 @@ fn export_diagnostics(state: State<'_, Arc<AppState>>, destination: String) -> R
             })
         })
         .collect();
+    let sync_progress = state
+        .telegram
+        .sync_progress
+        .lock()
+        .map(|progress| progress.clone())
+        .unwrap_or_default();
+    let (sync_log_tail, sync_log_read_error) = match state.telegram.sync_log_tail(512 * 1024) {
+        Ok(raw) => (
+            raw.lines()
+                .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+                .collect::<Vec<_>>(),
+            None,
+        ),
+        Err(error) => (Vec::new(), Some(error)),
+    };
     let report = serde_json::json!({
         "product": "Nuvio",
         "version": env!("CARGO_PKG_VERSION"),
@@ -1350,6 +1365,9 @@ fn export_diagnostics(state: State<'_, Arc<AppState>>, destination: String) -> R
         "settings": settings,
         "queue": summary,
         "transfers": sanitized_transfers,
+        "syncProgress": sync_progress,
+        "syncLogTail": sync_log_tail,
+        "syncLogReadError": sync_log_read_error,
         "backgroundErrorPresent": state.background_error.lock().expect("background").is_some()
     });
     let bytes = serde_json::to_vec_pretty(&report).map_err(|e| e.to_string())?;

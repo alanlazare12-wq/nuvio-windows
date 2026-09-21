@@ -95,6 +95,7 @@ pub struct SyncProgress {
     pub total: Option<usize>,
     pub percent: Option<u8>,
     pub eta_seconds: Option<u64>,
+    pub detail: Option<String>,
     pub error: Option<String>,
 }
 
@@ -120,6 +121,7 @@ impl<'a> SyncRun<'a> {
         let mut state = self.state.lock().expect("sync progress");
         state.phase = phase;
         state.eta_seconds = None;
+        state.detail = None;
         if phase == SyncPhase::Folders {
             state.percent = Some(3);
         }
@@ -129,6 +131,7 @@ impl<'a> SyncRun<'a> {
         state.phase = SyncPhase::Files;
         state.scanned = scanned;
         state.total = total;
+        state.detail = None;
         state.percent = total
             .filter(|n| *n > 0)
             .map(|n| ((scanned as f64 / n as f64 * 90.0) as u8).min(89));
@@ -142,18 +145,21 @@ impl<'a> SyncRun<'a> {
         state.phase = SyncPhase::Applying;
         state.percent = Some(90 + (processed.saturating_mul(9) / total.max(1)).min(9) as u8);
         state.eta_seconds = None;
+        state.detail = None;
     }
     pub fn publishing(&self) {
         let mut state = self.state.lock().expect("sync progress");
         state.phase = SyncPhase::Publishing;
         state.percent = Some(99);
         state.eta_seconds = None;
+        state.detail = Some("Preparando checkpoint remoto del catálogo…".into());
     }
     pub fn cancel(&mut self) {
         let mut state = self.state.lock().expect("sync progress");
         state.active = false;
         state.phase = SyncPhase::Cancelled;
         state.eta_seconds = None;
+        state.detail = None;
         state.error = None;
         self.finished = true;
     }
@@ -169,6 +175,7 @@ impl<'a> SyncRun<'a> {
             state.percent = Some(100);
             state.eta_seconds = Some(0);
         }
+        state.detail = None;
         state.error = error;
         self.finished = true;
     }
@@ -223,12 +230,17 @@ mod sync_tests {
             assert!(snapshot.active);
             assert_eq!(snapshot.phase, SyncPhase::Publishing);
             assert_eq!(snapshot.percent, Some(99));
+            assert_eq!(
+                snapshot.detail.as_deref(),
+                Some("Preparando checkpoint remoto del catálogo…")
+            );
         }
         run.cancel();
         let snapshot = state.lock().unwrap();
         assert!(!snapshot.active);
         assert_eq!(snapshot.phase, SyncPhase::Cancelled);
         assert_eq!(snapshot.percent, Some(99));
+        assert!(snapshot.detail.is_none());
         assert!(snapshot.error.is_none());
     }
 

@@ -1668,6 +1668,12 @@ impl TelegramService {
         }
     }
 
+    fn set_sync_detail(&self, detail: impl Into<String>) {
+        if let Ok(mut progress) = self.sync_progress.lock() {
+            progress.detail = Some(detail.into());
+        }
+    }
+
     async fn wait_sync_cancel(&self) {
         while !self.sync_cancel_requested.load(Ordering::Acquire) {
             tokio::time::sleep(Duration::from_millis(100)).await;
@@ -1838,14 +1844,39 @@ impl TelegramService {
         message: t::Message,
         timeout_for: Duration,
         timeout_message: &str,
-    ) -> Result<t::Message, String> {
-        if message.sending_state.is_none() {
-            return Ok(message);
-        }
+    ) -> Result<i64, String> {
         let pending = message.id;
+        let expected_snapshot =
+            catalog_snapshot_message(&message).map(|(caption, file)| (caption, file.id));
+        if message.sending_state.is_none() {
+            self.log_sync_event(
+                "snapshot_send_confirmed_immediately",
+                serde_json::json!({ "messageId": pending }),
+            );
+            return Ok(pending);
+        }
+
+        self.log_sync_event(
+            "snapshot_send_wait_started",
+            serde_json::json!({
+                "pendingMessageId": pending,
+                "timeoutSeconds": timeout_for.as_secs(),
+                "fileId": expected_snapshot.as_ref().map(|(_, file_id)| *file_id),
+            }),
+        );
         let deadline = Instant::now() + timeout_for;
+        let started = Instant::now();
+        let mut last_message_probe = Instant::now() - Duration::from_secs(5);
+        let mut last_remote_probe = Instant::now() - Duration::from_secs(10);
+        let mut last_uploaded_bytes = 0_i64;
+        let mut last_upload_progress = Instant::now();
+
         while Instant::now() < deadline {
             if self.sync_cancel_requested.load(Ordering::Acquire) {
+                self.log_sync_event(
+                    "snapshot_send_cancelled",
+                    serde_json::json!({ "pendingMessageId": pending, "elapsedSeconds": started.elapsed().as_secs() }),
+                );
                 // This helper is used only by catalog snapshot publication. Deleting
                 // the pending message asks TDLib to stop the upload instead of leaving
                 // a hidden snapshot transfer consuming bandwidth after the user stops sync.
@@ -1858,16 +1889,233 @@ impl TelegramService {
                 .await;
                 return Err(SYNC_CANCELLED_ERROR.to_string());
             }
+
             if let Some(result) = self
                 .sent
                 .lock()
                 .map_err(|e| e.to_string())?
                 .remove(&pending)
             {
-                return result;
+                match result {
+                    Ok(message) => {
+                        self.log_sync_event(
+                            "snapshot_send_event_succeeded",
+                            serde_json::json!({
+                                "pendingMessageId": pending,
+                                "messageId": message.id,
+                                "elapsedSeconds": started.elapsed().as_secs(),
+                            }),
+                        );
+                        self.set_sync_detail("Checkpoint remoto confirmado por Telegram.");
+                        return Ok(message.id);
+                    }
+                    Err(error) => {
+                        self.log_sync_event(
+                            "snapshot_send_event_failed",
+                            serde_json::json!({
+                                "pendingMessageId": pending,
+                                "elapsedSeconds": started.elapsed().as_secs(),
+                                "error": error,
+                            }),
+                        );
+                        return Err(error);
+                    }
+                }
             }
-            tokio::time::sleep(Duration::from_millis(120)).await;
+
+            // Do not depend exclusively on UpdateMessageSendSucceeded. A missed/delayed
+            // TDLib update previously left sync at 99% until the full 15-minute timeout.
+            // Probe the temporary message and upload file directly so success/failure and
+            // byte progress remain observable even if the update channel misses an event.
+            if last_message_probe.elapsed() >= Duration::from_secs(5) {
+                last_message_probe = Instant::now();
+                match self
+                    .sync_call(f::get_message(chat, pending, self.client_id()))
+                    .await
+                {
+                    Ok(e::Message::Message(current)) => {
+                        if current.sending_state.is_none() {
+                            self.log_sync_event(
+                                "snapshot_send_probe_confirmed",
+                                serde_json::json!({
+                                    "pendingMessageId": pending,
+                                    "messageId": current.id,
+                                    "elapsedSeconds": started.elapsed().as_secs(),
+                                }),
+                            );
+                            self.set_sync_detail("Checkpoint remoto confirmado por Telegram.");
+                            return Ok(current.id);
+                        }
+                        if let Some(e::MessageSendingState::Failed(failed)) = current.sending_state
+                        {
+                            let error =
+                                format!("Telegram rechazó el checkpoint: {:?}", failed.error);
+                            self.log_sync_event(
+                                "snapshot_send_probe_failed",
+                                serde_json::json!({
+                                    "pendingMessageId": pending,
+                                    "elapsedSeconds": started.elapsed().as_secs(),
+                                    "error": error,
+                                }),
+                            );
+                            return Err(error);
+                        }
+
+                        let file_id = catalog_snapshot_message(&current)
+                            .map(|(_, file)| file.id)
+                            .or_else(|| expected_snapshot.as_ref().map(|(_, file_id)| *file_id));
+                        if let Some(file_id) = file_id {
+                            match self.sync_call(f::get_file(file_id, self.client_id())).await {
+                                Ok(e::File::File(file)) => {
+                                    let uploaded = file.remote.uploaded_size.max(0);
+                                    let total_bytes = file.size.max(file.expected_size).max(0);
+                                    if uploaded > last_uploaded_bytes {
+                                        last_uploaded_bytes = uploaded;
+                                        last_upload_progress = Instant::now();
+                                    }
+                                    if total_bytes > 0 {
+                                        let percent = ((uploaded as f64 / total_bytes as f64)
+                                            * 100.0)
+                                            .clamp(0.0, 100.0);
+                                        self.set_sync_detail(format!(
+                                            "Subiendo checkpoint remoto: {:.1} / {:.1} MB ({percent:.0}%)",
+                                            uploaded as f64 / (1024.0 * 1024.0),
+                                            total_bytes as f64 / (1024.0 * 1024.0)
+                                        ));
+                                    } else {
+                                        self.set_sync_detail(
+                                            "Subiendo checkpoint remoto a Telegram…",
+                                        );
+                                    }
+                                    self.log_sync_event(
+                                        "snapshot_upload_progress",
+                                        serde_json::json!({
+                                            "pendingMessageId": pending,
+                                            "fileId": file_id,
+                                            "uploadedBytes": uploaded,
+                                            "sizeBytes": total_bytes,
+                                            "uploadActive": file.remote.is_uploading_active,
+                                            "uploadComplete": file.remote.is_uploading_completed,
+                                            "elapsedSeconds": started.elapsed().as_secs(),
+                                            "secondsWithoutProgress": last_upload_progress.elapsed().as_secs(),
+                                        }),
+                                    );
+                                }
+                                Err(error) => self.log_sync_event(
+                                    "snapshot_file_probe_error",
+                                    serde_json::json!({
+                                        "pendingMessageId": pending,
+                                        "fileId": file_id,
+                                        "error": error.to_string(),
+                                    }),
+                                ),
+                            }
+                        }
+                    }
+                    Err(error) => self.log_sync_event(
+                        "snapshot_message_probe_error",
+                        serde_json::json!({
+                            "pendingMessageId": pending,
+                            "elapsedSeconds": started.elapsed().as_secs(),
+                            "error": error.to_string(),
+                        }),
+                    ),
+                }
+            }
+
+            // When TDLib has already replaced the temporary message id, get_message(old_id)
+            // may fail. Search the remote catalog marker as an independent confirmation.
+            if last_remote_probe.elapsed() >= Duration::from_secs(10) {
+                last_remote_probe = Instant::now();
+                if let Some((expected, _)) = expected_snapshot.as_ref() {
+                    match self.latest_catalog_snapshot(chat).await {
+                        Ok(Some((message_id, caption, _)))
+                            if caption.generated_at == expected.generated_at
+                                && caption.sha256.eq_ignore_ascii_case(&expected.sha256)
+                                && caption.documents == expected.documents =>
+                        {
+                            self.log_sync_event(
+                                "snapshot_send_recovered_by_remote_search",
+                                serde_json::json!({
+                                    "pendingMessageId": pending,
+                                    "messageId": message_id,
+                                    "elapsedSeconds": started.elapsed().as_secs(),
+                                }),
+                            );
+                            self.set_sync_detail(
+                                "Checkpoint remoto localizado y confirmado en Telegram.",
+                            );
+                            return Ok(message_id);
+                        }
+                        Ok(Some((message_id, caption, _))) => self.log_sync_event(
+                            "snapshot_remote_probe_old_snapshot",
+                            serde_json::json!({
+                                "pendingMessageId": pending,
+                                "visibleMessageId": message_id,
+                                "visibleGeneratedAt": caption.generated_at,
+                                "expectedGeneratedAt": expected.generated_at,
+                                "elapsedSeconds": started.elapsed().as_secs(),
+                            }),
+                        ),
+                        Ok(None) => self.log_sync_event(
+                            "snapshot_remote_probe_not_visible",
+                            serde_json::json!({
+                                "pendingMessageId": pending,
+                                "elapsedSeconds": started.elapsed().as_secs(),
+                            }),
+                        ),
+                        Err(error) if error == SYNC_CANCELLED_ERROR => return Err(error),
+                        Err(error) => self.log_sync_event(
+                            "snapshot_remote_probe_error",
+                            serde_json::json!({
+                                "pendingMessageId": pending,
+                                "elapsedSeconds": started.elapsed().as_secs(),
+                                "error": error,
+                            }),
+                        ),
+                    }
+                }
+            }
+
+            if started.elapsed() >= Duration::from_secs(90)
+                && last_upload_progress.elapsed() >= Duration::from_secs(90)
+            {
+                let error = "Telegram no mostró progreso al publicar el checkpoint remoto durante 90 segundos".to_string();
+                self.log_sync_event(
+                    "snapshot_send_stalled",
+                    serde_json::json!({
+                        "pendingMessageId": pending,
+                        "uploadedBytes": last_uploaded_bytes,
+                        "elapsedSeconds": started.elapsed().as_secs(),
+                        "error": error.clone(),
+                    }),
+                );
+                let _ = call(f::delete_messages(
+                    chat,
+                    vec![pending],
+                    true,
+                    self.client_id(),
+                ))
+                .await;
+                return Err(error);
+            }
+
+            tokio::time::sleep(Duration::from_millis(200)).await;
         }
+        self.log_sync_event(
+            "snapshot_send_timeout",
+            serde_json::json!({
+                "pendingMessageId": pending,
+                "elapsedSeconds": started.elapsed().as_secs(),
+            }),
+        );
+        let _ = call(f::delete_messages(
+            chat,
+            vec![pending],
+            true,
+            self.client_id(),
+        ))
+        .await;
         Err(timeout_message.to_string())
     }
 
@@ -1877,7 +2125,12 @@ impl TelegramService {
         chat: i64,
         cursor: i64,
     ) -> Result<(), String> {
-        if !repo.snapshot_publish_needed(chat, cursor)? {
+        let publish_needed = repo.snapshot_publish_needed(chat, cursor)?;
+        self.log_sync_event(
+            "snapshot_publish_decision",
+            serde_json::json!({ "cursor": cursor, "publishNeeded": publish_needed }),
+        );
+        if !publish_needed {
             return Ok(());
         }
 
@@ -1886,18 +2139,47 @@ impl TelegramService {
         self.ensure_sync_not_cancelled()?;
         let documents = snapshot.documents.len();
         let generated_at = snapshot.generated_at;
+        self.set_sync_detail(format!(
+            "Preparando checkpoint remoto con {documents} documentos…"
+        ));
+        self.log_sync_event(
+            "snapshot_exported",
+            serde_json::json!({
+                "cursor": cursor,
+                "documents": documents,
+                "generatedAt": generated_at,
+                "folders": snapshot.folders.len(),
+                "trashedMessages": snapshot.trashed_message_ids.len(),
+            }),
+        );
         let temp = tempfile::Builder::new()
             .prefix("nuvio-catalog-v2-")
             .tempdir()
             .map_err(|e| e.to_string())?;
         let path = temp.path().join("nuvio-catalog-v2.zip");
         let build_path = path.clone();
+        let build_started = Instant::now();
         let hash = tauri::async_runtime::spawn_blocking(move || {
             write_catalog_snapshot_zip(&snapshot, &build_path)?;
             sha256_file(&build_path).map_err(|e| e.to_string())
         })
         .await
         .map_err(|e| e.to_string())??;
+        let snapshot_bytes = fs::metadata(&path).map(|meta| meta.len()).unwrap_or(0);
+        self.set_sync_detail(format!(
+            "Checkpoint preparado ({:.1} MB). Enviando a Telegram…",
+            snapshot_bytes as f64 / (1024.0 * 1024.0)
+        ));
+        self.log_sync_event(
+            "snapshot_zip_ready",
+            serde_json::json!({
+                "cursor": cursor,
+                "documents": documents,
+                "bytes": snapshot_bytes,
+                "buildMs": build_started.elapsed().as_millis(),
+                "sha256": hash.clone(),
+            }),
+        );
         self.ensure_sync_not_cancelled()?;
         let caption = CatalogSnapshotCaption {
             v: 2,
@@ -1923,7 +2205,17 @@ impl TelegramService {
 
         self.ensure_sync_not_cancelled()?;
         let old_message = repo.snapshot_message_id(chat)?;
-        let e::Message::Message(message) = self
+        self.log_sync_event(
+            "snapshot_send_requested",
+            serde_json::json!({
+                "cursor": cursor,
+                "documents": documents,
+                "bytes": snapshot_bytes,
+                "previousSnapshotMessageId": old_message,
+            }),
+        );
+        let send_started = Instant::now();
+        let send_result = self
             .sync_call(f::send_message(
                 chat,
                 None,
@@ -1932,8 +2224,32 @@ impl TelegramService {
                 content,
                 self.client_id(),
             ))
-            .await?;
-        let message = self
+            .await;
+        let e::Message::Message(message) = match send_result {
+            Ok(message) => message,
+            Err(error) => {
+                self.log_sync_event(
+                    "snapshot_send_request_failed",
+                    serde_json::json!({
+                        "cursor": cursor,
+                        "elapsedMs": send_started.elapsed().as_millis(),
+                        "error": error,
+                    }),
+                );
+                return Err(error);
+            }
+        };
+        self.log_sync_event(
+            "snapshot_send_request_accepted",
+            serde_json::json!({
+                "cursor": cursor,
+                "pendingMessageId": message.id,
+                "elapsedMs": send_started.elapsed().as_millis(),
+                "sending": message.sending_state.is_some(),
+            }),
+        );
+        self.set_sync_detail("Telegram aceptó el checkpoint. Esperando confirmación de subida…");
+        let message_id = self
             .wait_sent_message(
                 chat,
                 message,
@@ -1941,16 +2257,35 @@ impl TelegramService {
                 "Telegram tardó demasiado en publicar el snapshot del catálogo",
             )
             .await?;
-        repo.mark_snapshot_published(chat, cursor, message.id)?;
+        repo.mark_snapshot_published(chat, cursor, message_id)?;
+        self.set_sync_detail("Checkpoint remoto guardado correctamente.");
+        self.log_sync_event(
+            "snapshot_checkpoint_committed",
+            serde_json::json!({
+                "cursor": cursor,
+                "messageId": message_id,
+                "documents": documents,
+            }),
+        );
 
-        if let Some(old_id) = old_message.filter(|old_id| *old_id > 0 && *old_id != message.id) {
-            let _ = call(f::delete_messages(
+        if let Some(old_id) = old_message.filter(|old_id| *old_id > 0 && *old_id != message_id) {
+            match call(f::delete_messages(
                 chat,
                 vec![old_id],
                 true,
                 self.client_id(),
             ))
-            .await;
+            .await
+            {
+                Ok(_) => self.log_sync_event(
+                    "snapshot_previous_deleted",
+                    serde_json::json!({ "messageId": old_id }),
+                ),
+                Err(error) => self.log_sync_event(
+                    "snapshot_previous_delete_failed",
+                    serde_json::json!({ "messageId": old_id, "error": error.to_string() }),
+                ),
+            }
         }
         Ok(())
     }
@@ -2715,6 +3050,11 @@ impl TelegramService {
     ) -> Result<usize, String> {
         let _gate = self.catalog_sync_gate.lock().await;
         self.reset_sync_cancel();
+        self.log_sync_event(
+            "sync_started",
+            serde_json::json!({ "verifyDeleted": verify_deleted }),
+        );
+        let sync_started = Instant::now();
         let mut progress = crate::progress::SyncRun::new(&self.sync_progress);
         Self::publish_sync_notification(
             true,
@@ -2761,6 +3101,29 @@ impl TelegramService {
                 Some(err),
             ),
         }
+        match result.as_ref() {
+            Ok(count) => self.log_sync_event(
+                "sync_completed",
+                serde_json::json!({
+                    "documents": count,
+                    "elapsedMs": sync_started.elapsed().as_millis(),
+                }),
+            ),
+            Err(error) if cancelled => self.log_sync_event(
+                "sync_cancelled",
+                serde_json::json!({
+                    "elapsedMs": sync_started.elapsed().as_millis(),
+                    "error": error,
+                }),
+            ),
+            Err(error) => self.log_sync_event(
+                "sync_failed",
+                serde_json::json!({
+                    "elapsedMs": sync_started.elapsed().as_millis(),
+                    "error": error,
+                }),
+            ),
+        }
         self.reset_sync_cancel();
         result
     }
@@ -2800,6 +3163,19 @@ impl TelegramService {
         let move_checkpoint = repo.sync_stream_checkpoint(chat, "moves", checkpoint)?;
         let trash_checkpoint = repo.sync_stream_checkpoint(chat, "trash", checkpoint)?;
         let delete_checkpoint = repo.sync_stream_checkpoint(chat, "deletes", checkpoint)?;
+        self.log_sync_event(
+            "sync_checkpoints_loaded",
+            serde_json::json!({
+                "general": checkpoint,
+                "documents": document_checkpoint,
+                "folders": folder_checkpoint,
+                "moves": move_checkpoint,
+                "trash": trash_checkpoint,
+                "deletes": delete_checkpoint,
+                "historyBackfillNeeded": history_backfill_needed,
+                "fastSearchBackfillNeeded": fast_search_backfill_needed,
+            }),
+        );
 
         // Folders, moves, trash and permanent-delete metadata are independent searches.
         // Give every stream its own checkpoint so delayed Telegram search indexing in
@@ -2960,12 +3336,26 @@ impl TelegramService {
         // Advance checkpoints only after every request and local reconciliation
         // succeeded. Metadata streams are independent from document search so a
         // delayed Telegram index in one stream cannot hide another stream's events.
+        self.log_sync_event(
+            "sync_checkpoint_commit_started",
+            serde_json::json!({
+                "documents": state.newest,
+                "folders": folder_newest,
+                "moves": move_newest,
+                "trash": trash_newest,
+                "deletes": delete_newest,
+            }),
+        );
         repo.save_sync_checkpoint(chat, state.newest)?;
         repo.save_sync_stream_checkpoint(chat, "documents", state.newest)?;
         repo.save_sync_stream_checkpoint(chat, "folders", folder_newest)?;
         repo.save_sync_stream_checkpoint(chat, "moves", move_newest)?;
         repo.save_sync_stream_checkpoint(chat, "trash", trash_newest)?;
         repo.save_sync_stream_checkpoint(chat, "deletes", delete_newest)?;
+        self.log_sync_event(
+            "sync_checkpoint_commit_completed",
+            serde_json::json!({ "documents": state.newest }),
+        );
         if history_backfill_needed {
             repo.mark_history_backfill_done(chat)?;
         }
@@ -2984,6 +3374,14 @@ impl TelegramService {
         .max()
         .unwrap_or(0);
         self.ensure_sync_not_cancelled()?;
+        self.log_sync_event(
+            "sync_snapshot_publish_started",
+            serde_json::json!({
+                "snapshotCursor": snapshot_cursor,
+                "documentsScanned": state.scanned,
+                "documentsTotal": state.total_documents,
+            }),
+        );
         progress.publishing();
         Self::publish_sync_notification(
             true,
@@ -2995,6 +3393,10 @@ impl TelegramService {
         );
         self.publish_catalog_snapshot_if_needed(repo, chat, snapshot_cursor)
             .await?;
+        self.log_sync_event(
+            "sync_snapshot_publish_completed",
+            serde_json::json!({ "snapshotCursor": snapshot_cursor }),
+        );
         progress.applying(state.total_documents, state.total_documents.max(1));
         Ok(imported_snapshot.saturating_add(state.total_documents))
     }

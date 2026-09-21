@@ -141,6 +141,7 @@ export type SyncProgress = {
   total?: number | null;
   percent?: number | null;
   etaSeconds?: number | null;
+  detail?: string | null;
   error?: string | null;
 };
 export type SyncDelta = {

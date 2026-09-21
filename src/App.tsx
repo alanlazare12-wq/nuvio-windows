@@ -855,6 +855,7 @@ function App() {
               syncBusy={syncBusy}
               cancelBusy={syncCancelBusy}
               onCancel={() => void handleStopSync()}
+              onDiagnostics={() => void handleExportDiagnostics()}
               onDismiss={() => setSyncDismissed(true)}
             />
           )}

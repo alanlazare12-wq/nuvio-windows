@@ -173,6 +173,8 @@ async function setup(viewport = { width: 1280, height: 820 }) {
         if (cmd === "prepare_thumbnail") return qa.thumbnails?.[args.id] ?? null;
         if (cmd === "telegram_auth_state") return { stage: "needsCredentials", connected: false, message: "Configura tus credenciales", isPremium: false };
         if (cmd === "plugin:dialog|open") return qa.uploadPaths ?? null;
+        if (cmd === "plugin:dialog|save") return "C:/QA/nuvio-diagnostics.json";
+        if (cmd === "export_diagnostics") { qa.diagnosticsExports = (qa.diagnosticsExports ?? 0) + 1; return; }
         if (cmd === "plugin:event|listen") return 1;
         if (cmd === "plugin:event|unlisten") return;
         if (cmd === "analyze_upload_selection") {
@@ -627,9 +629,12 @@ try {
       await expect(page.getByLabel("Progreso de sincronización")).toContainText("12 s");
       await page.evaluate(() => { window.__qa.syncProgress = { active: true, phase: "scanning", scanned: 70, percent: null }; });
       await expect(bar).not.toHaveAttribute("value");
-      await page.evaluate(() => { window.__qa.syncProgress = { active: true, phase: "publishing", scanned: 70, percent: 99, etaSeconds: null }; });
+      await page.evaluate(() => { window.__qa.syncProgress = { active: true, phase: "publishing", scanned: 70, percent: 99, etaSeconds: null, detail: "Subiendo checkpoint remoto: 2.0 / 4.0 MB (50%)" }; });
       await expect(page.getByLabel("Progreso de sincronización")).toContainText("Finalizando catálogo…");
+      await expect(page.getByLabel("Progreso de sincronización")).toContainText("2.0 / 4.0 MB (50%)");
       await expect(bar).toHaveAttribute("value", "99");
+      await page.getByRole("button", { name: "Exportar diagnóstico de sincronización" }).click();
+      await expect.poll(() => page.evaluate(() => window.__qa.diagnosticsExports ?? 0)).toBe(1);
       await page.evaluate(() => { window.__qa.syncProgress = { active: false, phase: "cancelled", scanned: 70, percent: 99, etaSeconds: null, error: null }; });
       await expect(page.getByLabel("Progreso de sincronización")).toContainText("Sincronización detenida");
       await page.evaluate(() => { window.__qa.syncProgress = { active: false, phase: "error", scanned: 70, percent: 63, error: "Sin conexión" }; });

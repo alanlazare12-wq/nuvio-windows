@@ -1,6 +1,6 @@
 [package]
 name = "nuviodrive-v1"
-version = "1.2.6"
+version = "1.2.7"
 description = "Nuvio private cloud client"
 authors = ["Nuvio"]
 edition = "2021"

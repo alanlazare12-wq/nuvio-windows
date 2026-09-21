@@ -1,10 +1,11 @@
 use std::collections::HashMap;
 use std::fs;
 use std::future::Future;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::time::timeout;
 
 use serde_json::Value;
@@ -179,11 +180,68 @@ pub struct TelegramService {
     pub(crate) realtime_notify: Arc<tokio::sync::Notify>,
     realtime_overflowed: Arc<AtomicBool>,
     file_updates: tokio::sync::broadcast::Sender<tdlib_rs::types::File>,
+    sync_log_path: PathBuf,
+    sync_log_guard: Mutex<()>,
 }
 
 impl TelegramService {
     pub(crate) fn client_id(&self) -> i32 {
         self.client_id_atomic.load(Ordering::SeqCst)
+    }
+
+    pub(crate) fn log_sync_event(&self, event: &str, details: serde_json::Value) {
+        const MAX_LOG_BYTES: u64 = 2 * 1024 * 1024;
+        let Ok(_guard) = self.sync_log_guard.lock() else {
+            return;
+        };
+        if self
+            .sync_log_path
+            .metadata()
+            .is_ok_and(|metadata| metadata.len() >= MAX_LOG_BYTES)
+        {
+            let rotated = self.sync_log_path.with_file_name("catalog-sync.log.1");
+            let _ = fs::remove_file(&rotated);
+            let _ = fs::rename(&self.sync_log_path, rotated);
+        }
+        let timestamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis();
+        let record = serde_json::json!({
+            "tsUnixMs": timestamp,
+            "scope": "catalog-sync",
+            "event": event,
+            "details": details,
+        });
+        let Ok(line) = serde_json::to_string(&record) else {
+            return;
+        };
+        if let Ok(mut file) = fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&self.sync_log_path)
+        {
+            let _ = writeln!(file, "{line}");
+        }
+    }
+
+    pub(crate) fn sync_log_tail(&self, max_bytes: usize) -> Result<String, String> {
+        let _guard = self
+            .sync_log_guard
+            .lock()
+            .map_err(|_| "No se pudo bloquear el log de sincronización".to_string())?;
+        if !self.sync_log_path.exists() {
+            return Ok(String::new());
+        }
+        let bytes = fs::read(&self.sync_log_path).map_err(|e| e.to_string())?;
+        if bytes.len() <= max_bytes {
+            return Ok(String::from_utf8_lossy(&bytes).into_owned());
+        }
+        let mut start = bytes.len().saturating_sub(max_bytes);
+        if let Some(relative) = bytes[start..].iter().position(|byte| *byte == b'\n') {
+            start = start.saturating_add(relative + 1);
+        }
+        Ok(String::from_utf8_lossy(&bytes[start..]).into_owned())
     }
 
     pub(crate) fn drain_realtime_updates(&self, limit: usize) -> Vec<TelegramRealtimeUpdate> {
@@ -287,6 +345,7 @@ impl TelegramService {
         let realtime_notify = Arc::new(tokio::sync::Notify::new());
         let realtime_overflowed = Arc::new(AtomicBool::new(false));
         let (file_updates, _) = tokio::sync::broadcast::channel(2048);
+        let sync_log_path = root.join("catalog-sync.log");
 
         let client_id_atomic = Arc::new(AtomicI32::new(tdlib_rs::create_client()));
         let cached = Arc::new(Mutex::new(TelegramAuthSnapshot::default()));
@@ -410,6 +469,8 @@ impl TelegramService {
             realtime_notify,
             realtime_overflowed,
             file_updates,
+            sync_log_path,
+            sync_log_guard: Mutex::new(()),
         })
     }
 

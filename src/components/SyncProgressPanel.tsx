@@ -1,4 +1,4 @@
-﻿import { Square, X } from "lucide-react";
+﻿import { FileText, Square, X } from "lucide-react";
 import type { SyncProgress } from "../types";
 
 export interface SyncProgressPanelProps {
@@ -6,6 +6,7 @@ export interface SyncProgressPanelProps {
   syncBusy: boolean;
   cancelBusy?: boolean;
   onCancel?: () => void;
+  onDiagnostics?: () => void;
   onDismiss?: () => void;
 }
 
@@ -14,6 +15,7 @@ export function SyncProgressPanel({
   syncBusy,
   cancelBusy = false,
   onCancel,
+  onDiagnostics,
   onDismiss,
 }: SyncProgressPanelProps) {
   if (!syncProgress?.phase && !syncBusy) return null;
@@ -60,6 +62,7 @@ export function SyncProgressPanel({
 
   const detailLabel =
     syncProgress?.error ||
+    syncProgress?.detail ||
     (active
       ? isFolders
         ? "Preparando estructura de carpetas antes de mostrar archivos…"
@@ -88,6 +91,17 @@ export function SyncProgressPanel({
         <strong>{title}</strong>
         <div style={{ display: "flex", alignItems: "center", gap: "8px" }}>
           <span>{percentLabel}</span>
+          {onDiagnostics && (
+            <button
+              className="secondary-button compact"
+              type="button"
+              onClick={onDiagnostics}
+              title="Exportar diagnóstico de sincronización"
+              aria-label="Exportar diagnóstico de sincronización"
+            >
+              <FileText size={12} /> Diagnóstico
+            </button>
+          )}
           {active && onCancel && (
             <button
               className="secondary-button compact"
