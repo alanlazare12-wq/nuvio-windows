@@ -2,6 +2,22 @@
 
 > Archivo de continuidad del proyecto. A partir del ciclo 1.2.3-dev se actualiza durante el desarrollo cada vez que se incorpora o corrige una funcionalidad relevante, antes de dar el trabajo por terminado. Cada entrada conserva decisiones técnicas, QA y pendientes para poder retomar el proyecto sin depender del historial del chat.
 
+## 1.2.7-dev — 2026-09-21 — Subidas grandes en serie y vigilancia por progreso
+
+### Transferencias
+
+- Diagnosticado el fallo de los respaldos divididos: un cliente TDLib reparte un único presupuesto de subida entre todos los archivos que envía a la vez, así que cuatro volúmenes de ~2 GB en paralelo avanzaban unos pocos MB por turno y ninguno llegaba a confirmarse.
+- Las subidas de 128 MB o más (`SERIAL_UPLOAD_MIN_BYTES`) pasan por un cupo serial de un permiso. Mientras una ocupa el canal, el worker sólo reclama transferencias por debajo de ese umbral (`claim_pending_under`); los demás volúmenes esperan en SQLite como `ready` en vez de ocupar un worker sin mover bytes. La concurrencia configurable sigue aplicando a los archivos pequeños.
+- El worker reclama primero las subidas que ya tienen mensaje en Telegram: TDLib sigue empujando sus bytes aunque Nuvio no las esté observando, así que reanudar una de ellas siempre es mejor que abrir una segunda subida que competiría por el mismo presupuesto. Las descargas siempre llevan `message_id`, por lo que conservan el orden de cola.
+- Sustituido el plazo fijo de una hora por transferencia —que mataba cualquier volumen grande en enlaces lentos aunque estuviera avanzando— por un vigilante de progreso: 20 min sin mover bytes, 30 min sin que Telegram confirme un archivo ya recibido completo, o un tope absoluto de 12 h. La muestra se compara por desigualdad porque TDLib reinicia una subida interrumpida desde un offset menor y reenviar esos bytes es progreso, no un bloqueo. Mismo vigilante para las descargas, que tenían el mismo plazo fijo.
+- El checkpoint del catálogo se sube con `preliminaryUploadFile` y prioridad explícita 32, y cancela su subida preliminar si el `sendMessage` falla, para que un snapshot pequeño no quede en 0 bytes detrás de las subidas del usuario ni acumule trabajo oculto en cada reintento.
+- El selector "Subidas simultáneas" aclara que aplica a los archivos pequeños, para que el ajuste no contradiga lo que el usuario ve con volúmenes grandes.
+
+### QA
+
+- Suite Rust: 110/110 aprobados, con tests nuevos para los turnos de volúmenes, la prioridad de reanudación y los umbrales del vigilante.
+- `pnpm lint:rust` (`clippy --all-targets -D warnings`), `pnpm check` y QA UI (20/20): aprobados.
+
 ## 1.2.5 — 2026-09-18 — Catálogo incremental, sincronización realtime y rendimiento masivo
 
 ### Arquitectura y sincronización

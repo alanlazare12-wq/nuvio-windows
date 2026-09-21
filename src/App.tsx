@@ -1043,7 +1043,7 @@ function App() {
                   <option value="max">Máximo · terminar antes</option>
                 </select>
               </label>}
-              {section !== "trash" && <label className="conflict-control">Subidas simultáneas
+              {section !== "trash" && <label className="conflict-control" title="Aplica a los archivos pequeños. Los mayores de 128 MB suben de uno en uno: Telegram reparte un mismo ancho de banda entre todo lo que envía y en paralelo ninguna parte llegaría a terminar.">Subidas simultáneas
                 <select aria-label="Subidas simultáneas" value={dashboard.settings.uploadConcurrency} onChange={(event) => void action(() => updateSetting("upload_concurrency", event.target.value))}>
                   {[1, 2, 4, 6, 8, 12, 16].map(value => <option key={value} value={value}>{value}</option>)}
                 </select>

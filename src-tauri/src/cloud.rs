@@ -16,8 +16,62 @@ use std::{
 };
 
 const SYNC_CANCELLED_ERROR: &str = "Sincronización detenida por el usuario";
+const CATALOG_SNAPSHOT_UPLOAD_PRIORITY: i32 = 32;
+
 use tdlib_rs::{enums as e, functions as f, types as t};
 use zip::{write::SimpleFileOptions, CompressionMethod, ZipArchive, ZipWriter};
+
+/// A TDLib client pushes every file it is sending through one shared upload
+/// budget. When several multi-gigabyte documents are queued at the same time
+/// that budget is split between all of them, so each volume advances a few
+/// megabytes, TDLib rotates to the next one, and none of them ever reaches
+/// 100%: the whole batch crawls until every job gives up. Uploads at or above
+/// this size therefore take turns — one pushes bytes while the rest stay
+/// queued, which is also strictly faster end to end because a finished volume
+/// is a confirmed volume.
+pub const SERIAL_UPLOAD_MIN_BYTES: i64 = 128 * 1024 * 1024;
+
+/// A 2 GB volume on a slow uplink legitimately takes hours, so elapsed time
+/// alone cannot decide whether a transfer is broken: only the lack of progress
+/// can. These bound the three ways a transfer can stop being useful.
+const TRANSFER_STALL_TIMEOUT: Duration = Duration::from_secs(20 * 60);
+const UPLOAD_CONFIRM_TIMEOUT: Duration = Duration::from_secs(30 * 60);
+const TRANSFER_MAX_RUNTIME: Duration = Duration::from_secs(12 * 60 * 60);
+
+/// Returns the error to fail an upload attempt with, or `None` to keep waiting.
+/// `confirming_for` is set once Telegram has received every byte and Nuvio is
+/// only waiting for the message to be confirmed.
+fn upload_timeout_reason(
+    elapsed: Duration,
+    since_progress: Duration,
+    confirming_for: Option<Duration>,
+) -> Option<&'static str> {
+    if elapsed >= TRANSFER_MAX_RUNTIME {
+        return Some("La subida excedió el tiempo máximo de confirmación.");
+    }
+    match confirming_for {
+        Some(waiting) if waiting >= UPLOAD_CONFIRM_TIMEOUT => {
+            Some("Telegram recibió el archivo pero no confirmó el mensaje. Nuvio lo reintentará.")
+        }
+        Some(_) => None,
+        None if since_progress >= TRANSFER_STALL_TIMEOUT => {
+            Some("La subida dejó de avanzar. Nuvio la reintentará sin perder lo ya enviado.")
+        }
+        None => None,
+    }
+}
+
+/// Same contract as [`upload_timeout_reason`] for the download direction, which
+/// has no confirmation phase of its own.
+fn download_timeout_reason(elapsed: Duration, since_progress: Duration) -> Option<&'static str> {
+    if elapsed >= TRANSFER_MAX_RUNTIME {
+        return Some("La descarga excedió el tiempo máximo permitido.");
+    }
+    if since_progress >= TRANSFER_STALL_TIMEOUT {
+        return Some("La descarga dejó de avanzar. Nuvio la reintentará.");
+    }
+    None
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RemoteDocument {
@@ -241,10 +295,7 @@ fn parse_catalog_snapshot_caption(text: &str) -> Option<CatalogSnapshotCaption> 
     Some(caption)
 }
 
-fn catalog_snapshot_message(message: &t::Message) -> Option<(CatalogSnapshotCaption, t::File)> {
-    if message.sending_state.is_some() {
-        return None;
-    }
+fn catalog_snapshot_payload(message: &t::Message) -> Option<(CatalogSnapshotCaption, t::File)> {
     let e::MessageContent::MessageDocument(content) = &message.content else {
         return None;
     };
@@ -257,6 +308,13 @@ fn catalog_snapshot_message(message: &t::Message) -> Option<(CatalogSnapshotCapt
         return None;
     }
     Some((caption, file))
+}
+
+fn catalog_snapshot_message(message: &t::Message) -> Option<(CatalogSnapshotCaption, t::File)> {
+    if message.sending_state.is_some() {
+        return None;
+    }
+    catalog_snapshot_payload(message)
 }
 
 struct HistoryScanState {
@@ -1052,6 +1110,24 @@ impl CatalogRepository {
     }
 
     pub fn claim_pending(&self, direction: &str) -> Result<Option<WorkItem>, RepositoryError> {
+        self.claim_pending_under(direction, None)
+    }
+
+    /// `size_limit` skips jobs of at least that many bytes. The worker uses it to
+    /// keep claiming small transfers while a large one already owns the shared
+    /// TDLib upload budget, instead of parking a big volume in `uploading` with
+    /// no bytes moving.
+    ///
+    /// Uploads that already have a Telegram message are claimed first: TDLib keeps
+    /// pushing their bytes in the background whether or not Nuvio is watching, so
+    /// resuming one of those is always better than opening a second upload that
+    /// would have to share the same budget. Downloads always carry a message id,
+    /// so for them the order stays the queue order.
+    pub fn claim_pending_under(
+        &self,
+        direction: &str,
+        size_limit: Option<i64>,
+    ) -> Result<Option<WorkItem>, RepositoryError> {
         let mut c = self.connection.lock().expect("catalog");
         let tx = c.transaction()?;
         let wanted = if direction == "upload" {
@@ -1067,8 +1143,9 @@ impl CatalogRepository {
                  LEFT JOIN transfer_pending p ON p.id=t.id
                  LEFT JOIN transfer_folders tf ON tf.transfer_id=t.id
                  WHERE t.direction=?1 AND t.status=?2 AND m.encrypted=0
-                 ORDER BY t.rowid LIMIT 1",
-                params![direction, wanted],
+                   AND (?3 IS NULL OR m.size_bytes < ?3)
+                 ORDER BY (COALESCE(p.message_id,0)=0), t.rowid LIMIT 1",
+                params![direction, wanted, size_limit],
                 |r| {
                     Ok(WorkItem {
                         id: r.get(0)?,
@@ -1846,8 +1923,11 @@ impl TelegramService {
         timeout_message: &str,
     ) -> Result<i64, String> {
         let pending = message.id;
+        // Pending messages intentionally have a sending_state, so the strict remote
+        // snapshot parser rejects them. We still need their caption and TDLib file id
+        // to observe upload progress while the message is being sent.
         let expected_snapshot =
-            catalog_snapshot_message(&message).map(|(caption, file)| (caption, file.id));
+            catalog_snapshot_payload(&message).map(|(caption, file)| (caption, file.id));
         if message.sending_state.is_none() {
             self.log_sync_event(
                 "snapshot_send_confirmed_immediately",
@@ -1961,7 +2041,7 @@ impl TelegramService {
                             return Err(error);
                         }
 
-                        let file_id = catalog_snapshot_message(&current)
+                        let file_id = catalog_snapshot_payload(&current)
                             .map(|(_, file)| file.id)
                             .or_else(|| expected_snapshot.as_ref().map(|(_, file_id)| *file_id));
                         if let Some(file_id) = file_id {
@@ -2191,9 +2271,33 @@ impl TelegramService {
             "#NuvioCatalog2 {}",
             serde_json::to_string(&caption).map_err(|e| e.to_string())?
         );
+        // Give this small consistency checkpoint precedence over multi-gigabyte user
+        // uploads already queued in TDLib. Without an explicit priority, four active
+        // split-volume uploads can leave the checkpoint at 0 bytes indefinitely and
+        // every sync retry adds another doomed temporary message to the same queue.
+        let e::File::File(preliminary_file) = self
+            .sync_call(f::preliminary_upload_file(
+                e::InputFile::Local(t::InputFileLocal {
+                    path: path.to_string_lossy().into_owned(),
+                }),
+                Some(e::FileType::Document),
+                CATALOG_SNAPSHOT_UPLOAD_PRIORITY,
+                self.client_id(),
+            ))
+            .await?;
+        let snapshot_file_id = preliminary_file.id;
+        self.log_sync_event(
+            "snapshot_upload_prioritized",
+            serde_json::json!({
+                "cursor": cursor,
+                "fileId": snapshot_file_id,
+                "priority": CATALOG_SNAPSHOT_UPLOAD_PRIORITY,
+                "bytes": snapshot_bytes,
+            }),
+        );
         let content = e::InputMessageContent::InputMessageDocument(t::InputMessageDocument {
-            document: e::InputFile::Local(t::InputFileLocal {
-                path: path.to_string_lossy().into_owned(),
+            document: e::InputFile::Id(t::InputFileId {
+                id: snapshot_file_id,
             }),
             thumbnail: None,
             disable_content_type_detection: true,
@@ -2228,6 +2332,17 @@ impl TelegramService {
         let e::Message::Message(message) = match send_result {
             Ok(message) => message,
             Err(error) => {
+                // Explicit request failures leave a preliminary upload with no message
+                // to consume it. Stop it so a retry doesn't accumulate hidden work.
+                // On a transport timeout the request may still have reached TDLib, so
+                // preserve the file and let normal recovery locate the message.
+                if !error.contains("45 segundos") {
+                    let _ = call(f::cancel_preliminary_upload_file(
+                        snapshot_file_id,
+                        self.client_id(),
+                    ))
+                    .await;
+                }
                 self.log_sync_event(
                     "snapshot_send_request_failed",
                     serde_json::json!({
@@ -3562,13 +3677,29 @@ impl TelegramService {
             }
         }
 
-        let deadline = Instant::now() + Duration::from_secs(3600);
+        let started_at = Instant::now();
         let mut estimator = SpeedEstimator::new(0);
         let mut last_uploaded = 0_i64;
         let mut last_progress_at = Instant::now();
+        // Only byte movement resets the watchdog. `last_progress_at` above still
+        // drives the UI label and is refreshed by confirmation samples too, which
+        // would otherwise mask an upload that stopped advancing. The sample is
+        // compared for inequality rather than growth because TDLib restarts an
+        // interrupted upload from a lower offset, and re-sending those bytes is
+        // progress, not a stall.
+        let mut last_sample = 0_i64;
+        let mut last_advance_at = Instant::now();
+        let mut confirming_since: Option<Instant> = None;
         let mut waiting_reported = false;
         let mut last_message_probe = Instant::now() - Duration::from_secs(5);
-        while Instant::now() < deadline {
+        loop {
+            if let Some(reason) = upload_timeout_reason(
+                started_at.elapsed(),
+                last_advance_at.elapsed(),
+                confirming_since.map(|since| since.elapsed()),
+            ) {
+                return Err(reason.into());
+            }
             let control = repo.transfer_control(&job.id).map_err(|e| e.to_string())?;
             if control.pause_requested || control.cancel_requested {
                 if pending > 0 {
@@ -3653,6 +3784,15 @@ impl TelegramService {
                     } else {
                         "uploading"
                     };
+                    if uploaded != last_sample {
+                        last_sample = uploaded;
+                        last_advance_at = Instant::now();
+                    }
+                    if phase == "confirming" {
+                        confirming_since.get_or_insert_with(Instant::now);
+                    } else {
+                        confirming_since = None;
+                    }
                     if uploaded > last_uploaded || phase == "confirming" {
                         let speed = estimator.update(uploaded);
                         let eta = SpeedEstimator::eta(job.size, uploaded, speed);
@@ -3699,7 +3839,6 @@ impl TelegramService {
                 tokio::time::sleep(Duration::from_secs(1)).await;
             }
         }
-        Err("La subida excedió el tiempo máximo de confirmación.".into())
     }
 
     pub async fn run_download(
@@ -3720,10 +3859,17 @@ impl TelegramService {
         let mut file_updates = self.subscribe_file_updates();
         let e::File::File(mut file) =
             call(f::download_file(file_id, 16, 0, 0, false, self.client_id())).await?;
-        let deadline = Instant::now() + Duration::from_secs(3600);
+        let started_at = Instant::now();
         let mut estimator = SpeedEstimator::new(0);
+        let mut last_downloaded = 0_i64;
+        let mut last_advance_at = Instant::now();
 
-        while Instant::now() < deadline {
+        loop {
+            if let Some(reason) =
+                download_timeout_reason(started_at.elapsed(), last_advance_at.elapsed())
+            {
+                return Err(reason.into());
+            }
             let control = repo.transfer_control(&job.id).map_err(|e| e.to_string())?;
             if control.pause_requested || control.cancel_requested {
                 let _ = call(f::cancel_download_file(file_id, false, self.client_id())).await;
@@ -3775,6 +3921,10 @@ impl TelegramService {
                 return Err("La descarga se interrumpió. Nuvio intentará reanudarla.".into());
             }
             let downloaded = file.local.downloaded_size.clamp(0, job.size.max(0));
+            if downloaded != last_downloaded {
+                last_downloaded = downloaded;
+                last_advance_at = Instant::now();
+            }
             let speed = estimator.update(downloaded);
             let eta = SpeedEstimator::eta(job.size, downloaded, speed);
             repo.update_runtime(
@@ -3793,7 +3943,6 @@ impl TelegramService {
                 .next_file_update(&mut file_updates, file_id, Duration::from_secs(1))
                 .await?;
         }
-        Err("La descarga excedió el tiempo máximo permitido.".into())
     }
 }
 
@@ -4682,5 +4831,119 @@ mod tests {
                 .unwrap()
                 .favorite
         );
+    }
+
+    #[test]
+    fn large_uploads_take_turns_while_small_ones_keep_flowing() {
+        let root = tempfile::tempdir().unwrap();
+        let repo = CatalogRepository::open(&root.path().join("db")).unwrap();
+        repo.init_cloud().unwrap();
+        let volume = SERIAL_UPLOAD_MIN_BYTES + 1;
+        for (id, size, hash) in [
+            ("volume-1", volume, "aa"),
+            ("volume-2", volume, "bb"),
+            ("note", 2048, "cc"),
+        ] {
+            repo.create_upload_placeholder_in_folder(
+                id,
+                &format!("{id}.bin"),
+                &format!("C:/origen/{id}.bin"),
+                None,
+                size,
+                None,
+                false,
+            )
+            .unwrap();
+            repo.finish_preparation(id, &format!("C:/staging/{id}.bin"), hash, size, false)
+                .unwrap();
+        }
+
+        // A worker that cannot take the serial slot skips both volumes instead of
+        // starting a second upload that would only steal bandwidth from the first.
+        let job = repo
+            .claim_pending_under("upload", Some(SERIAL_UPLOAD_MIN_BYTES))
+            .unwrap()
+            .unwrap();
+        assert_eq!(job.id, "note");
+        assert!(repo
+            .claim_pending_under("upload", Some(SERIAL_UPLOAD_MIN_BYTES))
+            .unwrap()
+            .is_none());
+
+        // With the slot free the oldest volume goes first, and the next one keeps
+        // waiting in SQLite rather than sharing the upload budget.
+        assert_eq!(
+            repo.claim_pending_under("upload", None)
+                .unwrap()
+                .unwrap()
+                .id,
+            "volume-1"
+        );
+        assert!(repo
+            .claim_pending_under("upload", Some(SERIAL_UPLOAD_MIN_BYTES))
+            .unwrap()
+            .is_none());
+        assert_eq!(
+            repo.claim_pending_under("upload", None)
+                .unwrap()
+                .unwrap()
+                .id,
+            "volume-2"
+        );
+    }
+
+    #[test]
+    fn an_upload_already_flying_in_telegram_is_resumed_before_a_new_one_starts() {
+        let root = tempfile::tempdir().unwrap();
+        let repo = CatalogRepository::open(&root.path().join("db")).unwrap();
+        repo.init_cloud().unwrap();
+        for (id, hash) in [("first", "aa"), ("second", "bb")] {
+            repo.create_upload_placeholder_in_folder(
+                id,
+                &format!("{id}.bin"),
+                &format!("C:/origen/{id}.bin"),
+                None,
+                4096,
+                None,
+                false,
+            )
+            .unwrap();
+            repo.finish_preparation(id, &format!("C:/staging/{id}.bin"), hash, 4096, false)
+                .unwrap();
+        }
+        // A reserved row with no message id yet is not an upload in flight, while a
+        // sent-but-unconfirmed message is one TDLib keeps pushing on its own. The
+        // second transfer therefore wins the next worker despite being queued last.
+        repo.set_pending("first", 0).unwrap();
+        repo.set_pending("second", 77).unwrap();
+        let resumed = repo.claim_pending("upload").unwrap().unwrap();
+        assert_eq!(resumed.id, "second");
+        assert_eq!(resumed.pending, Some(77));
+        assert_eq!(repo.claim_pending("upload").unwrap().unwrap().id, "first");
+    }
+
+    #[test]
+    fn transfer_watchdog_tracks_progress_instead_of_wall_clock() {
+        let minute = Duration::from_secs(60);
+
+        // Hours of honest progress are not a failure: a 2 GB volume on a slow
+        // uplink is exactly this shape.
+        assert!(upload_timeout_reason(Duration::from_secs(11 * 3600), minute, None).is_none());
+        assert!(upload_timeout_reason(TRANSFER_MAX_RUNTIME, Duration::ZERO, None).is_some());
+        assert!(upload_timeout_reason(minute, TRANSFER_STALL_TIMEOUT, None).is_some());
+
+        // Telegram assembling an already received volume is not a stall...
+        assert!(upload_timeout_reason(minute, TRANSFER_STALL_TIMEOUT, Some(minute)).is_none());
+        // ...but it cannot hang there forever either.
+        assert!(upload_timeout_reason(
+            minute,
+            TRANSFER_STALL_TIMEOUT,
+            Some(UPLOAD_CONFIRM_TIMEOUT)
+        )
+        .is_some());
+
+        assert!(download_timeout_reason(Duration::from_secs(11 * 3600), minute).is_none());
+        assert!(download_timeout_reason(minute, TRANSFER_STALL_TIMEOUT).is_some());
+        assert!(download_timeout_reason(TRANSFER_MAX_RUNTIME, Duration::ZERO).is_some());
     }
 }

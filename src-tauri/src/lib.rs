@@ -113,6 +113,9 @@ struct AppState {
     compression_slots: Arc<DynamicLimiter>,
     heavy_io_slots: Arc<DynamicLimiter>,
     upload_slots: Arc<DynamicLimiter>,
+    // Only one large upload may hold the shared TDLib upload budget at a time.
+    // See cloud::SERIAL_UPLOAD_MIN_BYTES.
+    serial_upload_slots: Arc<DynamicLimiter>,
     download_slots: Arc<DynamicLimiter>,
     worker_wake: Arc<tokio::sync::Notify>,
     sync_lock: tokio::sync::Mutex<()>,
@@ -1772,25 +1775,43 @@ async fn worker(state: Arc<AppState>) {
                 drop(permit);
                 break;
             };
-            match state.repository.claim_pending("upload") {
+            // TDLib shares one upload budget between every file it is sending, so a
+            // second multi-gigabyte document would only steal bandwidth from the
+            // first and leave both unfinished. Without a free serial slot keep
+            // claiming small transfers only; the big ones stay queued in SQLite
+            // instead of occupying a worker with no bytes moving.
+            let serial_permit = state.serial_upload_slots.try_acquire();
+            let size_limit = match serial_permit {
+                Some(_) => None,
+                None => Some(cloud::SERIAL_UPLOAD_MIN_BYTES),
+            };
+            match state.repository.claim_pending_under("upload", size_limit) {
                 Ok(Some(job)) => {
+                    // A small transfer must hand the serial slot back right away so a
+                    // queued volume can start on the next iteration.
+                    let serial_permit =
+                        serial_permit.filter(|_| job.size >= cloud::SERIAL_UPLOAD_MIN_BYTES);
                     let owned = state.clone();
                     let wake = owned.worker_wake.clone();
                     tauri::async_runtime::spawn(async move {
                         let upload_permit = permit;
                         let io_permit = heavy_io_permit;
+                        let serial_permit = serial_permit;
                         run_job(owned, job).await;
+                        drop(serial_permit);
                         drop(io_permit);
                         drop(upload_permit);
                         wake.notify_one();
                     });
                 }
                 Ok(None) => {
+                    drop(serial_permit);
                     drop(heavy_io_permit);
                     drop(permit);
                     break;
                 }
                 Err(error) => {
+                    drop(serial_permit);
                     drop(heavy_io_permit);
                     drop(permit);
                     *state.background_error.lock().expect("background") = Some(error.to_string());
@@ -2105,6 +2126,7 @@ pub fn run() {
                     16,
                 ),
                 upload_slots: DynamicLimiter::new(settings.upload_concurrency, 16),
+                serial_upload_slots: DynamicLimiter::new(1, 1),
                 download_slots: DynamicLimiter::new(settings.download_concurrency, 8),
                 worker_wake: Arc::new(tokio::sync::Notify::new()),
                 sync_lock: tokio::sync::Mutex::new(()),
