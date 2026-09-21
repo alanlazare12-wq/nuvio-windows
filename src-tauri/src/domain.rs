@@ -96,6 +96,7 @@ pub struct AppSettings {
     pub conflict_policy: String,
     pub delete_original_after_upload: bool,
     pub speed_limit_bps: Option<i64>,
+    pub resource_profile: String,
 }
 
 impl Default for AppSettings {
@@ -109,6 +110,7 @@ impl Default for AppSettings {
             conflict_policy: "skip".to_string(),
             delete_original_after_upload: false,
             speed_limit_bps: None,
+            resource_profile: "balanced".to_string(),
         }
     }
 }

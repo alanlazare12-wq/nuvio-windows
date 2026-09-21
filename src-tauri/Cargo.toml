@@ -1,6 +1,6 @@
 [package]
 name = "nuviodrive-v1"
-version = "1.2.5"
+version = "1.2.6"
 description = "Nuvio private cloud client"
 authors = ["Nuvio"]
 edition = "2021"
@@ -40,7 +40,7 @@ qrcode = { version = "0.14", default-features = false, features = ["svg"] }
 tauri-plugin-notification = "2"
 
 [target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.61", features = ["Win32_Security_Cryptography", "Win32_System_Memory"] }
+windows-sys = { version = "0.61", features = ["Win32_Security_Cryptography", "Win32_System_Memory", "Win32_System_Threading"] }
 
 [target.'cfg(target_os = "android")'.dependencies]
 tdlib-rs = { version = "1.4.0", features = ["download-tdlib", "static"] }

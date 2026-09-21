@@ -352,6 +352,7 @@ impl CatalogRepository {
             INSERT OR IGNORE INTO app_settings VALUES ('conflict_policy','skip');
             INSERT OR IGNORE INTO app_settings VALUES ('delete_original_after_upload','0');
             INSERT OR IGNORE INTO app_settings VALUES ('speed_limit_bps','');
+            INSERT OR IGNORE INTO app_settings VALUES ('resource_profile','balanced');
 
             CREATE TABLE IF NOT EXISTS media_cache_entries (
                 path TEXT PRIMARY KEY NOT NULL,
@@ -1432,7 +1433,7 @@ impl CatalogRepository {
         let rows = statement.query_map([], |row| {
             Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
         })?;
-        let mut values = HashMap::with_capacity(8);
+        let mut values = HashMap::with_capacity(9);
         for row in rows {
             let (key, value) = row?;
             values.insert(key, value);
@@ -1466,6 +1467,10 @@ impl CatalogRepository {
             .filter(|v| !v.is_empty())
             .and_then(|v| v.parse::<i64>().ok())
             .filter(|v| *v > 0);
+        let resource_profile = get("resource_profile")
+            .filter(|v| matches!(*v, "low" | "balanced" | "max"))
+            .map(str::to_owned)
+            .unwrap_or(defaults.resource_profile);
         Ok(AppSettings {
             preparation_concurrency: prep,
             upload_concurrency: upload,
@@ -1475,6 +1480,7 @@ impl CatalogRepository {
             conflict_policy: conflict,
             delete_original_after_upload,
             speed_limit_bps,
+            resource_profile,
         })
     }
 
@@ -1488,6 +1494,7 @@ impl CatalogRepository {
             "conflict_policy",
             "delete_original_after_upload",
             "speed_limit_bps",
+            "resource_profile",
         ];
         if !ALLOWED.contains(&key) {
             return Err(RepositoryError::Database(
@@ -3442,6 +3449,25 @@ mod tests {
                 .unwrap()
                 .upload_concurrency,
             8
+        );
+    }
+
+    #[test]
+    fn resource_profile_defaults_to_balanced_and_persists() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("db");
+        let repo = CatalogRepository::open(&path).unwrap();
+        assert_eq!(repo.settings().unwrap().resource_profile, "balanced");
+        repo.set_setting("resource_profile", "low").unwrap();
+        assert_eq!(repo.settings().unwrap().resource_profile, "low");
+        drop(repo);
+        assert_eq!(
+            CatalogRepository::open(&path)
+                .unwrap()
+                .settings()
+                .unwrap()
+                .resource_profile,
+            "low"
         );
     }
 }

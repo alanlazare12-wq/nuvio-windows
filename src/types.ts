@@ -119,6 +119,7 @@ export type AppSettings = {
   conflictPolicy: "skip" | "rename";
   deleteOriginalAfterUpload: boolean;
   speedLimitBps?: number | null;
+  resourceProfile: "low" | "balanced" | "max";
 };
 
 export type SyncPhase =

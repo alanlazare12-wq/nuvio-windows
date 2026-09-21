@@ -1035,6 +1035,13 @@ function App() {
                 </>}
                 <button className="secondary-button" onClick={() => setSelectedFiles(new Set())}>Limpiar</button>
               </>}
+              {section !== "trash" && <label className="conflict-control" title="Controla cuánto CPU y disco puede usar Nuvio al comprimir o dividir archivos grandes">Uso de recursos
+                <select aria-label="Uso de recursos" value={dashboard.settings.resourceProfile} onChange={(event) => void action(() => updateSetting("resource_profile", event.target.value))}>
+                  <option value="low">Bajo · PC más fluida</option>
+                  <option value="balanced">Equilibrado</option>
+                  <option value="max">Máximo · terminar antes</option>
+                </select>
+              </label>}
               {section !== "trash" && <label className="conflict-control">Subidas simultáneas
                 <select aria-label="Subidas simultáneas" value={dashboard.settings.uploadConcurrency} onChange={(event) => void action(() => updateSetting("upload_concurrency", event.target.value))}>
                   {[1, 2, 4, 6, 8, 12, 16].map(value => <option key={value} value={value}>{value}</option>)}

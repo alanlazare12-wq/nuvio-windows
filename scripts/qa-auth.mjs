@@ -42,7 +42,7 @@ async function setup(viewport = { width: 1280, height: 820 }) {
             favoriteCount: qa.files.filter(file => file.favorite && !file.trashed).length, trashCount: qa.files.filter(file => file.trashed).length, recentCount: qa.files.filter(file => !file.trashed).length,
             telegramConnected: true, telegramAccountLabel: "Cuenta QA", providerStatus: "Conectado · entorno de pruebas",
             queueSummary: { total: 0, completed: 0, pending: 0, failed: 0, active: 0, processedBytes: 0, totalBytes: 0, speedBps: 0, cacheBytes: 0, cacheLimitBytes: 2147483648 },
-            settings: { preparationConcurrency: 2, uploadConcurrency: 1, downloadConcurrency: 2, cacheLimitBytes: 2147483648, rememberSession: false, conflictPolicy: "skip", deleteOriginalAfterUpload: false },
+            settings: { preparationConcurrency: 2, uploadConcurrency: 1, downloadConcurrency: 2, cacheLimitBytes: 2147483648, rememberSession: false, conflictPolicy: "skip", deleteOriginalAfterUpload: false, resourceProfile: "balanced" },
             catalogCursor: qa.syncCursor,
             historyCursor: qa.historyCursor,
           };
@@ -55,7 +55,7 @@ async function setup(viewport = { width: 1280, height: 820 }) {
             favoriteCount: qa.files.filter(file => file.favorite && !file.trashed).length, trashCount: qa.files.filter(file => file.trashed).length, recentCount: qa.files.filter(file => !file.trashed).length,
             telegramConnected: true, telegramAccountLabel: "Cuenta QA", providerStatus: "Conectado · entorno de pruebas",
             queueSummary: { total: 0, completed: 0, pending: 0, failed: 0, active: 0, processedBytes: 0, totalBytes: 0, speedBps: 0, cacheBytes: 0, cacheLimitBytes: 2147483648 },
-            settings: { preparationConcurrency: 2, uploadConcurrency: 1, downloadConcurrency: 2, cacheLimitBytes: 2147483648, rememberSession: false, conflictPolicy: "skip", deleteOriginalAfterUpload: false },
+            settings: { preparationConcurrency: 2, uploadConcurrency: 1, downloadConcurrency: 2, cacheLimitBytes: 2147483648, rememberSession: false, conflictPolicy: "skip", deleteOriginalAfterUpload: false, resourceProfile: "balanced" },
             catalogCursor: qa.syncCursor,
             historyCursor: qa.historyCursor,
           };

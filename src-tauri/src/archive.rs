@@ -4,12 +4,193 @@ use std::{
     fs::{self, File, OpenOptions},
     io::{self, Read, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
-    time::{Instant, SystemTime},
+    time::{Duration, Instant, SystemTime},
 };
 use zip::{write::SimpleFileOptions, CompressionMethod, ZipArchive, ZipWriter};
 
 pub const ZIP_LIMIT: u64 = 2_000_000_000;
 const SPLIT_MANIFEST_NAME: &str = "NUVIO-SPLIT-MANIFEST.json";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ResourceProfile {
+    Low,
+    Balanced,
+    Max,
+}
+
+impl ResourceProfile {
+    pub fn from_setting(value: &str) -> Self {
+        match value {
+            "low" => Self::Low,
+            "max" => Self::Max,
+            _ => Self::Balanced,
+        }
+    }
+
+    pub fn compression_concurrency(self) -> usize {
+        match self {
+            Self::Low | Self::Balanced => 1,
+            Self::Max => 2,
+        }
+    }
+
+    pub fn heavy_io_concurrency(self) -> usize {
+        match self {
+            Self::Low => 2,
+            Self::Balanced => 4,
+            Self::Max => 16,
+        }
+    }
+
+    fn pause_after_bytes(self) -> u64 {
+        match self {
+            Self::Low => 2 * 1024 * 1024,
+            Self::Balanced => 8 * 1024 * 1024,
+            Self::Max => u64::MAX,
+        }
+    }
+
+    fn pause_duration(self) -> Duration {
+        match self {
+            Self::Low => Duration::from_millis(4),
+            Self::Balanced => Duration::from_millis(1),
+            Self::Max => Duration::ZERO,
+        }
+    }
+
+    pub(crate) fn throttle(self, bytes_since_pause: &mut u64, processed: usize) {
+        if self == Self::Max {
+            return;
+        }
+        *bytes_since_pause = bytes_since_pause.saturating_add(processed as u64);
+        if *bytes_since_pause < self.pause_after_bytes() {
+            return;
+        }
+        *bytes_since_pause = 0;
+        std::thread::yield_now();
+        let pause = self.pause_duration();
+        if !pause.is_zero() {
+            std::thread::sleep(pause);
+        }
+    }
+}
+
+pub fn compression_concurrency(setting: &str) -> usize {
+    ResourceProfile::from_setting(setting).compression_concurrency()
+}
+
+pub fn heavy_io_concurrency(setting: &str) -> usize {
+    ResourceProfile::from_setting(setting).heavy_io_concurrency()
+}
+
+struct ResourceGovernor {
+    profile: ResourceProfile,
+    bytes_since_pause: u64,
+}
+
+impl ResourceGovernor {
+    fn new(profile: ResourceProfile) -> Self {
+        Self {
+            profile,
+            bytes_since_pause: 0,
+        }
+    }
+
+    fn checkpoint(&mut self, processed: usize) {
+        self.profile
+            .throttle(&mut self.bytes_since_pause, processed);
+    }
+}
+
+#[cfg(windows)]
+struct ThreadPriorityGuard {
+    previous: i32,
+    background_mode: bool,
+    changed_priority: bool,
+}
+
+#[cfg(windows)]
+impl ThreadPriorityGuard {
+    fn new(profile: ResourceProfile) -> Self {
+        use windows_sys::Win32::System::Threading::{
+            GetCurrentThread, GetThreadPriority, SetThreadPriority, THREAD_MODE_BACKGROUND_BEGIN,
+            THREAD_PRIORITY_BELOW_NORMAL, THREAD_PRIORITY_LOWEST,
+        };
+        // Windows background mode lowers both CPU scheduling priority and I/O priority
+        // for the current blocking-pool thread. That matters more than CPU priority alone:
+        // multi-GB ZIP writes should not monopolize the storage queue and make Explorer or
+        // the desktop feel frozen. Max mode deliberately leaves the thread untouched.
+        unsafe {
+            let thread = GetCurrentThread();
+            let previous = GetThreadPriority(thread);
+            if profile == ResourceProfile::Max {
+                return Self {
+                    previous,
+                    background_mode: false,
+                    changed_priority: false,
+                };
+            }
+
+            let background_mode = SetThreadPriority(thread, THREAD_MODE_BACKGROUND_BEGIN) != 0;
+            if background_mode {
+                return Self {
+                    previous,
+                    background_mode: true,
+                    changed_priority: false,
+                };
+            }
+
+            // Background mode can fail on older/unusual Windows environments. Fall back
+            // to a conventional CPU-priority reduction rather than failing the upload.
+            let desired = if profile == ResourceProfile::Low {
+                THREAD_PRIORITY_LOWEST
+            } else {
+                THREAD_PRIORITY_BELOW_NORMAL
+            };
+            let changed_priority = SetThreadPriority(thread, desired) != 0;
+            Self {
+                previous,
+                background_mode: false,
+                changed_priority,
+            }
+        }
+    }
+}
+
+#[cfg(windows)]
+impl Drop for ThreadPriorityGuard {
+    fn drop(&mut self) {
+        use windows_sys::Win32::System::Threading::{
+            GetCurrentThread, SetThreadPriority, THREAD_MODE_BACKGROUND_END,
+        };
+        unsafe {
+            let thread = GetCurrentThread();
+            if self.background_mode {
+                let _ = SetThreadPriority(thread, THREAD_MODE_BACKGROUND_END);
+            } else if self.changed_priority {
+                let _ = SetThreadPriority(thread, self.previous);
+            }
+        }
+    }
+}
+
+#[cfg(not(windows))]
+struct ThreadPriorityGuard;
+
+#[cfg(not(windows))]
+impl ThreadPriorityGuard {
+    fn new(_profile: ResourceProfile) -> Self {
+        Self
+    }
+}
+
+pub(crate) fn with_resource_priority<T>(
+    profile: ResourceProfile,
+    operation: impl FnOnce() -> T,
+) -> T {
+    let _priority = ThreadPriorityGuard::new(profile);
+    operation()
+}
 
 #[derive(Clone, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -121,15 +302,30 @@ fn stored(name: &str) -> bool {
             | "rar"
             | "7z"
             | "gz"
+            | "bz2"
+            | "xz"
+            | "zst"
+            | "tgz"
+            | "cab"
             | "jpg"
             | "jpeg"
             | "png"
+            | "gif"
             | "webp"
+            | "avif"
+            | "jxl"
             | "heic"
             | "mp4"
             | "mkv"
+            | "mov"
+            | "m4v"
+            | "webm"
             | "mp3"
             | "aac"
+            | "m4a"
+            | "flac"
+            | "ogg"
+            | "opus"
             | "pdf"
             | "docx"
             | "xlsx"
@@ -164,7 +360,10 @@ fn output_label(name: &str) -> String {
 
 fn finalize_zip(mut writer: LimitedWriter, target: &Path, limit: u64) -> Result<(), String> {
     writer.flush().map_err(|error| error.to_string())?;
-    writer.file.sync_all().map_err(|error| error.to_string())?;
+    // These archives are private staging artifacts that are immediately reopened and
+    // verified before upload. Forcing FlushFileBuffers/sync_all after every multi-GB
+    // part monopolizes the Windows storage queue and can freeze the desktop for seconds.
+    // A normal flush is sufficient here; the verification pass remains the integrity gate.
     if writer
         .file
         .metadata()
@@ -235,6 +434,7 @@ fn verify_split_parts(
     original_sha256: &str,
     processed: &mut u64,
     total_work: u64,
+    governor: &mut ResourceGovernor,
     report: &mut impl FnMut(ArchiveProgress),
 ) -> Result<(), String> {
     let expected_count = u32::try_from(parts.len()).map_err(|_| "Demasiadas partes ZIP")?;
@@ -300,6 +500,7 @@ fn verify_split_parts(
             hasher.update(&buffer[..count]);
             verified += count as u64;
             *processed = processed.saturating_add(count as u64);
+            governor.checkpoint(count);
         }
         if verified != part.size || hex::encode(hasher.finalize()) != part.sha256 {
             return Err(format!(
@@ -319,6 +520,7 @@ struct ArchiveWriteState<'a, F: FnMut(ArchiveProgress)> {
     processed: u64,
     total_work: u64,
     last_report: Instant,
+    governor: ResourceGovernor,
     report: &'a mut F,
 }
 
@@ -392,6 +594,7 @@ fn write_regular_archive<F: FnMut(ArchiveProgress)>(
                 .map_err(|error| format!("{}: {error}", source.name))?;
             read_size += count as u64;
             state.processed = state.processed.saturating_add(count as u64);
+            state.governor.checkpoint(count);
             state.maybe_report(source.name.clone());
         }
         let current = input.metadata().map_err(|error| error.to_string())?;
@@ -474,6 +677,7 @@ fn write_split_archives<F: FnMut(ArchiveProgress)>(
             total_read += count as u64;
             remaining -= count as u64;
             state.processed = state.processed.saturating_add(count as u64);
+            state.governor.checkpoint(count);
             state.maybe_report(format!(
                 "{} · parte {:03}/{:03}",
                 source.name, part_index, part_count
@@ -508,17 +712,30 @@ fn write_split_archives<F: FnMut(ArchiveProgress)>(
         &original_sha256,
         &mut state.processed,
         state.total_work,
+        &mut state.governor,
         &mut *state.report,
     )?;
     Ok(parts.into_iter().map(|part| part.path).collect())
 }
 
+#[cfg(test)]
 pub fn create_archives(
     items: &[ArchiveInput],
     output: &Path,
     limit: u64,
+    report: impl FnMut(ArchiveProgress),
+) -> Result<Vec<PathBuf>, String> {
+    create_archives_with_profile(items, output, limit, ResourceProfile::Balanced, report)
+}
+
+pub fn create_archives_with_profile(
+    items: &[ArchiveInput],
+    output: &Path,
+    limit: u64,
+    profile: ResourceProfile,
     mut report: impl FnMut(ArchiveProgress),
 ) -> Result<Vec<PathBuf>, String> {
+    let _priority = ThreadPriorityGuard::new(profile);
     if items.is_empty() || items.len() > 10000 {
         return Err("Selecciona entre 1 y 10000 archivos para comprimir".into());
     }
@@ -621,6 +838,7 @@ pub fn create_archives(
         processed: 0,
         total_work,
         last_report: Instant::now(),
+        governor: ResourceGovernor::new(profile),
         report: &mut report,
     };
 
@@ -653,6 +871,33 @@ pub fn create_archives(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn resource_profiles_bound_compression_concurrency() {
+        assert_eq!(
+            ResourceProfile::from_setting("low").compression_concurrency(),
+            1
+        );
+        assert_eq!(
+            ResourceProfile::from_setting("balanced").compression_concurrency(),
+            1
+        );
+        assert_eq!(
+            ResourceProfile::from_setting("max").compression_concurrency(),
+            2
+        );
+        assert_eq!(ResourceProfile::Low.heavy_io_concurrency(), 2);
+        assert_eq!(ResourceProfile::Balanced.heavy_io_concurrency(), 4);
+        assert_eq!(ResourceProfile::Max.heavy_io_concurrency(), 16);
+        assert_eq!(
+            ResourceProfile::from_setting("unexpected"),
+            ResourceProfile::Balanced
+        );
+        assert!(stored("pelicula.mkv"));
+        assert!(stored("audio.flac"));
+        assert!(stored("respaldo.zst"));
+        assert!(!stored("datos.csv"));
+    }
 
     fn split_manifest(path: &Path) -> SplitManifest {
         let file = File::open(path).unwrap();

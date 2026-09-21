@@ -110,6 +110,8 @@ struct AppState {
     staging_dir: PathBuf,
     media_cache_dir: PathBuf,
     preparation_slots: Arc<DynamicLimiter>,
+    compression_slots: Arc<DynamicLimiter>,
+    heavy_io_slots: Arc<DynamicLimiter>,
     upload_slots: Arc<DynamicLimiter>,
     download_slots: Arc<DynamicLimiter>,
     worker_wake: Arc<tokio::sync::Notify>,
@@ -508,17 +510,34 @@ async fn prepare_zip_uploads(
     let _ = &mut items;
 
     let state = state.inner().clone();
+    let profile = archive::ResourceProfile::from_setting(
+        &state
+            .repository
+            .settings()
+            .map_err(|e| e.to_string())?
+            .resource_profile,
+    );
+    let compression_permit = state.compression_slots.acquire().await;
+    let heavy_io_permit = state.heavy_io_slots.acquire().await;
     let permit = state.preparation_slots.acquire().await;
+    let worker_wake = state.worker_wake.clone();
     let result = tauri::async_runtime::spawn_blocking(move || {
+        let _compression_permit = compression_permit;
+        let _heavy_io_permit = heavy_io_permit;
         let _permit = permit;
         let temp = tempfile::Builder::new()
             .prefix("zip-")
             .tempdir_in(&state.staging_dir)
             .map_err(|e| e.to_string())?;
-        let paths =
-            archive::create_archives(&items, temp.path(), archive::ZIP_LIMIT, |progress| {
+        let paths = archive::create_archives_with_profile(
+            &items,
+            temp.path(),
+            archive::ZIP_LIMIT,
+            profile,
+            |progress| {
                 let _ = app.emit("nuvio-zip-progress", progress);
-            })?;
+            },
+        )?;
         let results: Vec<_> = paths
             .iter()
             .map(|path| {
@@ -527,6 +546,7 @@ async fn prepare_zip_uploads(
                     &path.to_string_lossy(),
                     &state.staging_dir,
                     folder_id.as_deref(),
+                    profile,
                 )
             })
             .collect();
@@ -534,13 +554,14 @@ async fn prepare_zip_uploads(
         // per-transfer staging folders. Any archive left in `temp` belongs to a failed
         // adoption and must be discarded here; keeping the whole temp directory leaked
         // multi-gigabyte ZIP parts on disk.
-        if results.iter().any(Result::is_ok) {
-            state.worker_wake.notify_one();
-        }
         Ok(results)
     })
     .await
     .map_err(|e| e.to_string())?;
+    // Wake the transfer worker only after the compression/I/O permits have been dropped.
+    // Waking it inside the blocking closure could race with permit release and leave
+    // queued uploads sleeping until the next periodic worker tick.
+    worker_wake.notify_one();
 
     #[cfg(target_os = "android")]
     for staged in &staged_android_sources {
@@ -574,8 +595,9 @@ async fn prepare_upload(
             return Err("No puedes subir archivos a una carpeta eliminada".into());
         }
     }
-    let _permit = state.preparation_slots.acquire().await;
     state.telegram.own_chat(&state.repository).await?;
+    let _heavy_io_permit = state.heavy_io_slots.acquire().await;
+    let _permit = state.preparation_slots.acquire().await;
     if encrypt {
         return Err("El cifrado adicional de archivos todavía no está habilitado para transferencias Telegram".into());
     }
@@ -624,6 +646,8 @@ async fn prepare_upload(
         }
         .await;
         cleanup_android_staged_source(&staged_path);
+        drop(_permit);
+        drop(_heavy_io_permit);
         if result.is_ok() {
             state.worker_wake.notify_one();
         }
@@ -673,6 +697,8 @@ async fn prepare_upload(
     }
     .await;
 
+    drop(_permit);
+    drop(_heavy_io_permit);
     if result.is_ok() {
         state.worker_wake.notify_one();
     }
@@ -1073,9 +1099,11 @@ async fn resume_one(state: Arc<AppState>, id: String) -> Result<(), String> {
         .map_err(|e| e.to_string())?
         .is_some()
     {
+        let heavy_io_permit = state.heavy_io_slots.acquire().await;
         let permit = state.preparation_slots.acquire().await;
         let owned = state.clone();
         tauri::async_runtime::spawn_blocking(move || {
+            let _heavy_io_permit = heavy_io_permit;
             let _permit = permit;
             TransferService::resume_preparation(&owned.repository, &id, &owned.staging_dir)
                 .map(|_| ())
@@ -1355,6 +1383,7 @@ fn update_setting(
         "remember_session" if value == "0" || value == "1" => {}
         "delete_original_after_upload" if value == "0" || value == "1" => {}
         "conflict_policy" if value == "skip" || value == "rename" => {}
+        "resource_profile" if matches!(value.as_str(), "low" | "balanced" | "max") => {}
         "cache_limit_bytes" => {
             let parsed: i64 = value.parse().map_err(|_| "Límite de caché inválido")?;
             if !(256 * 1024 * 1024..=20 * 1024 * 1024 * 1024_i64).contains(&parsed) {
@@ -1391,11 +1420,22 @@ fn update_setting(
         "download_concurrency" => state
             .download_slots
             .set_limit(settings.download_concurrency),
+        "resource_profile" => {
+            state
+                .compression_slots
+                .set_limit(archive::compression_concurrency(&settings.resource_profile));
+            state
+                .heavy_io_slots
+                .set_limit(archive::heavy_io_concurrency(&settings.resource_profile));
+        }
         _ => {}
     }
     if matches!(
         key.as_str(),
-        "preparation_concurrency" | "upload_concurrency" | "download_concurrency"
+        "preparation_concurrency"
+            | "upload_concurrency"
+            | "download_concurrency"
+            | "resource_profile"
     ) {
         state.worker_wake.notify_one();
     }
@@ -1613,7 +1653,6 @@ async fn run_job(state: Arc<AppState>, job: cloud::WorkItem) {
             }
         }
     }
-    state.worker_wake.notify_one();
 }
 
 async fn worker(state: Arc<AppState>) {
@@ -1711,19 +1750,30 @@ async fn worker(state: Arc<AppState>) {
             let Some(permit) = state.upload_slots.try_acquire() else {
                 break;
             };
+            let Some(heavy_io_permit) = state.heavy_io_slots.try_acquire() else {
+                drop(permit);
+                break;
+            };
             match state.repository.claim_pending("upload") {
                 Ok(Some(job)) => {
                     let owned = state.clone();
+                    let wake = owned.worker_wake.clone();
                     tauri::async_runtime::spawn(async move {
-                        let _permit = permit;
+                        let upload_permit = permit;
+                        let io_permit = heavy_io_permit;
                         run_job(owned, job).await;
+                        drop(io_permit);
+                        drop(upload_permit);
+                        wake.notify_one();
                     });
                 }
                 Ok(None) => {
+                    drop(heavy_io_permit);
                     drop(permit);
                     break;
                 }
                 Err(error) => {
+                    drop(heavy_io_permit);
                     drop(permit);
                     *state.background_error.lock().expect("background") = Some(error.to_string());
                     break;
@@ -1735,19 +1785,30 @@ async fn worker(state: Arc<AppState>) {
             let Some(permit) = state.download_slots.try_acquire() else {
                 break;
             };
+            let Some(heavy_io_permit) = state.heavy_io_slots.try_acquire() else {
+                drop(permit);
+                break;
+            };
             match state.repository.claim_pending("download") {
                 Ok(Some(job)) => {
                     let owned = state.clone();
+                    let wake = owned.worker_wake.clone();
                     tauri::async_runtime::spawn(async move {
-                        let _permit = permit;
+                        let download_permit = permit;
+                        let io_permit = heavy_io_permit;
                         run_job(owned, job).await;
+                        drop(io_permit);
+                        drop(download_permit);
+                        wake.notify_one();
                     });
                 }
                 Ok(None) => {
+                    drop(heavy_io_permit);
                     drop(permit);
                     break;
                 }
                 Err(error) => {
+                    drop(heavy_io_permit);
                     drop(permit);
                     *state.background_error.lock().expect("background") = Some(error.to_string());
                     break;
@@ -2017,6 +2078,14 @@ pub fn run() {
                 staging_dir,
                 media_cache_dir,
                 preparation_slots: DynamicLimiter::new(settings.preparation_concurrency, 8),
+                compression_slots: DynamicLimiter::new(
+                    archive::compression_concurrency(&settings.resource_profile),
+                    2,
+                ),
+                heavy_io_slots: DynamicLimiter::new(
+                    archive::heavy_io_concurrency(&settings.resource_profile),
+                    16,
+                ),
                 upload_slots: DynamicLimiter::new(settings.upload_concurrency, 16),
                 download_slots: DynamicLimiter::new(settings.download_concurrency, 8),
                 worker_wake: Arc::new(tokio::sync::Notify::new()),

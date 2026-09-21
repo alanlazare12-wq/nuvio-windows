@@ -5,6 +5,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use sha2::{Digest, Sha256};
 
+use crate::archive::ResourceProfile;
 use crate::crypto::encrypt_file;
 use crate::progress::SpeedEstimator;
 use crate::repository::CatalogRepository;
@@ -102,6 +103,7 @@ impl TransferService {
         path: &str,
         staging_dir: &Path,
         folder_id: Option<&str>,
+        resource_profile: ResourceProfile,
     ) -> Result<PreparedUpload, String> {
         let source_path = normalize_path(path)?;
         let metadata = fs::metadata(&source_path).map_err(|error| error.to_string())?;
@@ -165,7 +167,15 @@ impl TransferService {
             return Err(error);
         }
 
-        let sha256 = match hash_with_progress(repository, &transfer_id, &snapshot, size_bytes) {
+        let sha256 = match crate::archive::with_resource_priority(resource_profile, || {
+            hash_with_progress_profile(
+                repository,
+                &transfer_id,
+                &snapshot,
+                size_bytes,
+                Some(resource_profile),
+            )
+        }) {
             Ok(hash) => hash,
             Err(error) => {
                 mark_preparation_failure(
@@ -601,6 +611,16 @@ fn hash_with_progress(
     path: &Path,
     total: i64,
 ) -> Result<String, String> {
+    hash_with_progress_profile(repository, transfer_id, path, total, None)
+}
+
+fn hash_with_progress_profile(
+    repository: &CatalogRepository,
+    transfer_id: &str,
+    path: &Path,
+    total: i64,
+    resource_profile: Option<ResourceProfile>,
+) -> Result<String, String> {
     let mut reader = BufReader::with_capacity(
         2 * 1024 * 1024,
         fs::File::open(path).map_err(|e| e.to_string())?,
@@ -608,6 +628,7 @@ fn hash_with_progress(
     let mut hasher = Sha256::new();
     let mut buffer = vec![0_u8; 1024 * 1024];
     let mut processed = 0_i64;
+    let mut throttle_bytes = 0_u64;
     let mut estimator = SpeedEstimator::new(0);
     let mut last_report = Instant::now() - Duration::from_secs(1);
 
@@ -618,6 +639,9 @@ fn hash_with_progress(
         }
         hasher.update(&buffer[..read]);
         processed += read as i64;
+        if let Some(profile) = resource_profile {
+            profile.throttle(&mut throttle_bytes, read);
+        }
         if last_report.elapsed() >= Duration::from_millis(250) || processed >= total {
             check_control(repository, transfer_id)?;
             let speed = estimator.update(processed);
@@ -945,6 +969,7 @@ mod tests {
             generated.to_str().unwrap(),
             &staging,
             None,
+            ResourceProfile::Balanced,
         )
         .unwrap();
 
