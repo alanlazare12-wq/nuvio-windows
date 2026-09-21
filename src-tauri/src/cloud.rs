@@ -11,8 +11,11 @@ use std::{
     fs,
     io::Read,
     path::{Path, PathBuf},
+    sync::atomic::Ordering,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
+
+const SYNC_CANCELLED_ERROR: &str = "Sincronización detenida por el usuario";
 use tdlib_rs::{enums as e, functions as f, types as t};
 use zip::{write::SimpleFileOptions, CompressionMethod, ZipArchive, ZipWriter};
 
@@ -1641,6 +1644,46 @@ fn file_delete_event(message: &t::Message) -> Option<FileDeleteEvent> {
 }
 
 impl TelegramService {
+    pub fn request_sync_cancel(&self) -> bool {
+        let active = self
+            .sync_progress
+            .lock()
+            .map(|progress| progress.active)
+            .unwrap_or(false);
+        if active {
+            self.sync_cancel_requested.store(true, Ordering::Release);
+        }
+        active
+    }
+
+    fn reset_sync_cancel(&self) {
+        self.sync_cancel_requested.store(false, Ordering::Release);
+    }
+
+    fn ensure_sync_not_cancelled(&self) -> Result<(), String> {
+        if self.sync_cancel_requested.load(Ordering::Acquire) {
+            Err(SYNC_CANCELLED_ERROR.to_string())
+        } else {
+            Ok(())
+        }
+    }
+
+    async fn wait_sync_cancel(&self) {
+        while !self.sync_cancel_requested.load(Ordering::Acquire) {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    }
+
+    async fn sync_call<T>(
+        &self,
+        request: impl std::future::Future<Output = Result<T, tdlib_rs::types::Error>>,
+    ) -> Result<T, String> {
+        tokio::select! {
+            result = call(request) => result,
+            _ = self.wait_sync_cancel() => Err(SYNC_CANCELLED_ERROR.to_string()),
+        }
+    }
+
     pub async fn own_chat(&self, repo: &CatalogRepository) -> Result<i64, String> {
         if !self.refresh().await?.connected {
             return Err("Conecta tu cuenta de Telegram primero".into());
@@ -1657,18 +1700,20 @@ impl TelegramService {
         &self,
         chat: i64,
     ) -> Result<Option<(i64, CatalogSnapshotCaption, t::File)>, String> {
-        let e::FoundChatMessages::FoundChatMessages(page) = call(f::search_chat_messages(
-            chat,
-            None,
-            "#NuvioCatalog2".to_string(),
-            None,
-            0,
-            0,
-            50,
-            None,
-            self.client_id(),
-        ))
-        .await?;
+        self.ensure_sync_not_cancelled()?;
+        let e::FoundChatMessages::FoundChatMessages(page) = self
+            .sync_call(f::search_chat_messages(
+                chat,
+                None,
+                "#NuvioCatalog2".to_string(),
+                None,
+                0,
+                0,
+                50,
+                None,
+                self.client_id(),
+            ))
+            .await?;
 
         let mut best: Option<(i64, CatalogSnapshotCaption, t::File)> = None;
         for message in page.messages {
@@ -1700,13 +1745,16 @@ impl TelegramService {
             return Err("El snapshot remoto excede el límite de seguridad".into());
         }
 
+        self.ensure_sync_not_cancelled()?;
         let mut updates = self.subscribe_file_updates();
-        let e::File::File(started) =
-            call(f::download_file(file.id, 32, 0, 0, false, self.client_id())).await?;
+        let e::File::File(started) = self
+            .sync_call(f::download_file(file.id, 32, 0, 0, false, self.client_id()))
+            .await?;
         file = started;
 
         let deadline = Instant::now() + Duration::from_secs(20 * 60);
         while !file.local.is_downloading_completed {
+            self.ensure_sync_not_cancelled()?;
             if Instant::now() >= deadline {
                 return Err("El snapshot remoto tardó demasiado en descargarse".into());
             }
@@ -1714,10 +1762,11 @@ impl TelegramService {
                 return Err("Telegram interrumpió la descarga del snapshot".into());
             }
             file = self
-                .next_file_update(&mut updates, file.id, Duration::from_secs(5))
+                .next_file_update(&mut updates, file.id, Duration::from_millis(500))
                 .await?;
         }
 
+        self.ensure_sync_not_cancelled()?;
         let path = PathBuf::from(&file.local.path);
         let metadata = fs::metadata(&path).map_err(|e| e.to_string())?;
         if !metadata.is_file() || metadata.len() > MAX_COMPRESSED_BYTES as u64 {
@@ -1729,6 +1778,7 @@ impl TelegramService {
             .await
             .map_err(|e| e.to_string())?
             .map_err(|e| e.to_string())?;
+        self.ensure_sync_not_cancelled()?;
         if !actual_hash.eq_ignore_ascii_case(&caption.sha256) {
             return Err("El hash del snapshot remoto no coincide".into());
         }
@@ -1738,6 +1788,7 @@ impl TelegramService {
             tauri::async_runtime::spawn_blocking(move || read_catalog_snapshot_zip(&snapshot_path))
                 .await
                 .map_err(|e| e.to_string())??;
+        self.ensure_sync_not_cancelled()?;
         if snapshot.documents.len() != caption.documents
             || snapshot.generated_at != caption.generated_at
         {
@@ -1759,8 +1810,11 @@ impl TelegramService {
         };
 
         // A malformed or stale snapshot must never block the normal history fallback.
+        // Explicit user cancellation is different: propagate it immediately instead of
+        // silently falling back to a potentially very long history scan.
         let snapshot = match self.download_catalog_snapshot(&caption, file).await {
             Ok(snapshot) => snapshot,
+            Err(error) if error == SYNC_CANCELLED_ERROR => return Err(error),
             Err(_) => return Ok(None),
         };
         let imported = repo.import_catalog_snapshot(chat, &snapshot)?;
@@ -1780,6 +1834,7 @@ impl TelegramService {
 
     async fn wait_sent_message(
         &self,
+        chat: i64,
         message: t::Message,
         timeout_for: Duration,
         timeout_message: &str,
@@ -1790,6 +1845,19 @@ impl TelegramService {
         let pending = message.id;
         let deadline = Instant::now() + timeout_for;
         while Instant::now() < deadline {
+            if self.sync_cancel_requested.load(Ordering::Acquire) {
+                // This helper is used only by catalog snapshot publication. Deleting
+                // the pending message asks TDLib to stop the upload instead of leaving
+                // a hidden snapshot transfer consuming bandwidth after the user stops sync.
+                let _ = call(f::delete_messages(
+                    chat,
+                    vec![pending],
+                    true,
+                    self.client_id(),
+                ))
+                .await;
+                return Err(SYNC_CANCELLED_ERROR.to_string());
+            }
             if let Some(result) = self
                 .sent
                 .lock()
@@ -1813,19 +1881,29 @@ impl TelegramService {
             return Ok(());
         }
 
+        self.ensure_sync_not_cancelled()?;
         let snapshot = repo.export_catalog_snapshot(chat)?;
+        self.ensure_sync_not_cancelled()?;
+        let documents = snapshot.documents.len();
+        let generated_at = snapshot.generated_at;
         let temp = tempfile::Builder::new()
             .prefix("nuvio-catalog-v2-")
             .tempdir()
             .map_err(|e| e.to_string())?;
         let path = temp.path().join("nuvio-catalog-v2.zip");
-        write_catalog_snapshot_zip(&snapshot, &path)?;
-        let hash = sha256_file(&path).map_err(|e| e.to_string())?;
+        let build_path = path.clone();
+        let hash = tauri::async_runtime::spawn_blocking(move || {
+            write_catalog_snapshot_zip(&snapshot, &build_path)?;
+            sha256_file(&build_path).map_err(|e| e.to_string())
+        })
+        .await
+        .map_err(|e| e.to_string())??;
+        self.ensure_sync_not_cancelled()?;
         let caption = CatalogSnapshotCaption {
             v: 2,
             sha256: hash,
-            documents: snapshot.documents.len(),
-            generated_at: snapshot.generated_at,
+            documents,
+            generated_at,
         };
         let text = format!(
             "#NuvioCatalog2 {}",
@@ -1843,18 +1921,21 @@ impl TelegramService {
             }),
         });
 
+        self.ensure_sync_not_cancelled()?;
         let old_message = repo.snapshot_message_id(chat)?;
-        let e::Message::Message(message) = call(f::send_message(
-            chat,
-            None,
-            None,
-            None,
-            content,
-            self.client_id(),
-        ))
-        .await?;
+        let e::Message::Message(message) = self
+            .sync_call(f::send_message(
+                chat,
+                None,
+                None,
+                None,
+                content,
+                self.client_id(),
+            ))
+            .await?;
         let message = self
             .wait_sent_message(
+                chat,
                 message,
                 Duration::from_secs(15 * 60),
                 "Telegram tardó demasiado en publicar el snapshot del catálogo",
@@ -1971,6 +2052,22 @@ impl TelegramService {
     }
 
     async fn send_metadata_text(&self, chat: i64, text: String) -> Result<(), String> {
+        self.send_metadata_text_inner(chat, text, false).await
+    }
+
+    async fn send_sync_metadata_text(&self, chat: i64, text: String) -> Result<(), String> {
+        self.send_metadata_text_inner(chat, text, true).await
+    }
+
+    async fn send_metadata_text_inner(
+        &self,
+        chat: i64,
+        text: String,
+        cancellable: bool,
+    ) -> Result<(), String> {
+        if cancellable {
+            self.ensure_sync_not_cancelled()?;
+        }
         let content = e::InputMessageContent::InputMessageText(t::InputMessageText {
             text: t::FormattedText {
                 text,
@@ -1979,21 +2076,22 @@ impl TelegramService {
             link_preview_options: None,
             clear_draft: false,
         });
-        let e::Message::Message(message) = call(f::send_message(
-            chat,
-            None,
-            None,
-            None,
-            content,
-            self.client_id(),
-        ))
-        .await?;
+        let request = f::send_message(chat, None, None, None, content, self.client_id());
+        let response = if cancellable {
+            self.sync_call(request).await?
+        } else {
+            call(request).await?
+        };
+        let e::Message::Message(message) = response;
         if message.sending_state.is_none() {
             return Ok(());
         }
         let pending = message.id;
         let deadline = Instant::now() + Duration::from_secs(25);
         while Instant::now() < deadline {
+            if cancellable {
+                self.ensure_sync_not_cancelled()?;
+            }
             if let Some(result) = self
                 .sent
                 .lock()
@@ -2164,18 +2262,20 @@ impl TelegramService {
         let mut newest = checkpoint.unwrap_or(0);
         let mut from_message_id = 0;
         loop {
-            let e::FoundChatMessages::FoundChatMessages(page) = call(f::search_chat_messages(
-                chat,
-                None,
-                "#NuvioFolder1".to_string(),
-                None,
-                from_message_id,
-                0,
-                100,
-                None,
-                self.client_id(),
-            ))
-            .await?;
+            self.ensure_sync_not_cancelled()?;
+            let e::FoundChatMessages::FoundChatMessages(page) = self
+                .sync_call(f::search_chat_messages(
+                    chat,
+                    None,
+                    "#NuvioFolder1".to_string(),
+                    None,
+                    from_message_id,
+                    0,
+                    100,
+                    None,
+                    self.client_id(),
+                ))
+                .await?;
             let next_from_message_id = page.next_from_message_id;
             let mut reached_checkpoint = false;
             for message in page.messages {
@@ -2208,18 +2308,20 @@ impl TelegramService {
         let mut newest = checkpoint.unwrap_or(0);
         let mut from_message_id = 0;
         loop {
-            let e::FoundChatMessages::FoundChatMessages(page) = call(f::search_chat_messages(
-                chat,
-                None,
-                "#NuvioMove1".to_string(),
-                None,
-                from_message_id,
-                0,
-                100,
-                None,
-                self.client_id(),
-            ))
-            .await?;
+            self.ensure_sync_not_cancelled()?;
+            let e::FoundChatMessages::FoundChatMessages(page) = self
+                .sync_call(f::search_chat_messages(
+                    chat,
+                    None,
+                    "#NuvioMove1".to_string(),
+                    None,
+                    from_message_id,
+                    0,
+                    100,
+                    None,
+                    self.client_id(),
+                ))
+                .await?;
             let next_from_message_id = page.next_from_message_id;
             let mut reached_checkpoint = false;
             for message in page.messages {
@@ -2254,18 +2356,20 @@ impl TelegramService {
         let mut newest = checkpoint.unwrap_or(0);
         let mut from_message_id = 0;
         loop {
-            let e::FoundChatMessages::FoundChatMessages(page) = call(f::search_chat_messages(
-                chat,
-                None,
-                "#NuvioTrash1".to_string(),
-                None,
-                from_message_id,
-                0,
-                100,
-                None,
-                self.client_id(),
-            ))
-            .await?;
+            self.ensure_sync_not_cancelled()?;
+            let e::FoundChatMessages::FoundChatMessages(page) = self
+                .sync_call(f::search_chat_messages(
+                    chat,
+                    None,
+                    "#NuvioTrash1".to_string(),
+                    None,
+                    from_message_id,
+                    0,
+                    100,
+                    None,
+                    self.client_id(),
+                ))
+                .await?;
             let next_from_message_id = page.next_from_message_id;
             let mut reached_checkpoint = false;
             for message in page.messages {
@@ -2300,18 +2404,20 @@ impl TelegramService {
         let mut newest = checkpoint.unwrap_or(0);
         let mut from_message_id = 0;
         loop {
-            let e::FoundChatMessages::FoundChatMessages(page) = call(f::search_chat_messages(
-                chat,
-                None,
-                "#NuvioDelete1".to_string(),
-                None,
-                from_message_id,
-                0,
-                100,
-                None,
-                self.client_id(),
-            ))
-            .await?;
+            self.ensure_sync_not_cancelled()?;
+            let e::FoundChatMessages::FoundChatMessages(page) = self
+                .sync_call(f::search_chat_messages(
+                    chat,
+                    None,
+                    "#NuvioDelete1".to_string(),
+                    None,
+                    from_message_id,
+                    0,
+                    100,
+                    None,
+                    self.client_id(),
+                ))
+                .await?;
             let next_from_message_id = page.next_from_message_id;
             let mut reached_checkpoint = false;
             for message in page.messages {
@@ -2355,18 +2461,20 @@ impl TelegramService {
         let mut pending_trash_states = std::collections::HashMap::new();
 
         loop {
-            let e::FoundChatMessages::FoundChatMessages(page) = call(f::search_chat_messages(
-                chat,
-                None,
-                "#Nuvio1".to_string(),
-                None,
-                from_message_id,
-                0,
-                100,
-                None,
-                self.client_id(),
-            ))
-            .await?;
+            self.ensure_sync_not_cancelled()?;
+            let e::FoundChatMessages::FoundChatMessages(page) = self
+                .sync_call(f::search_chat_messages(
+                    chat,
+                    None,
+                    "#Nuvio1".to_string(),
+                    None,
+                    from_message_id,
+                    0,
+                    100,
+                    None,
+                    self.client_id(),
+                ))
+                .await?;
 
             outcome.total_hint = outcome.total_hint.max(page.total_count);
             let next_from_message_id = page.next_from_message_id;
@@ -2462,15 +2570,17 @@ impl TelegramService {
         let mut pending_documents = Vec::with_capacity(100);
         let mut pending_trash_states = std::collections::HashMap::new();
         loop {
-            let e::Messages::Messages(page) = call(f::get_chat_history(
-                chat,
-                cursor,
-                0,
-                100,
-                false,
-                self.client_id(),
-            ))
-            .await?;
+            self.ensure_sync_not_cancelled()?;
+            let e::Messages::Messages(page) = self
+                .sync_call(f::get_chat_history(
+                    chat,
+                    cursor,
+                    0,
+                    100,
+                    false,
+                    self.client_id(),
+                ))
+                .await?;
             let mut last = cursor;
             let mut reached_checkpoint = false;
             let mut folders_changed = false;
@@ -2604,6 +2714,7 @@ impl TelegramService {
         verify_deleted: bool,
     ) -> Result<usize, String> {
         let _gate = self.catalog_sync_gate.lock().await;
+        self.reset_sync_cancel();
         let mut progress = crate::progress::SyncRun::new(&self.sync_progress);
         Self::publish_sync_notification(
             true,
@@ -2616,7 +2727,14 @@ impl TelegramService {
         let result = self
             .sync_catalog_inner(repo, &progress, verify_deleted)
             .await;
-        progress.finish(result.as_ref().err().cloned());
+        let cancelled = result
+            .as_ref()
+            .is_err_and(|error| error == SYNC_CANCELLED_ERROR);
+        if cancelled {
+            progress.cancel();
+        } else {
+            progress.finish(result.as_ref().err().cloned());
+        }
         match result.as_ref() {
             Ok(_) => Self::publish_sync_notification(
                 false,
@@ -2624,6 +2742,14 @@ impl TelegramService {
                 0,
                 None,
                 Some(100),
+                None,
+            ),
+            Err(_) if cancelled => Self::publish_sync_notification(
+                false,
+                crate::progress::SyncPhase::Cancelled,
+                0,
+                None,
+                None,
                 None,
             ),
             Err(err) => Self::publish_sync_notification(
@@ -2635,6 +2761,7 @@ impl TelegramService {
                 Some(err),
             ),
         }
+        self.reset_sync_cancel();
         result
     }
 
@@ -2644,7 +2771,9 @@ impl TelegramService {
         progress: &crate::progress::SyncRun<'_>,
         verify_deleted: bool,
     ) -> Result<usize, String> {
+        self.ensure_sync_not_cancelled()?;
         let chat = self.own_chat(repo).await?;
+        self.ensure_sync_not_cancelled()?;
         let imported_snapshot =
             if repo.catalog_remote_count()? == 0 && repo.initial_catalog_sync_needed(chat)? {
                 self.import_latest_catalog_snapshot(repo, chat)
@@ -2764,8 +2893,10 @@ impl TelegramService {
             // not require probing every known message on each manual sync.
             let known = repo.catalog_message_ids()?;
             for batch in known.chunks(100) {
-                let e::Messages::Messages(page) =
-                    call(f::get_messages(chat, batch.to_vec(), self.client_id())).await?;
+                self.ensure_sync_not_cancelled()?;
+                let e::Messages::Messages(page) = self
+                    .sync_call(f::get_messages(chat, batch.to_vec(), self.client_id()))
+                    .await?;
                 let returned: Vec<_> = page
                     .messages
                     .iter()
@@ -2808,12 +2939,13 @@ impl TelegramService {
         if !repo.trash_backfill_done(chat)? {
             let legacy_trashed = repo.trashed_remote_message_ids()?;
             for chunk in legacy_trashed.chunks(100) {
+                self.ensure_sync_not_cancelled()?;
                 let event = FileTrashEvent {
                     v: 1,
                     message_ids: chunk.to_vec(),
                     trashed: true,
                 };
-                self.send_metadata_text(
+                self.send_sync_metadata_text(
                     chat,
                     format!(
                         "#NuvioTrash1 {}",
@@ -2851,6 +2983,16 @@ impl TelegramService {
         .into_iter()
         .max()
         .unwrap_or(0);
+        self.ensure_sync_not_cancelled()?;
+        progress.publishing();
+        Self::publish_sync_notification(
+            true,
+            crate::progress::SyncPhase::Publishing,
+            state.scanned,
+            None,
+            Some(99),
+            None,
+        );
         self.publish_catalog_snapshot_if_needed(repo, chat, snapshot_cursor)
             .await?;
         progress.applying(state.total_documents, state.total_documents.max(1));
@@ -3020,6 +3162,9 @@ impl TelegramService {
 
         let deadline = Instant::now() + Duration::from_secs(3600);
         let mut estimator = SpeedEstimator::new(0);
+        let mut last_uploaded = 0_i64;
+        let mut last_progress_at = Instant::now();
+        let mut waiting_reported = false;
         let mut last_message_probe = Instant::now() - Duration::from_secs(5);
         while Instant::now() < deadline {
             let control = repo.transfer_control(&job.id).map_err(|e| e.to_string())?;
@@ -3101,29 +3246,52 @@ impl TelegramService {
                     .await
                 {
                     let uploaded = file.remote.uploaded_size.clamp(0, job.size.max(0));
-                    let speed = estimator.update(uploaded);
-                    let eta = SpeedEstimator::eta(job.size, uploaded, speed);
                     let phase = if uploaded >= job.size && job.size > 0 {
                         "confirming"
                     } else {
                         "uploading"
                     };
-                    repo.update_runtime(
-                        &job.id,
-                        phase,
-                        phase,
-                        uploaded,
-                        job.size,
-                        speed,
-                        eta,
-                        if phase == "confirming" {
-                            "Confirmando en Telegram"
-                        } else {
-                            "Subiendo a Telegram"
-                        },
-                        None,
-                    )
-                    .map_err(|e| e.to_string())?;
+                    if uploaded > last_uploaded || phase == "confirming" {
+                        let speed = estimator.update(uploaded);
+                        let eta = SpeedEstimator::eta(job.size, uploaded, speed);
+                        last_uploaded = uploaded;
+                        last_progress_at = Instant::now();
+                        waiting_reported = false;
+                        repo.update_runtime(
+                            &job.id,
+                            phase,
+                            phase,
+                            uploaded,
+                            job.size,
+                            speed,
+                            eta,
+                            if phase == "confirming" {
+                                "Confirmando en Telegram"
+                            } else {
+                                "Subiendo a Telegram"
+                            },
+                            None,
+                        )
+                        .map_err(|e| e.to_string())?;
+                    } else if !waiting_reported
+                        && last_progress_at.elapsed() >= Duration::from_secs(8)
+                    {
+                        // Do not replace a valid ETA with "calculando" on every duplicate
+                        // TDLib sample. Only mark a real sustained pause after eight seconds.
+                        repo.update_runtime(
+                            &job.id,
+                            "uploading",
+                            "uploading",
+                            uploaded,
+                            job.size,
+                            0,
+                            None,
+                            "Esperando progreso de Telegram",
+                            None,
+                        )
+                        .map_err(|e| e.to_string())?;
+                        waiting_reported = true;
+                    }
                 }
             } else {
                 tokio::time::sleep(Duration::from_secs(1)).await;

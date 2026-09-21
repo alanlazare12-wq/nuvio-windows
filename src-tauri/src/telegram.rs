@@ -163,6 +163,7 @@ fn configured_app_api_credentials() -> Option<(i32, String)> {
 pub struct TelegramService {
     pub(crate) sync_progress: Mutex<crate::progress::SyncProgress>,
     pub(crate) catalog_sync_gate: tokio::sync::Mutex<()>,
+    pub(crate) sync_cancel_requested: AtomicBool,
     client_id_atomic: Arc<AtomicI32>,
     database_directory: PathBuf,
     files_directory: PathBuf,
@@ -224,20 +225,28 @@ impl TelegramService {
         file_id: i32,
         fallback_after: Duration,
     ) -> Result<tdlib_rs::types::File, String> {
+        // Use one fixed deadline for this file. With several concurrent uploads the
+        // broadcast channel is constantly receiving updates for *other* files; the old
+        // per-recv timeout restarted on every unrelated event and could therefore wait
+        // forever without polling this transfer's real TDLib state.
+        let deadline = tokio::time::Instant::now() + fallback_after;
         loop {
-            match tokio::time::timeout(fallback_after, receiver.recv()).await {
+            let now = tokio::time::Instant::now();
+            if now >= deadline {
+                break;
+            }
+            match tokio::time::timeout(deadline.saturating_duration_since(now), receiver.recv())
+                .await
+            {
                 Ok(Ok(file)) if file.id == file_id => return Ok(file),
                 Ok(Ok(_)) => continue,
                 Ok(Err(tokio::sync::broadcast::error::RecvError::Lagged(_)))
                 | Ok(Err(tokio::sync::broadcast::error::RecvError::Closed))
-                | Err(_) => {
-                    return match call(tdlib_rs::functions::get_file(file_id, self.client_id()))
-                        .await?
-                    {
-                        tdlib_rs::enums::File::File(file) => Ok(file),
-                    };
-                }
+                | Err(_) => break,
             }
+        }
+        match call(tdlib_rs::functions::get_file(file_id, self.client_id())).await? {
+            tdlib_rs::enums::File::File(file) => Ok(file),
         }
     }
 
@@ -385,6 +394,7 @@ impl TelegramService {
         Ok(Self {
             sync_progress: Mutex::new(crate::progress::SyncProgress::default()),
             catalog_sync_gate: tokio::sync::Mutex::new(()),
+            sync_cancel_requested: AtomicBool::new(false),
             client_id_atomic,
             database_directory,
             files_directory,

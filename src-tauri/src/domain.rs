@@ -102,7 +102,7 @@ impl Default for AppSettings {
     fn default() -> Self {
         Self {
             preparation_concurrency: 4,
-            upload_concurrency: 8,
+            upload_concurrency: 4,
             download_concurrency: 2,
             cache_limit_bytes: 2 * 1024 * 1024 * 1024,
             remember_session: false,

@@ -61,6 +61,11 @@ type TransferRowProps = {
 };
 
 export function TransferRow({ job, connected, onAction }: TransferRowProps) {
+  const waitingForUploadProgress =
+    job.status === "uploading"
+    && job.processedBytes > 0
+    && job.speedBps <= 0
+    && job.etaSeconds == null;
   const calculating = [
     "analyzing",
     "copying",
@@ -68,7 +73,7 @@ export function TransferRow({ job, connected, onAction }: TransferRowProps) {
     "downloading",
     "confirming",
     "running",
-  ].includes(job.status);
+  ].includes(job.status) && !waitingForUploadProgress;
 
   return (
     <article className={`transfer-detail status-${job.status}`}>
@@ -85,7 +90,9 @@ export function TransferRow({ job, connected, onAction }: TransferRowProps) {
         <div className="transfer-stats">
           <span>{formatBytes(job.processedBytes)} / {formatBytes(job.totalBytes)}</span>
           <span>{formatSpeed(job.speedBps)}</span>
-          <span>{formatEta(job.etaSeconds, calculating && job.speedBps <= 0)}</span>
+          <span>{waitingForUploadProgress
+            ? (job.speedLabel || "Esperando progreso de Telegram")
+            : formatEta(job.etaSeconds, calculating && job.speedBps <= 0)}</span>
           {job.attempts > 0 && (
             <span>
               Intento {Math.min(job.attempts + 1, job.maxAttempts)}/{job.maxAttempts}

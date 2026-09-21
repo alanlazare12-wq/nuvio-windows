@@ -5,7 +5,7 @@ import {
   type Dispatch,
   type SetStateAction,
 } from "react";
-import { loadSyncDelta, syncFiles } from "./bridge/dashboard";
+import { cancelSync, loadSyncDelta, syncFiles } from "./bridge/dashboard";
 import { readableError } from "./bridge/shared";
 import type { DashboardData } from "./types";
 
@@ -23,6 +23,7 @@ export function useCatalogSync({
   setNotice,
 }: UseCatalogSyncOptions) {
   const [syncBusy, setSyncBusy] = useState(false);
+  const [syncCancelBusy, setSyncCancelBusy] = useState(false);
   const [syncDismissed, setSyncDismissed] = useState(false);
   const manualSyncPollingRef = useRef(false);
   const mountedRef = useRef(true);
@@ -57,6 +58,21 @@ export function useCatalogSync({
   ]);
 
   const isSyncing = syncBusy || Boolean(dashboard?.syncProgress?.active);
+
+  const handleStopSync = async () => {
+    if (!isSyncing || syncCancelBusy) return;
+    setSyncCancelBusy(true);
+    try {
+      const requested = await cancelSync();
+      setNotice(requested
+        ? "Deteniendo sincronización de forma segura…"
+        : "La sincronización ya había terminado.");
+    } catch (error) {
+      setNotice(readableError(error));
+    } finally {
+      if (mountedRef.current) setSyncCancelBusy(false);
+    }
+  };
 
   const handleSync = async () => {
     if (isSyncing || manualSyncPollingRef.current) {
@@ -113,7 +129,10 @@ export function useCatalogSync({
       }
     } catch (error) {
       if (mountedRef.current) {
-        setNotice(readableError(error));
+        const message = readableError(error);
+        setNotice(message.includes("Sincronización detenida por el usuario")
+          ? "Sincronización detenida. El catálogo queda guardado hasta el último checkpoint seguro."
+          : message);
         await refreshDashboard();
       }
     } finally {
@@ -126,10 +145,12 @@ export function useCatalogSync({
 
   return {
     syncBusy,
+    syncCancelBusy,
     syncDismissed,
     setSyncDismissed,
     isSyncing,
     manualSyncPollingRef,
     handleSync,
+    handleStopSync,
   };
 }

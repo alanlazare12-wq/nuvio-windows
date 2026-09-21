@@ -38,6 +38,7 @@ import {
   Settings,
   SlidersHorizontal,
   Sparkles,
+  Square,
   Star,
   Sun,
   Trash2,
@@ -488,7 +489,7 @@ function App() {
   const {
     cleanupBusy,
     handleExportDiagnostics,
-    handleFreeUploadedImages,
+    handleFreeUploadedSources,
   } = useMaintenanceActions({
     refreshDashboard,
     setNotice: setAppNotice,
@@ -511,11 +512,13 @@ function App() {
 
   const {
     syncBusy,
+    syncCancelBusy,
     syncDismissed,
     setSyncDismissed,
     isSyncing,
     manualSyncPollingRef,
     handleSync,
+    handleStopSync,
   } = useCatalogSync({
     dashboard,
     setDashboard,
@@ -814,7 +817,20 @@ function App() {
             <div className="heading-actions">
               {section === "files" && <button className="secondary-button folder-create-button" disabled={!dashboard.telegramConnected} onClick={() => setFolderEditor({ mode: "create" })}><FolderPlus size={17} /> Nueva carpeta</button>}
               <button className="secondary-button folder-upload-button" disabled={uploadBusy || !dashboard.telegramConnected} onClick={() => void handleUploadFolder()}><FolderUp size={17} /> Subir carpeta</button>
-              <button className={`secondary-button sync-action-button ${isSyncing ? "is-syncing" : ""}`} disabled={isSyncing || !dashboard.telegramConnected} onClick={() => void handleSync()} title={isSyncing ? "Sincronización en curso con Telegram…" : "Sincronizar con Telegram"} aria-label={isSyncing ? "Sincronizando…" : "Sincronizar"}><RefreshCw size={17} className={isSyncing ? "spin-icon" : ""} /><span className="sync-button-label">{isSyncing ? "Sincronizando…" : "Sincronizar"}</span></button>
+              <button
+                className={`secondary-button sync-action-button ${isSyncing ? "is-syncing" : ""}`}
+                disabled={!dashboard.telegramConnected || syncCancelBusy}
+                onClick={() => void (isSyncing ? handleStopSync() : handleSync())}
+                title={isSyncing ? "Detener sincronización de forma segura" : "Sincronizar con Telegram"}
+                aria-label={isSyncing ? "Detener sincronización" : "Sincronizar"}
+              >
+                {isSyncing
+                  ? <Square size={15} fill="currentColor" />
+                  : <RefreshCw size={17} />}
+                <span className="sync-button-label">
+                  {isSyncing ? (syncCancelBusy ? "Deteniendo…" : "Detener sync") : "Sincronizar"}
+                </span>
+              </button>
               <button className="primary-button" onClick={() => void handleUpload()} disabled={uploadBusy}><Upload size={17} /> {uploadBusy ? "Preparando…" : "Subir"}</button>
             </div>
           </section>
@@ -837,6 +853,8 @@ function App() {
             <SyncProgressPanel
               syncProgress={dashboard.syncProgress}
               syncBusy={syncBusy}
+              cancelBusy={syncCancelBusy}
+              onCancel={() => void handleStopSync()}
               onDismiss={() => setSyncDismissed(true)}
             />
           )}
@@ -1036,10 +1054,10 @@ function App() {
                   className="secondary-button compact source-cleanup-button"
                   type="button"
                   disabled={cleanupBusy}
-                  onClick={() => void handleFreeUploadedImages()}
+                  onClick={() => void handleFreeUploadedSources()}
                   title="Busca originales locales registrados por Nuvio y los elimina solo después de verificar tamaño y SHA-256"
                 >
-                  <HardDrive size={14} /> {cleanupBusy ? "Liberando…" : "Liberar imágenes subidas"}
+                  <HardDrive size={14} /> {cleanupBusy ? "Liberando…" : "Liberar originales subidos"}
                 </button>
               </div>}
             </div>

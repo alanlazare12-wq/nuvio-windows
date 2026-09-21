@@ -128,6 +128,8 @@ export type SyncPhase =
   | "folders"
   | "files"
   | "applying"
+  | "publishing"
+  | "cancelled"
   | "complete"
   | "error";
 

@@ -151,6 +151,76 @@ fn cleanup_android_staged_source(path: &Path) {
     }
 }
 
+fn cleanup_private_staging_file(staging_dir: &Path, file_path: &str) -> Result<u64, String> {
+    let candidate = PathBuf::from(file_path);
+    if !candidate.exists() {
+        return Ok(0);
+    }
+    let root = staging_dir
+        .canonicalize()
+        .map_err(|error| format!("No se pudo resolver la caché privada: {error}"))?;
+    let target = candidate
+        .canonicalize()
+        .map_err(|error| format!("No se pudo resolver el archivo temporal: {error}"))?;
+    if !target.starts_with(&root) {
+        // Never delete a user-selected source through the staging cleanup path.
+        return Ok(0);
+    }
+    let metadata = fs::metadata(&target).map_err(|error| error.to_string())?;
+    if !metadata.is_file() {
+        return Ok(0);
+    }
+    let released = metadata.len();
+    fs::remove_file(&target)
+        .map_err(|error| format!("No se pudo limpiar la copia temporal subida: {error}"))?;
+
+    // Every prepared upload owns its own staging subdirectory. Remove empty parents
+    // up to, but never including, the staging root.
+    let mut parent = target.parent().map(Path::to_path_buf);
+    while let Some(directory) = parent {
+        if directory == root {
+            break;
+        }
+        match fs::remove_dir(&directory) {
+            Ok(()) => parent = directory.parent().map(Path::to_path_buf),
+            Err(error) if error.kind() == std::io::ErrorKind::DirectoryNotEmpty => break,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => break,
+            Err(error) => return Err(format!("No se pudo limpiar la carpeta temporal: {error}")),
+        }
+    }
+    Ok(released)
+}
+
+fn cleanup_staging_orphans(staging_dir: &Path, keep_paths: &[String]) {
+    let Ok(root) = staging_dir.canonicalize() else {
+        return;
+    };
+    let protected: Vec<PathBuf> = keep_paths
+        .iter()
+        .filter_map(|path| PathBuf::from(path).canonicalize().ok())
+        .filter(|path| path.starts_with(&root))
+        .collect();
+    let Ok(entries) = fs::read_dir(&root) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let Ok(canonical) = path.canonicalize() else {
+            continue;
+        };
+        if !canonical.starts_with(&root)
+            || protected.iter().any(|keep| keep.starts_with(&canonical))
+        {
+            continue;
+        }
+        if canonical.is_dir() {
+            let _ = fs::remove_dir_all(&canonical);
+        } else {
+            let _ = fs::remove_file(&canonical);
+        }
+    }
+}
+
 #[tauri::command]
 async fn get_dashboard(state: State<'_, Arc<AppState>>) -> Result<DashboardData, String> {
     let state = state.inner().clone();
@@ -460,11 +530,10 @@ async fn prepare_zip_uploads(
                 )
             })
             .collect();
-        // If one generated archive could not be adopted, preserve the temporary
-        // source so it is not silently discarded while reporting the failure.
-        if results.iter().any(Result::is_err) {
-            let _ = temp.keep();
-        }
+        // Successfully adopted archives have already been moved into their private
+        // per-transfer staging folders. Any archive left in `temp` belongs to a failed
+        // adoption and must be discarded here; keeping the whole temp directory leaked
+        // multi-gigabyte ZIP parts on disk.
         if results.iter().any(Result::is_ok) {
             state.worker_wake.notify_one();
         }
@@ -620,11 +689,21 @@ async fn sync_files(state: State<'_, Arc<AppState>>) -> Result<usize, String> {
         .telegram
         .sync_catalog_checked(&state.repository, true)
         .await;
-    *state.background_error.lock().expect("background") = result.as_ref().err().cloned();
+    let background_error = result
+        .as_ref()
+        .err()
+        .filter(|error| error.as_str() != "Sincronización detenida por el usuario")
+        .cloned();
+    *state.background_error.lock().expect("background") = background_error;
     if result.is_ok() {
         let _ = state.repository.optimize();
     }
     result
+}
+
+#[tauri::command]
+fn cancel_sync(state: State<'_, Arc<AppState>>) -> bool {
+    state.telegram.request_sync_cancel()
 }
 
 #[tauri::command]
@@ -1394,12 +1473,21 @@ async fn delete_verified_upload_source_inner(
     };
 
     match result {
-        Ok(removed) => {
+        Ok(true) => {
+            // The same local path can have more than one completed transfer in the
+            // durable cleanup ledger. Once deletion really succeeded, clear every
+            // matching ledger row so the next cleanup pass does not rediscover it.
             state
                 .repository
-                .mark_upload_source_deleted(transfer_id)
+                .mark_upload_source_path_deleted(&candidate.source_path)
                 .map_err(|e| e.to_string())?;
-            Ok(removed)
+            Ok(true)
+        }
+        Ok(false) => {
+            // Missing/unavailable paths are not proof that the original was deleted:
+            // an external/removable drive may simply be offline. Preserve the ledger
+            // so a later cleanup can retry when the source is reachable again.
+            Ok(false)
         }
         Err(error) => {
             let _ = state
@@ -1427,15 +1515,10 @@ fn uploaded_image_cleanup_candidates(
         .upload_source_cleanup_candidates()
         .map_err(|e| e.to_string())?
         .into_iter()
-        .filter(|candidate| {
-            let extension = Path::new(&candidate.file_name)
-                .extension()
-                .and_then(|value| value.to_str())
-                .unwrap_or("")
-                .to_ascii_lowercase();
-            cloud::classify_extension(&extension) == "image"
-                && seen_sources.insert(candidate.source_path.clone())
-        })
+        // This maintenance action is for every verified original uploaded to Nuvio,
+        // not only image extensions. The previous image-only filter made the button
+        // silently ignore videos, archives and large split uploads.
+        .filter(|candidate| seen_sources.insert(candidate.source_path.clone()))
         .collect();
     Ok(candidates)
 }
@@ -1498,7 +1581,23 @@ async fn run_job(state: Arc<AppState>, job: cloud::WorkItem) {
         state.telegram.run_download(&state.repository, &job).await
     };
     if result.is_ok() && job.direction == "upload" {
-        let _ = delete_verified_upload_source_inner(&state, &job.id, true).await;
+        let status = state
+            .repository
+            .transfer_by_id(&job.id)
+            .ok()
+            .flatten()
+            .map(|transfer| transfer.status);
+        // A cancelled upload is intentionally resumable in the UI, so its private
+        // staging copy must stay available. Only a confirmed completion makes that
+        // copy disposable; startup orphan cleanup handles leftovers from older builds.
+        if status.as_deref() == Some("completed") {
+            if let Err(error) = cleanup_private_staging_file(&state.staging_dir, &job.path) {
+                *state.background_error.lock().expect("background") = Some(error);
+            }
+        }
+        if status.as_deref() == Some("completed") {
+            let _ = delete_verified_upload_source_inner(&state, &job.id, true).await;
+        }
     }
     if let Err(error) = result {
         let current = state.repository.transfer_by_id(&job.id).ok().flatten();
@@ -1907,6 +2006,8 @@ pub fn run() {
             let repository = CatalogRepository::open(&app_data_dir.join("nuvio.db"))
                 .map_err(|error| error.to_string())?;
             repository.init_cloud()?;
+            let staging_in_use = repository.upload_staging_paths_in_use().unwrap_or_default();
+            cleanup_staging_orphans(&staging_dir, &staging_in_use);
             reconcile_media_cache_index(&repository, &media_cache_dir)?;
             let settings = repository.settings().map_err(|e| e.to_string())?;
             let telegram = TelegramService::new(&app_data_dir)?;
@@ -1951,6 +2052,7 @@ pub fn run() {
             pick_upload_files,
             decrypt_nuvio_file,
             sync_files,
+            cancel_sync,
             create_folder,
             rename_folder,
             move_folder,
@@ -2010,6 +2112,50 @@ pub fn run() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn private_staging_cleanup_never_deletes_user_files() {
+        let root = tempfile::tempdir().unwrap();
+        let staging = root.path().join("staging");
+        let transfer_dir = staging.join("transfer-1");
+        fs::create_dir_all(&transfer_dir).unwrap();
+        let staged = transfer_dir.join("part.zip");
+        fs::write(&staged, b"temporary").unwrap();
+        let external = root.path().join("original.zip");
+        fs::write(&external, b"user-data").unwrap();
+
+        assert_eq!(
+            cleanup_private_staging_file(&staging, &staged.to_string_lossy()).unwrap(),
+            9
+        );
+        assert!(!staged.exists());
+        assert!(!transfer_dir.exists());
+
+        assert_eq!(
+            cleanup_private_staging_file(&staging, &external.to_string_lossy()).unwrap(),
+            0
+        );
+        assert_eq!(fs::read(&external).unwrap(), b"user-data");
+    }
+
+    #[test]
+    fn startup_staging_sweep_preserves_active_transfers_only() {
+        let root = tempfile::tempdir().unwrap();
+        let staging = root.path().join("staging");
+        let active_dir = staging.join("active");
+        let orphan_dir = staging.join("old-zip");
+        fs::create_dir_all(&active_dir).unwrap();
+        fs::create_dir_all(&orphan_dir).unwrap();
+        let active_file = active_dir.join("upload.bin");
+        let orphan_file = orphan_dir.join("leftover.zip");
+        fs::write(&active_file, b"active").unwrap();
+        fs::write(&orphan_file, b"orphan").unwrap();
+
+        cleanup_staging_orphans(&staging, &[active_file.to_string_lossy().into_owned()]);
+
+        assert!(active_file.exists());
+        assert!(!orphan_dir.exists());
+    }
 
     #[test]
     fn test_build_directory_upload_plan_hierarchy_and_filtering() {

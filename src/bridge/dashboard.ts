@@ -40,3 +40,7 @@ export function loadSyncDelta(afterCursor?: number | null): Promise<SyncDelta> {
 export function syncFiles(): Promise<number> {
   return invoke("sync_files");
 }
+
+export function cancelSync(): Promise<boolean> {
+  return invoke<boolean>("cancel_sync");
+}

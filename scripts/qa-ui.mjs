@@ -106,17 +106,30 @@ async function setup(viewport = { width: 1280, height: 820 }) {
         if (cmd === "update_setting") return {};
         if (cmd === "set_trashed") { qa.files.find(file => file.id === args.id).trashed = args.trashed; qa.syncCursor++; return; }
         if (cmd === "platform_name") return "windows";
+        if (cmd === "cancel_sync") {
+          if (!qa.syncProgress?.active) return false;
+          qa.syncCancelled = true;
+          qa.syncProgress = { ...qa.syncProgress, active: false, phase: "cancelled", etaSeconds: null, error: null };
+          const rejectSync = qa.syncReject;
+          qa.syncReject = null;
+          if (rejectSync) queueMicrotask(() => rejectSync(new Error("Sincronización detenida por el usuario")));
+          return true;
+        }
         if (cmd === "sync_files") {
           const plan = qa.syncPlan;
           if (!plan) return 0;
+          qa.syncCancelled = false;
           qa.syncProgress = { active: true, phase: "folders", scanned: 0, total: plan.files.length, percent: 3, etaSeconds: null };
-          return new Promise(resolve => {
+          return new Promise((resolve, reject) => {
+            qa.syncReject = reject;
             const [first, ...rest] = structuredClone(plan.files);
             window.setTimeout(() => {
+              if (qa.syncCancelled) return;
               if (plan.folders?.length) qa.folders.unshift(...structuredClone(plan.folders));
               qa.syncProgress = { active: true, phase: "folders", scanned: 0, total: plan.files.length, percent: 3, etaSeconds: null };
             }, 80);
             window.setTimeout(() => {
+              if (qa.syncCancelled) return;
               if (first) {
                 first.__rowid = ++qa.syncCursor;
                 qa.files.unshift(first);
@@ -124,11 +137,13 @@ async function setup(viewport = { width: 1280, height: 820 }) {
               qa.syncProgress = { active: true, phase: "files", scanned: first ? 1 : 0, total: plan.files.length, percent: first ? 45 : 5, etaSeconds: 1 };
             }, 950);
             window.setTimeout(() => {
+              if (qa.syncCancelled) return;
               if (rest.length) {
                 for (const file of rest) file.__rowid = ++qa.syncCursor;
                 qa.files.unshift(...rest);
               }
               qa.syncProgress = { active: false, phase: "complete", scanned: plan.files.length, total: plan.files.length, percent: 100, etaSeconds: 0 };
+              qa.syncReject = null;
               resolve(plan.files.length);
             }, 2200);
           });
@@ -181,7 +196,10 @@ async function setup(viewport = { width: 1280, height: 820 }) {
     };
   });
   await page.route("**/qa-media/**", route => route.fulfill({ status: 200, contentType: "audio/wav", body: Buffer.alloc(44) }));
-  await page.goto(url);
+  // The QA assertions wait for the React shell explicitly below. Waiting for the
+  // browser `load` event is unnecessarily fragile in dev mode because Vite/HMR and
+  // media requests can keep that event pending even though the app is interactive.
+  await page.goto(url, { waitUntil: "domcontentloaded" });
   await expect(page.getByRole("heading", { name: "Inicio", exact: true })).toBeVisible();
   return { context, page, errors };
 }
@@ -542,23 +560,47 @@ try {
     });
     const syncButton = page.locator(".sync-action-button");
     await syncButton.click();
-    await expect(syncButton).toBeDisabled();
+    await expect(syncButton).toBeEnabled();
+    await expect(syncButton).toHaveAttribute("aria-label", "Detener sincronización");
     await expect(page.getByText("Cargando carpetas…", { exact: true })).toBeVisible({ timeout: 1000 });
     await expect(page.getByText("Carpeta primero", { exact: true })).toBeVisible({ timeout: 1100 });
     await expect(page.locator(".file-card")).toHaveCount(16);
     await expect(page.locator(".file-card")).toHaveCount(17, { timeout: 1900 });
     await expect(page.getByText("Sincronizando archivos…", { exact: true })).toBeVisible();
     await expect(page.getByText("Sincronizando visible 1", { exact: true })).toBeVisible();
-    await expect(syncButton).toBeDisabled();
+    await expect(syncButton).toBeEnabled();
+    await expect(syncButton).toHaveAttribute("aria-label", "Detener sincronización");
     await expect(page.locator(".file-card")).toHaveCount(18, { timeout: 2500 });
     await expect(page.getByText("Sincronizando visible 2", { exact: true })).toBeVisible();
     await expect(syncButton).toBeEnabled();
+    await expect(syncButton).toHaveAttribute("aria-label", "Sincronizar");
     const dashboardReads = await page.evaluate(() => window.__qa.calls.filter(c => c.cmd === "get_dashboard").length);
     const deltaReads = await page.evaluate(() => window.__qa.calls.filter(c => c.cmd === "get_sync_delta").length);
     assert.ok(deltaReads >= 2, "sync should stream lightweight deltas while running");
     assert.ok(dashboardReads <= 4, "sync should not repeatedly serialize the full dashboard");
   });
-  await test("manual-uploaded-image-cleanup-works-with-auto-option-off", async page => {
+  await test("desktop-sync-can-be-stopped", async page => {
+    await page.getByRole("navigation", { name: "Principal", exact: true }).getByRole("button", { name: "Mis archivos", exact: true }).click();
+    await page.evaluate(() => {
+      window.__qa.syncPlan = {
+        folders: [],
+        files: [{
+          id: "sync-cancel-1", name: "No debe terminar", extension: "txt", kind: "document", sizeBytes: 4096,
+          updatedAt: new Date(Date.UTC(2026, 8, 14, 23, 58, 57)).toISOString(),
+          favorite: false, trashed: false, folder: "Mi unidad", folderId: null, tags: [], provider: "telegram",
+        }],
+      };
+    });
+    const syncButton = page.locator(".sync-action-button");
+    await syncButton.click();
+    await expect(syncButton).toHaveAttribute("aria-label", "Detener sincronización");
+    await syncButton.click();
+    await expect.poll(() => page.evaluate(() => window.__qa.calls.filter(c => c.cmd === "cancel_sync").length)).toBe(1);
+    await expect(page.getByLabel("Progreso de sincronización")).toContainText("Sincronización detenida");
+    await expect(syncButton).toHaveAttribute("aria-label", "Sincronizar");
+    await expect(page.getByText("No debe terminar", { exact: true })).toHaveCount(0);
+  });
+  await test("manual-uploaded-source-cleanup-works-with-auto-option-off", async page => {
     await page.getByRole("navigation", { name: "Principal", exact: true }).getByRole("button", { name: "Mis archivos", exact: true }).click();
     await page.evaluate(() => {
       window.__qa.cleanupSummary = { count: 3, bytes: 6 * 1024 * 1024 };
@@ -567,11 +609,11 @@ try {
     });
     const autoCleanup = page.getByRole("checkbox", { name: /Liberar espacio tras subir/ });
     await expect(autoCleanup).not.toBeChecked();
-    await page.getByRole("button", { name: "Liberar imágenes subidas", exact: true }).click();
+    await page.getByRole("button", { name: "Liberar originales subidos", exact: true }).click();
     await expect.poll(() => page.evaluate(() => window.__qa.calls.filter(c => c.cmd === "uploaded_image_cleanup_summary").length)).toBe(1);
     await expect.poll(() => page.evaluate(() => window.__qa.calls.filter(c => c.cmd === "delete_uploaded_image_sources").length)).toBe(1);
     const cleanupNotice = page.getByRole("status");
-    await expect(cleanupNotice).toContainText("3 imágenes liberadas");
+    await expect(cleanupNotice).toContainText("3 originales liberados");
     await expect(cleanupNotice).toContainText("liberados");
     await expect(autoCleanup).not.toBeChecked();
   });
@@ -583,6 +625,11 @@ try {
       await expect(page.getByLabel("Progreso de sincronización")).toContainText("12 s");
       await page.evaluate(() => { window.__qa.syncProgress = { active: true, phase: "scanning", scanned: 70, percent: null }; });
       await expect(bar).not.toHaveAttribute("value");
+      await page.evaluate(() => { window.__qa.syncProgress = { active: true, phase: "publishing", scanned: 70, percent: 99, etaSeconds: null }; });
+      await expect(page.getByLabel("Progreso de sincronización")).toContainText("Finalizando catálogo…");
+      await expect(bar).toHaveAttribute("value", "99");
+      await page.evaluate(() => { window.__qa.syncProgress = { active: false, phase: "cancelled", scanned: 70, percent: 99, etaSeconds: null, error: null }; });
+      await expect(page.getByLabel("Progreso de sincronización")).toContainText("Sincronización detenida");
       await page.evaluate(() => { window.__qa.syncProgress = { active: false, phase: "error", scanned: 70, percent: 63, error: "Sin conexión" }; });
       await expect(page.getByLabel("Progreso de sincronización")).toContainText("Sin conexión");
       await expect(bar).toHaveAttribute("value", "63");

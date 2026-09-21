@@ -29,7 +29,7 @@ export function useMaintenanceActions({
     }
   };
 
-  const handleFreeUploadedImages = async () => {
+  const handleFreeUploadedSources = async () => {
     if (cleanupBusy) return;
 
     setCleanupBusy(true);
@@ -43,7 +43,7 @@ export function useMaintenanceActions({
       }
 
       if (!window.confirm(
-        `¿Liberar espacio borrando ${summary.count} ${summary.count === 1 ? "imagen" : "imágenes"} ya ${summary.count === 1 ? "subida" : "subidas"}?\n\n`
+        `¿Liberar espacio borrando ${summary.count} ${summary.count === 1 ? "original" : "originales"} ya ${summary.count === 1 ? "subido" : "subidos"}?\n\n`
         + `Espacio potencial: ${formatBytes(summary.bytes)}. Nuvio comprobará tamaño y SHA-256 de cada original antes de borrarlo. `
         + "La copia guardada en Telegram no se elimina. No importa si ‘Liberar espacio tras subir’ estaba desactivado, siempre que Nuvio haya registrado el original durante esa subida.",
       )) {
@@ -52,7 +52,7 @@ export function useMaintenanceActions({
 
       const result = await deleteUploadedImageSources();
       const parts = [
-        `${result.deleted} ${result.deleted === 1 ? "imagen liberada" : "imágenes liberadas"}`,
+        `${result.deleted} ${result.deleted === 1 ? "original liberado" : "originales liberados"}`,
         result.releasedBytes > 0 ? `${formatBytes(result.releasedBytes)} liberados` : null,
         result.skipped ? `${result.skipped} omitida${result.skipped === 1 ? "" : "s"}` : null,
         result.failed ? `${result.failed} no se pudieron borrar y se conservaron` : null,
@@ -71,6 +71,6 @@ export function useMaintenanceActions({
   return {
     cleanupBusy,
     handleExportDiagnostics,
-    handleFreeUploadedImages,
+    handleFreeUploadedSources,
   };
 }

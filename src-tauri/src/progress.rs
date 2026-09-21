@@ -80,6 +80,8 @@ pub enum SyncPhase {
     Folders,
     Files,
     Applying,
+    Publishing,
+    Cancelled,
     Complete,
     Error,
 }
@@ -141,6 +143,20 @@ impl<'a> SyncRun<'a> {
         state.percent = Some(90 + (processed.saturating_mul(9) / total.max(1)).min(9) as u8);
         state.eta_seconds = None;
     }
+    pub fn publishing(&self) {
+        let mut state = self.state.lock().expect("sync progress");
+        state.phase = SyncPhase::Publishing;
+        state.percent = Some(99);
+        state.eta_seconds = None;
+    }
+    pub fn cancel(&mut self) {
+        let mut state = self.state.lock().expect("sync progress");
+        state.active = false;
+        state.phase = SyncPhase::Cancelled;
+        state.eta_seconds = None;
+        state.error = None;
+        self.finished = true;
+    }
     pub fn finish(&mut self, error: Option<String>) {
         let mut state = self.state.lock().expect("sync progress");
         state.active = false;
@@ -197,6 +213,25 @@ mod sync_tests {
         assert_eq!(state.lock().unwrap().percent, Some(100));
         assert!(!state.lock().unwrap().active);
     }
+    #[test]
+    fn publishing_and_cancel_are_visible_terminal_states() {
+        let state = std::sync::Mutex::new(SyncProgress::default());
+        let mut run = SyncRun::new(&state);
+        run.publishing();
+        {
+            let snapshot = state.lock().unwrap();
+            assert!(snapshot.active);
+            assert_eq!(snapshot.phase, SyncPhase::Publishing);
+            assert_eq!(snapshot.percent, Some(99));
+        }
+        run.cancel();
+        let snapshot = state.lock().unwrap();
+        assert!(!snapshot.active);
+        assert_eq!(snapshot.phase, SyncPhase::Cancelled);
+        assert_eq!(snapshot.percent, Some(99));
+        assert!(snapshot.error.is_none());
+    }
+
     #[test]
     fn unknown_total_and_interruption_do_not_fake_completion() {
         let state = std::sync::Mutex::new(SyncProgress::default());

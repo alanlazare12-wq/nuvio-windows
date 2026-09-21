@@ -68,7 +68,6 @@ pub struct UploadSourceCleanup {
 #[derive(Debug, Clone)]
 pub struct UploadSourceCleanupCandidate {
     pub transfer_id: String,
-    pub file_name: String,
     pub source_path: String,
     pub size_bytes: i64,
 }
@@ -337,10 +336,16 @@ impl CatalogRepository {
                 value TEXT NOT NULL
             );
             INSERT OR IGNORE INTO app_settings VALUES ('preparation_concurrency','4');
-            INSERT OR IGNORE INTO app_settings VALUES ('upload_concurrency','8');
+            INSERT OR IGNORE INTO app_settings VALUES ('upload_concurrency','4');
             UPDATE app_settings SET value='8' WHERE key='upload_concurrency' AND value='4'
             AND NOT EXISTS (SELECT 1 FROM app_meta WHERE key='upload_concurrency_v2');
             INSERT OR IGNORE INTO app_meta VALUES ('upload_concurrency_v2','1');
+            -- v2 raised the default to 8. With multi-GB split archives that starts too
+            -- many TDLib uploads at once and produces long per-file stalls. Roll the
+            -- auto-migrated/default value back once; users can still choose 8/12/16 later.
+            UPDATE app_settings SET value='4' WHERE key='upload_concurrency' AND value='8'
+            AND NOT EXISTS (SELECT 1 FROM app_meta WHERE key='upload_concurrency_v3');
+            INSERT OR IGNORE INTO app_meta VALUES ('upload_concurrency_v3','1');
             INSERT OR IGNORE INTO app_settings VALUES ('download_concurrency','2');
             INSERT OR IGNORE INTO app_settings VALUES ('cache_limit_bytes','2147483648');
             INSERT OR IGNORE INTO app_settings VALUES ('remember_session','0');
@@ -1564,7 +1569,7 @@ impl CatalogRepository {
     ) -> Result<Vec<UploadSourceCleanupCandidate>, RepositoryError> {
         let connection = self.connection.lock().expect("catalog mutex poisoned");
         let mut statement = connection.prepare(
-            "SELECT transfer_id,file_name,source_path,size_bytes
+            "SELECT transfer_id,source_path,size_bytes
              FROM uploaded_sources
              WHERE source_deleted=0 AND source_path<>'' AND sha256<>''
              ORDER BY created_at DESC, transfer_id DESC",
@@ -1572,9 +1577,8 @@ impl CatalogRepository {
         let rows = statement.query_map([], |row| {
             Ok(UploadSourceCleanupCandidate {
                 transfer_id: row.get(0)?,
-                file_name: row.get(1)?,
-                source_path: row.get(2)?,
-                size_bytes: row.get(3)?,
+                source_path: row.get(1)?,
+                size_bytes: row.get(2)?,
             })
         })?;
         let mut candidates = Vec::new();
@@ -1584,16 +1588,19 @@ impl CatalogRepository {
         Ok(candidates)
     }
 
-    pub fn mark_upload_source_deleted(&self, id: &str) -> Result<(), RepositoryError> {
+    pub fn mark_upload_source_path_deleted(
+        &self,
+        source_path: &str,
+    ) -> Result<(), RepositoryError> {
         let mut connection = self.connection.lock().expect("catalog mutex poisoned");
         let transaction = connection.transaction()?;
         transaction.execute(
-            "UPDATE transfer_metadata SET source_deleted=1,source_delete_error=NULL WHERE transfer_id=?1",
-            [id],
+            "UPDATE transfer_metadata SET source_deleted=1,source_delete_error=NULL WHERE source_path=?1",
+            [source_path],
         )?;
         transaction.execute(
-            "UPDATE uploaded_sources SET source_deleted=1,source_delete_error=NULL WHERE transfer_id=?1",
-            [id],
+            "UPDATE uploaded_sources SET source_deleted=1,source_delete_error=NULL WHERE source_path=?1",
+            [source_path],
         )?;
         transaction.commit()?;
         Ok(())
@@ -2103,6 +2110,24 @@ impl CatalogRepository {
         Ok(count.max(0) as usize)
     }
 
+    pub fn upload_staging_paths_in_use(&self) -> Result<Vec<String>, RepositoryError> {
+        let connection = self.connection.lock().expect("catalog mutex poisoned");
+        let mut statement = connection.prepare(
+            "SELECT m.local_path
+             FROM transfer_metadata m
+             JOIN transfers t ON t.id=m.transfer_id
+             WHERE t.direction='upload'
+               AND t.status NOT IN ('completed','duplicate')
+               AND m.local_path<>''",
+        )?;
+        let rows = statement.query_map([], |row| row.get::<_, String>(0))?;
+        let mut paths = Vec::new();
+        for row in rows {
+            paths.push(row?);
+        }
+        Ok(paths)
+    }
+
     #[allow(dead_code)]
     pub fn unfinished_count(&self) -> Result<usize, RepositoryError> {
         let connection = self.connection.lock().expect("catalog mutex poisoned");
@@ -2566,7 +2591,8 @@ mod tests {
         assert_eq!(candidate.source_path, "original.jpg");
         assert_eq!(candidate.size_bytes, 3);
         assert_eq!(candidate.sha256, "abc");
-        repo.mark_upload_source_deleted("cleanup").unwrap();
+        repo.mark_upload_source_path_deleted("original.jpg")
+            .unwrap();
         assert!(repo
             .upload_source_cleanup("cleanup", false)
             .unwrap()
@@ -2574,6 +2600,73 @@ mod tests {
         let transfer = repo.list_transfers().unwrap().remove(0);
         assert!(transfer.source_deleted);
         assert!(!transfer.source_delete_available);
+    }
+
+    #[test]
+    fn source_path_cleanup_marks_every_ledger_row_for_the_removed_file() {
+        let root = tempfile::tempdir().unwrap();
+        let repo = CatalogRepository::open(&root.path().join("db")).unwrap();
+        for (id, hash, message) in [("one", "hash-one", "41"), ("two", "hash-two", "42")] {
+            repo.create_upload_placeholder_in_folder(
+                id,
+                &format!("{id}.bin"),
+                &format!("prepared-{id}.bin"),
+                Some("same-original.bin"),
+                10,
+                None,
+                false,
+            )
+            .unwrap();
+            repo.finish_preparation(id, &format!("prepared-{id}.bin"), hash, 10, false)
+                .unwrap();
+            repo.update_transfer_state(
+                id,
+                "completed",
+                100,
+                "Guardado en Telegram",
+                Some(message),
+                None,
+            )
+            .unwrap();
+        }
+        assert_eq!(repo.upload_source_cleanup_candidates().unwrap().len(), 2);
+        repo.mark_upload_source_path_deleted("same-original.bin")
+            .unwrap();
+        assert!(repo.upload_source_cleanup_candidates().unwrap().is_empty());
+        assert!(repo
+            .list_transfers()
+            .unwrap()
+            .into_iter()
+            .all(|job| job.source_deleted));
+    }
+
+    #[test]
+    fn cancelled_upload_keeps_staging_path_because_it_is_resumable() {
+        let root = tempfile::tempdir().unwrap();
+        let repo = CatalogRepository::open(&root.path().join("db")).unwrap();
+        repo.create_upload_placeholder_in_folder(
+            "cancelled",
+            "part.zip",
+            "staging/cancelled/part.zip",
+            None,
+            100,
+            None,
+            false,
+        )
+        .unwrap();
+        repo.finish_preparation(
+            "cancelled",
+            "staging/cancelled/part.zip",
+            "hash-cancelled",
+            100,
+            false,
+        )
+        .unwrap();
+        repo.mark_cancelled("cancelled").unwrap();
+        assert_eq!(
+            repo.upload_staging_paths_in_use().unwrap(),
+            vec!["staging/cancelled/part.zip".to_string()]
+        );
     }
 
     #[test]
@@ -2608,7 +2701,6 @@ mod tests {
         let candidates = repo.upload_source_cleanup_candidates().unwrap();
         assert_eq!(candidates.len(), 1);
         assert_eq!(candidates[0].transfer_id, "manual-cleanup");
-        assert_eq!(candidates[0].file_name, "photo.jpg");
         assert_eq!(candidates[0].source_path, "original.jpg");
         assert_eq!(candidates[0].size_bytes, 99);
 
@@ -3321,22 +3413,27 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let path = root.path().join("db");
         let repo = CatalogRepository::open(&path).unwrap();
-        assert_eq!(repo.settings().unwrap().upload_concurrency, 8);
-        repo.set_setting("upload_concurrency", "4").unwrap();
+        assert_eq!(repo.settings().unwrap().upload_concurrency, 4);
+
+        // Simulate an installation that already received the old v2 default of 8 but
+        // has not run the v3 migration yet.
+        repo.set_setting("upload_concurrency", "8").unwrap();
         repo.connection
             .lock()
             .unwrap()
-            .execute("DELETE FROM app_meta WHERE key='upload_concurrency_v2'", [])
+            .execute("DELETE FROM app_meta WHERE key='upload_concurrency_v3'", [])
             .unwrap();
         drop(repo);
         let repo = CatalogRepository::open(&path).unwrap();
-        assert_eq!(repo.settings().unwrap().upload_concurrency, 8);
+        assert_eq!(repo.settings().unwrap().upload_concurrency, 4);
+
         for value in [1, 4, 8, 16] {
             repo.set_setting("upload_concurrency", &value.to_string())
                 .unwrap();
             assert_eq!(repo.settings().unwrap().upload_concurrency, value);
         }
-        repo.set_setting("upload_concurrency", "4").unwrap();
+        // Once v3 has run, a deliberate user choice of 8 must stay at 8.
+        repo.set_setting("upload_concurrency", "8").unwrap();
         drop(repo);
         assert_eq!(
             CatalogRepository::open(&path)
@@ -3344,7 +3441,7 @@ mod tests {
                 .settings()
                 .unwrap()
                 .upload_concurrency,
-            4
+            8
         );
     }
 }
