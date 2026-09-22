@@ -18,6 +18,13 @@
 - El aviso "Esperando progreso de Telegram" saltaba tras sólo 8 s sin bytes nuevos y borraba la velocidad y el ETA válidos de una subida que avanzaba con normalidad. TDLib informa el progreso por partes completas: en un enlace lento dos muestras ya están a 5.5 s (4 MB a 750 KB/s) y el jitter normal superaba el umbral constantemente. Ahora espera 45 s y, mientras tanto, la interfaz conserva la última velocidad y estimación persistidas.
 - Añadida la cancelación de subidas huérfanas al arrancar. Un cierre inesperado deja las transferencias en curso como `paused` y los reintentos agotados las dejan en `failed`, pero en ambos casos TDLib sigue enviando sus mensajes en segundo plano: gastaban el presupuesto de subida de la cuenta detrás de la cola que el usuario sí está mirando. `discard_abandoned_uploads` las detiene una vez por sesión, respetando las que sí van a reanudarse (`retry_wait`) o están activas, y dejando intacto un mensaje que ya se envió para que la sincronización lo adopte como subida terminada.
 
+### Conexiones con Telegram
+
+- Ampliado el grupo de conexiones que TDLib abre a cada datacenter, el equivalente del "upload speed boost" de Kotatogram. TDLib decide ese número a partir de una opción que no documenta: `session_count`. Su código hace `is_premium = get_option_boolean("is_premium") || session_count > 1`, y de ahí salen 8 sesiones de subida en vez de 4 (en DC2/DC4) y 8 de descarga en vez de 2.
+- Nuvio ahora pide `session_count = 2`. Dos y no más porque el interruptor es booleano: un número mayor no añade ni una sesión de archivos y sólo multiplica la sesión *principal*, que es la que transporta las llamadas normales de API y la que atrae FLOOD_WAIT.
+- La opción se envía **antes** de `setTdlibParameters` en las tres rutas que levantan un cliente (arranque, configuración de credenciales y reinicio por QR), porque TDLib la lee una sola vez mientras construye las sesiones de cada datacenter; cambiarla después sólo redimensiona la principal.
+- El resultado queda registrado como `telegram_session_count_requested` en `catalog-sync.log`, con si TDLib la aceptó, para poder comprobarlo en lugar de suponerlo. Si una versión de TDLib ignorase la opción, el cliente se queda con el grupo por defecto: el comportamiento de hoy.
+
 ### Paralelismo de subida
 
 - Revertido el efecto colateral de la serialización. Al forzar un solo volumen grande a la vez, la velocidad total cayó a ~0.8 MB/s en un enlace de 339 Mbps. Reconstruyendo las marcas de tiempo de Telegram de un respaldo real de 89 volúmenes, esta cuenta alcanzó **14.36 MB/s** y los sostuvo durante decenas de partes, así que una sola conexión deja la mayor parte del enlace sin usar.

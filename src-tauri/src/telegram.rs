@@ -161,6 +161,32 @@ fn configured_app_api_credentials() -> Option<(i32, String)> {
     Some((id, hash.to_string()))
 }
 
+/// TDLib decides how many parallel connections it opens to each datacenter from an
+/// option it never documents:
+///
+/// ```cpp
+/// int32 session_count = get_session_count();          // option "session_count", min 1
+/// bool is_premium = G()->get_option_boolean("is_premium") || session_count > 1;
+/// int32 upload_session_count   = (raw_dc_id != 2 && raw_dc_id != 4) || is_premium ? 8 : 4;
+/// int32 download_session_count = is_premium ? 8 : 2;
+/// ```
+///
+/// The `|| session_count > 1` is the whole lever: any value above one makes TDLib
+/// use the connection counts it otherwise reserves for Premium accounts — eight
+/// upload sessions instead of four on DC2/DC4, and eight download sessions instead
+/// of two. This is the same knob Kotatogram exposes as "upload speed boost", and it
+/// changes only how many sockets the client opens; nothing here asks the server for
+/// a feature the account does not have.
+///
+/// Two is deliberate rather than timid: the flag is a boolean, so a higher number
+/// buys no extra file sessions and only multiplies the *main* session, which carries
+/// ordinary API calls and is the one that attracts FLOOD_WAIT.
+///
+/// TDLib reads this once, while building each datacenter's sessions, and a later
+/// change only resizes the main session — so it has to be set before
+/// `setTdlibParameters` brings the network up.
+const TELEGRAM_SESSION_COUNT: i64 = 2;
+
 pub struct TelegramService {
     pub(crate) sync_progress: Mutex<crate::progress::SyncProgress>,
     pub(crate) catalog_sync_gate: tokio::sync::Mutex<()>,
@@ -187,6 +213,30 @@ pub struct TelegramService {
 impl TelegramService {
     pub(crate) fn client_id(&self) -> i32 {
         self.client_id_atomic.load(Ordering::SeqCst)
+    }
+
+    /// Opens the wider connection pool described on [`TELEGRAM_SESSION_COUNT`].
+    /// Failure is not fatal: an older TDLib that ignores the option just keeps the
+    /// default pool, which is exactly today's behaviour.
+    async fn request_wide_connection_pool(&self, client_id: i32) {
+        let result = call(tdlib_rs::functions::set_option(
+            "session_count".to_string(),
+            Some(tdlib_rs::enums::OptionValue::Integer(
+                tdlib_rs::types::OptionValueInteger {
+                    value: TELEGRAM_SESSION_COUNT,
+                },
+            )),
+            client_id,
+        ))
+        .await;
+        self.log_sync_event(
+            "telegram_session_count_requested",
+            serde_json::json!({
+                "sessionCount": TELEGRAM_SESSION_COUNT,
+                "accepted": result.is_ok(),
+                "error": result.err(),
+            }),
+        );
     }
 
     pub(crate) fn log_sync_event(&self, event: &str, details: serde_json::Value) {
@@ -484,6 +534,7 @@ impl TelegramService {
             self.client_id(),
         ))
         .await?;
+        self.request_wide_connection_pool(self.client_id()).await;
         let state = self.refresh().await?;
         if state.stage == "needsCredentials" {
             if remember_session {
@@ -557,6 +608,9 @@ impl TelegramService {
         }
         self.set_future_auth_persistence(remember_session)?;
 
+        // Ordered before setTdlibParameters on purpose: the datacenter sessions are
+        // built while the parameters are applied, and they read the option once.
+        self.request_wide_connection_pool(self.client_id()).await;
         let result = call(tdlib_rs::functions::set_tdlib_parameters(
             false,
             self.database_directory.to_string_lossy().into_owned(),
@@ -621,6 +675,9 @@ impl TelegramService {
         let new_id = tdlib_rs::create_client();
         self.client_id_atomic.store(new_id, Ordering::SeqCst);
         call(tdlib_rs::functions::set_log_verbosity_level(0, new_id)).await?;
+        // A fresh client starts with fresh options, so the pool has to be widened
+        // again before this one brings its own datacenter sessions up.
+        self.request_wide_connection_pool(new_id).await;
         call(tdlib_rs::functions::set_tdlib_parameters(
             false,
             self.database_directory.to_string_lossy().into_owned(),
