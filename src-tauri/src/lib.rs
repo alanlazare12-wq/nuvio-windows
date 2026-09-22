@@ -113,7 +113,7 @@ struct AppState {
     compression_slots: Arc<DynamicLimiter>,
     heavy_io_slots: Arc<DynamicLimiter>,
     upload_slots: Arc<DynamicLimiter>,
-    // Only one large upload may hold the shared TDLib upload budget at a time.
+    // How many large uploads may share the TDLib upload budget at once.
     // See cloud::SERIAL_UPLOAD_MIN_BYTES.
     serial_upload_slots: Arc<DynamicLimiter>,
     download_slots: Arc<DynamicLimiter>,
@@ -1412,9 +1412,19 @@ fn update_setting(
                 return Err("El límite de caché debe estar entre 256 MB y 20 GB".into());
             }
         }
-        "preparation_concurrency" | "upload_concurrency" | "download_concurrency" => {
+        "preparation_concurrency"
+        | "upload_concurrency"
+        | "large_upload_concurrency"
+        | "download_concurrency" => {
             let parsed: usize = value.parse().map_err(|_| "Concurrencia inválida")?;
-            let max = if key == "upload_concurrency" { 16 } else { 8 };
+            let max = match key.as_str() {
+                "upload_concurrency" => 16,
+                // Each extra large upload divides the same TDLib budget, so every
+                // volume takes proportionally longer to finish. Four is as far as
+                // that trade is worth making.
+                "large_upload_concurrency" => 4,
+                _ => 8,
+            };
             if !(1..=max).contains(&parsed) {
                 return Err(format!("La concurrencia debe estar entre 1 y {max}"));
             }
@@ -1439,6 +1449,9 @@ fn update_setting(
             .preparation_slots
             .set_limit(settings.preparation_concurrency),
         "upload_concurrency" => state.upload_slots.set_limit(settings.upload_concurrency),
+        "large_upload_concurrency" => state
+            .serial_upload_slots
+            .set_limit(settings.large_upload_concurrency),
         "download_concurrency" => state
             .download_slots
             .set_limit(settings.download_concurrency),
@@ -1456,6 +1469,7 @@ fn update_setting(
         key.as_str(),
         "preparation_concurrency"
             | "upload_concurrency"
+            | "large_upload_concurrency"
             | "download_concurrency"
             | "resource_profile"
     ) {
@@ -1796,11 +1810,10 @@ async fn worker(state: Arc<AppState>) {
                 drop(permit);
                 break;
             };
-            // TDLib shares one upload budget between every file it is sending, so a
-            // second multi-gigabyte document would only steal bandwidth from the
-            // first and leave both unfinished. Without a free serial slot keep
-            // claiming small transfers only; the big ones stay queued in SQLite
-            // instead of occupying a worker with no bytes moving.
+            // Large uploads answer to their own limit (see SERIAL_UPLOAD_MIN_BYTES).
+            // With every large slot taken, keep claiming small transfers only: an
+            // extra volume beyond the limit would just divide the same budget, so it
+            // stays queued in SQLite instead of occupying a worker.
             let serial_permit = state.serial_upload_slots.try_acquire();
             let size_limit = match serial_permit {
                 Some(_) => None,
@@ -2147,7 +2160,7 @@ pub fn run() {
                     16,
                 ),
                 upload_slots: DynamicLimiter::new(settings.upload_concurrency, 16),
-                serial_upload_slots: DynamicLimiter::new(1, 1),
+                serial_upload_slots: DynamicLimiter::new(settings.large_upload_concurrency, 4),
                 download_slots: DynamicLimiter::new(settings.download_concurrency, 8),
                 worker_wake: Arc::new(tokio::sync::Notify::new()),
                 sync_lock: tokio::sync::Mutex::new(()),

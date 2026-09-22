@@ -346,6 +346,7 @@ impl CatalogRepository {
             UPDATE app_settings SET value='4' WHERE key='upload_concurrency' AND value='8'
             AND NOT EXISTS (SELECT 1 FROM app_meta WHERE key='upload_concurrency_v3');
             INSERT OR IGNORE INTO app_meta VALUES ('upload_concurrency_v3','1');
+            INSERT OR IGNORE INTO app_settings VALUES ('large_upload_concurrency','4');
             INSERT OR IGNORE INTO app_settings VALUES ('download_concurrency','2');
             INSERT OR IGNORE INTO app_settings VALUES ('cache_limit_bytes','2147483648');
             INSERT OR IGNORE INTO app_settings VALUES ('remember_session','0');
@@ -1448,6 +1449,10 @@ impl CatalogRepository {
             .and_then(|v| v.parse().ok())
             .unwrap_or(defaults.upload_concurrency)
             .clamp(1, 16);
+        let large_upload = get("large_upload_concurrency")
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(defaults.large_upload_concurrency)
+            .clamp(1, 4);
         let download = get("download_concurrency")
             .and_then(|v| v.parse().ok())
             .unwrap_or(defaults.download_concurrency)
@@ -1474,6 +1479,7 @@ impl CatalogRepository {
         Ok(AppSettings {
             preparation_concurrency: prep,
             upload_concurrency: upload,
+            large_upload_concurrency: large_upload,
             download_concurrency: download,
             cache_limit_bytes: cache,
             remember_session: remember,
@@ -1488,6 +1494,7 @@ impl CatalogRepository {
         const ALLOWED: &[&str] = &[
             "preparation_concurrency",
             "upload_concurrency",
+            "large_upload_concurrency",
             "download_concurrency",
             "cache_limit_bytes",
             "remember_session",

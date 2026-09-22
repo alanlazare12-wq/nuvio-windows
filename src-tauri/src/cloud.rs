@@ -21,14 +21,16 @@ const CATALOG_SNAPSHOT_UPLOAD_PRIORITY: i32 = 32;
 use tdlib_rs::{enums as e, functions as f, types as t};
 use zip::{write::SimpleFileOptions, CompressionMethod, ZipArchive, ZipWriter};
 
-/// A TDLib client pushes every file it is sending through one shared upload
-/// budget. When several multi-gigabyte documents are queued at the same time
-/// that budget is split between all of them, so each volume advances a few
-/// megabytes, TDLib rotates to the next one, and none of them ever reaches
-/// 100%: the whole batch crawls until every job gives up. Uploads at or above
-/// this size therefore take turns — one pushes bytes while the rest stay
-/// queued, which is also strictly faster end to end because a finished volume
-/// is a confirmed volume.
+/// Uploads at or above this size are scheduled against
+/// `AppSettings::large_upload_concurrency` instead of the plain upload slots.
+///
+/// They are kept on their own budget because the right number is not obvious and
+/// depends on where the ceiling actually is. Reconstructed from the Telegram
+/// timestamps of a real 89-volume backup, this account sustained about 10 MB/s in
+/// aggregate with four uploads in flight, and also sat at 1.2-1.6 MB/s for hours
+/// at a stretch on the same build — so the limit moves on its own and is not a
+/// fixed property of the client. One at a time finishes each volume earlier; more
+/// at once covers a per-file ceiling if that is what is binding.
 pub const SERIAL_UPLOAD_MIN_BYTES: i64 = 128 * 1024 * 1024;
 
 /// A 2 GB volume on a slow uplink legitimately takes hours, so elapsed time

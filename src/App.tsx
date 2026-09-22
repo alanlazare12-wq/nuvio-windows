@@ -1043,9 +1043,14 @@ function App() {
                   <option value="max">Máximo · terminar antes</option>
                 </select>
               </label>}
-              {section !== "trash" && <label className="conflict-control" title="Aplica a los archivos pequeños. Los mayores de 128 MB suben de uno en uno: Telegram reparte un mismo ancho de banda entre todo lo que envía y en paralelo ninguna parte llegaría a terminar.">Subidas simultáneas
+              {section !== "trash" && <label className="conflict-control" title="Aplica a los archivos menores de 128 MB. Los grandes usan su propio ajuste.">Subidas simultáneas
                 <select aria-label="Subidas simultáneas" value={dashboard.settings.uploadConcurrency} onChange={(event) => void action(() => updateSetting("upload_concurrency", event.target.value))}>
                   {[1, 2, 4, 6, 8, 12, 16].map(value => <option key={value} value={value}>{value}</option>)}
+                </select>
+              </label>}
+              {section !== "trash" && <label className="conflict-control" title="Cuántos archivos de más de 128 MB se envían a la vez. Telegram reparte un mismo presupuesto de subida entre todo lo que envía: con 1 cada volumen termina antes de empezar el siguiente. Súbelo sólo si al hacerlo la velocidad total aumenta.">Archivos grandes a la vez
+                <select aria-label="Archivos grandes a la vez" value={dashboard.settings.largeUploadConcurrency} onChange={(event) => void action(() => updateSetting("large_upload_concurrency", event.target.value))}>
+                  {[1, 2, 3, 4].map(value => <option key={value} value={value}>{value}</option>)}
                 </select>
               </label>}
               {section !== "trash" && <label className="conflict-control">Si ya existe

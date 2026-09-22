@@ -113,6 +113,7 @@ export type QueueSummary = {
 export type AppSettings = {
   preparationConcurrency: number;
   uploadConcurrency: number;
+  largeUploadConcurrency: number;
   downloadConcurrency: number;
   cacheLimitBytes: number;
   rememberSession: boolean;

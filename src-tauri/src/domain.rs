@@ -90,6 +90,10 @@ pub struct QueueSummary {
 pub struct AppSettings {
     pub preparation_concurrency: usize,
     pub upload_concurrency: usize,
+    /// How many uploads at or above `cloud::SERIAL_UPLOAD_MIN_BYTES` may run at
+    /// once. Four restores the behaviour that predates the serial gate; one makes
+    /// each volume finish before the next starts.
+    pub large_upload_concurrency: usize,
     pub download_concurrency: usize,
     pub cache_limit_bytes: i64,
     pub remember_session: bool,
@@ -104,6 +108,7 @@ impl Default for AppSettings {
         Self {
             preparation_concurrency: 4,
             upload_concurrency: 4,
+            large_upload_concurrency: 4,
             download_concurrency: 2,
             cache_limit_bytes: 2 * 1024 * 1024 * 1024,
             remember_session: false,
